@@ -152,7 +152,22 @@ impl Daemon {
         // 2. 身份噪声密钥对
         let (_noise_secret, _noise_public) = self.identity.noise_keypair();
 
-        // 3. 初始化 DHT
+        // 3. 初始化 Transport (先绑定以获取端口)
+        let transport = Transport::new(
+            TransportConfig::default(),
+            _noise_secret,
+            peer_id,
+            public_key,
+        )
+        .map_err(|e| DaemonError::Config(e.to_string()))?;
+
+        let transport = Arc::new(transport);
+        let transport_port = transport.local_addr()
+            .map(|a| a.port())
+            .map_err(|e| DaemonError::Config(e.to_string()))?;
+        tracing::info!("transport on port {transport_port}");
+
+        // 4. 初始化 DHT (共享同一端口)
         let dht_config = lain_dht::DhtConfig {
             k: self.config.dht.k,
             alpha: self.config.dht.alpha,
@@ -160,8 +175,9 @@ impl Daemon {
             heartbeat_interval_secs: self.config.dht.heartbeat_interval_secs,
             republish_interval_secs: lain_core::DHT_REPUBLISH_SECS,
             idle_peer_timeout_secs: 900,
-            local_addr: self.config.dht.local_addr
-                .unwrap_or_else(|| "0.0.0.0:0".parse().expect("valid addr")),
+            local_addr: format!("0.0.0.0:{}", transport_port)
+                .parse::<SocketAddr>()
+                .map_err(|e: std::net::AddrParseError| DaemonError::Config(e.to_string()))?,
             bootstrap_nodes: self.config.dht.bootstrap_nodes.clone(),
         };
 
@@ -181,24 +197,7 @@ impl Daemon {
             }
         }
 
-        // 5. 初始化 Transport
-        let (_noise_secret, _noise_public) = self.identity.noise_keypair();
-
-        let transport = Transport::new(
-            TransportConfig::default(),
-            _noise_secret,
-            peer_id,
-            public_key,
-        )
-        .map_err(|e| DaemonError::Config(e.to_string()))?;
-
-        let transport = Arc::new(transport);
-        let transport_local_port = transport.local_addr()
-            .map(|a| a.port())
-            .unwrap_or(0);
-        tracing::info!("Transport on port {transport_local_port}");
-
-        // 6. STORE self
+        // 5. STORE self
         let capabilities = Capabilities::new()
             .with(if nat_result.ipv6_inbound { Capabilities::IPV6_INBOUND } else { 0 })
             .with(if nat_result.nat_type.is_symmetric() { 0 } else { Capabilities::RELAY_CAPABLE });

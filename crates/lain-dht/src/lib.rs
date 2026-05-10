@@ -105,9 +105,16 @@ impl DhtHandle {
         let peer_records = Arc::new(RwLock::new(HashMap::new()));
         let (event_tx, _rx) = broadcast::channel(64);
         // Socket will be bound later
-        let std_socket = std::net::UdpSocket::bind(config.local_addr)
-            .map_err(|e| DhtError::Network(e.to_string()))?;
-        let _ = std_socket.set_nonblocking(true);
+        let std_socket = {
+            use socket2::{Socket, Domain, Type, Protocol};
+            let sock = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))
+                .map_err(|e| DhtError::Network(e.to_string()))?;
+            sock.set_reuse_address(true).map_err(|e| DhtError::Network(e.to_string()))?;
+            sock.set_nonblocking(true).map_err(|e| DhtError::Network(e.to_string()))?;
+            sock.bind(&config.local_addr.into())
+                .map_err(|e| DhtError::Network(e.to_string()))?;
+            std::net::UdpSocket::from(sock)
+        };
         let socket = UdpSocket::from_std(std_socket)
             .map_err(|e| DhtError::Network(e.to_string()))?;
 

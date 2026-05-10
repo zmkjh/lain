@@ -16,3 +16,4 @@ serde_json.workspace = true
 bincode.workspace = true
 rand.workspace = true
 ed25519-dalek.workspace = true
+socket2 = "0.6"
