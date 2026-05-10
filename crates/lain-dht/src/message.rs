@@ -1,6 +1,6 @@
 use lain_core::capabilities::Capabilities;
 use lain_core::dht::{DhtMessage, DhtMsgType};
-use lain_core::endpoint::Endpoint;
+use lain_core::endpoint::{Endpoint, EndpointKind};
 use lain_core::peer::PeerId;
 use lain_core::PROTOCOL_VERSION;
 use ed25519_dalek::Signer;
@@ -364,13 +364,33 @@ pub fn parse_record_from_payload(payload: &[u8]) -> Option<PeerRecord> {
     let mut pubkey = [0u8; 32];
     pubkey.copy_from_slice(&payload[4..36]);
     let ep_len = u16::from_be_bytes([payload[36], payload[37]]) as usize;
-    let _ep_len = ep_len;
-    // For now, endpoints are reconstructed from the STORE payload elsewhere
-    // Just parse the metadata fields
+    let mut endpoints = Vec::with_capacity(ep_len.min(64));
+    let mut offset = 38usize;
+    for _ in 0..ep_len {
+        let addr = match decode_address(payload, &mut offset) {
+            Some(a) => a,
+            None => break,
+        };
+        if offset + 7 > payload.len() { break; }
+        let kind_byte = payload[offset]; offset += 1;
+        let priority = payload[offset]; offset += 1;
+        let kind = match kind_byte {
+            0 => EndpointKind::IPv6,
+            1 => EndpointKind::STUN,
+            2 => EndpointKind::LAN,
+            3 => EndpointKind::WebSocket,
+            4 => EndpointKind::Relay,
+            _ => EndpointKind::STUN,
+        };
+        let ttl_bytes = [payload[offset], payload[offset+1], payload[offset+2], payload[offset+3]];
+        let ttl = u32::from_be_bytes(ttl_bytes);
+        offset += 4;
+        endpoints.push(Endpoint { addr, kind, priority, ttl_seconds: ttl });
+    }
 
     Some(PeerRecord {
         pubkey,
-        endpoints: vec![],
+        endpoints,
         capabilities: Capabilities::new(),
         ttl_remaining,
         expires_at: std::time::Instant::now() + std::time::Duration::from_secs(ttl_remaining as u64),
