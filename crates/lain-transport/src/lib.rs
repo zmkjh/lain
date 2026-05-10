@@ -354,10 +354,6 @@ impl Transport {
     /// Accept a raw connection and return (quinn::Connection, PeerId, pubkey)
     /// Caller can then inspect control frames before proceeding
     pub async fn accept_connection(&self) -> Result<(quinn::Connection, PeerId, Ed25519PublicKey), TransportError> {
-        // Acquire connection slot (backpressure)
-        let _permit = self.conn_semaphore.clone().acquire_owned().await
-            .map_err(|_| TransportError::Connect("connection limit reached".into()))?;
-
         let incoming = self.endpoint
             .accept()
             .await

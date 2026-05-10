@@ -12,6 +12,7 @@ use lain_core::dht::DhtEvent as CoreDhtEvent;
 use lain_core::endpoint::Endpoint;
 use lain_core::peer::PeerId;
 use serde::{Deserialize, Serialize};
+use sha2::Digest;
 use thiserror::Error;
 use tokio::net::UdpSocket;
 use tokio::sync::{broadcast, RwLock};
@@ -105,16 +106,9 @@ impl DhtHandle {
         let peer_records = Arc::new(RwLock::new(HashMap::new()));
         let (event_tx, _rx) = broadcast::channel(64);
         // Socket will be bound later
-        let std_socket = {
-            use socket2::{Socket, Domain, Type, Protocol};
-            let sock = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))
+        let std_socket = std::net::UdpSocket::bind(config.local_addr)
                 .map_err(|e| DhtError::Network(e.to_string()))?;
-            sock.set_reuse_address(true).map_err(|e| DhtError::Network(e.to_string()))?;
-            sock.set_nonblocking(true).map_err(|e| DhtError::Network(e.to_string()))?;
-            sock.bind(&config.local_addr.into())
-                .map_err(|e| DhtError::Network(e.to_string()))?;
-            std::net::UdpSocket::from(sock)
-        };
+            let _ = std_socket.set_nonblocking(true);
         let socket = UdpSocket::from_std(std_socket)
             .map_err(|e| DhtError::Network(e.to_string()))?;
 
@@ -372,6 +366,14 @@ impl DhtHandle {
                     if msg.payload.len() >= 68 {
                         let mut pubkey = [0u8; 32];
                         pubkey.copy_from_slice(&msg.payload[36..68]);
+
+                        // Verify pubkey matches PeerID (SHA256(pubkey) == key)
+                        let expected_id = PeerId(sha2::Sha256::digest(&pubkey).into());
+                        if expected_id != key {
+                            tracing::warn!("STORE from {}: pubkey doesn't match PeerID", msg.sender_id);
+                            return Err(DhtError::InvalidSignature { peer_id: msg.sender_id });
+                        }
+
                         let record = PeerRecord {
                             pubkey,
                             endpoints: vec![],
