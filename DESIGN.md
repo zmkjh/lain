@@ -12,7 +12,7 @@ Lain 是一个零服务器、零配置的 P2P 网络基础设施，以 daemon �
 
 - **PeerID 是永久的**：等于 `SHA256(Ed25519 公钥)`。只要密钥文件不丢，PeerID 在设备生命周期内不变。变化的只是网络地址。
 - **全联通，无分区**：一个全局 DHT，所有 Lain 节点共用一个地址空间。节点通过 DHT 宣告在线、发现彼此。没有"网络"概念——不需要创建、加入、切换。
-- **Invite 码是快捷方式**：提前打包 PeerID + 公钥 + 地址快照，省一次 DHT 查找。但不是前置条件——知道 PeerID 就能从 DHT 查到公钥和地址，直接发起连接。
+- **Invite 码有两重角色**：① 新节点的 DHT 入场券——首次启动时路由表为空，必须通过已在 DHT 中的老节点的 invite 获取 bootstrap 地址，才能加入 DHT；② 之后的快捷方式——路由表填满后，知道 PeerID 就能从 DHT 查到公钥和地址，invite 退为可选的加速手段。
 - **一对一连接，不是广播**：Lain 在两个设备之间建立加密字节流。如果要给多个 peer 发数据，就分别建立多条连接——每条都是独立的 Noise 端到端加密通道。
 - **零配置启动**：daemon 不带任何参数就能运行，所有参数有内置默认值。
 - **群组是应用层的事**：哪些 peer 之间通信、如何分组——Lain 不参与。基础设施只负责建通道。
@@ -154,9 +154,9 @@ Initiator (PeerID 小)              Responder (PeerID 大)
 
 **DHT 是完整目录**：每个节点通过 STORE 宣告自己的 PeerID、Ed25519 公钥、当前 endpoints。任何人 `FIND_VALUE(peer_id)` 就能拿到连接所需的全部信息——公钥、IP、端口。公钥由 Ed25519 签名验证：PeerID = SHA256(公钥)，自然防伪造。
 
-**连接 peer 不需要 invite**：知道 PeerID → DHT 查到公钥和地址 → 直接发起 QUIC + Noise IK。
+**连接已知 peer 不需要 invite**：知道 PeerID → DHT 查到公钥和地址 → 直接发起 QUIC + Noise IK。
 
-**Invite 是快捷方式**：提前打包好的 PeerID + 公钥 + 地址快照。收到 invite 可以直接连而不用先查 DHT——只是更快，不是必需。invite 也是最便捷地获取对方 PeerID 的方式（第一次接触时，你总得从某个渠道知道对方的 PeerID）。
+**Invite 有两重角色**：① DHT 入场券——新节点路由表为空，invite 里的老节点地址是唯一 bootstrap 入口。② 地址快照——收到 invite 可以跳过 DHT 查找直接连，更快但不是必需。路由表填满后，invite 退为可选的加速手段。
 
 **隐私考虑**：DHT 公开 PeerID、公钥、IP 和端口。PeerID 是公钥哈希，不直接关联真实身份。应用层自行管理"哪些 PeerID 属于我的联系人"。
 
@@ -512,13 +512,22 @@ insert_node(new):
 
 ### 9.4 Bootstrap
 
+新节点加入 DHT 的入口。Bootstrap 来源按优先级：
+
 ```
-1. 从 invite code 获取 endpoint
-2. PING → 加入路由表
-3. FIND_NODE(self.id) → 填充路由表
-4. 递归 FIND_NODE 填满 256 个 bucket
-5. STORE 自身信息到 k-closest 邻居
+1. routes.bin + peers.json（重启恢复，最快）
+2. invite code 中的 endpoint（新节点首次加入的唯一方式）
+3. 硬编码的 DHT bootstrap 节点（公共 lain 网络的可选固定入口，非必需）
+
+Bootstrap 步骤:
+  1. 从上述来源获取至少一个已知 endpoint
+  2. PING → 加入路由表
+  3. FIND_NODE(self.id) → 填充路由表
+  4. 递归 FIND_NODE 填满 256 个 bucket
+  5. STORE 自身信息（PeerID + 公钥 + endpoints）到 k-closest 邻居
 ```
+
+注：首次启动必须有 invite（来源 2）或公共 bootstrap 节点（来源 3）。重启则从来源 1 恢复。
 
 ### 9.5 Lookup
 
