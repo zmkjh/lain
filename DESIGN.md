@@ -1267,8 +1267,8 @@ Level 4 — 最小存活: 仅 Relay 路径（所有直连不可用）
 
 | 威胁 | 严重度 | 对策 |
 |------|--------|------|
-| **DHT 投毒** (伪造 STORE) | 中 | STORE 签名绑定 PeerID。FIND_VALUE 返回的 record 必须通过签名验证。接收方额外验证 endpoint 可达性。 |
-| **DHT Sybil 攻击** | 低 | PeerID = hash(公钥)，生成大量 ID 需大量计算。k-bucket 按 XOR 距离组织，Sybil 节点只能影响局部路由。 |
+| **DHT 投毒** (伪造 STORE) | 中 | STORE 必须 Ed25519 签名，FIND_VALUE 响应验证签名。 |
+| **DHT Sybil / Eclipse** | 中 | ① Liveness 门槛——攻击者必须持续运营在线节点（心跳、响应 PING），LIVE→STALE→EXPIRED 自动淘汰停止维护的 Sybil 节点。② peers.json 持久化真实 peer，不参与 bucket LRU 替换，Eclipse 不掉已连接过的 peer。③ 多源 bootstrap：routes.bin + peers.json + invite，不依赖单一入口。攻击者需要长期维护大量在线节点才能有效 Eclipse，成本远高于批量生成 PeerID。 |
 | **Eclipse 攻击** (隔离目标节点) | 中 | 多路径 bootstrap（invite seeds + peers.json + 持久化路由表）。定期从 seed 重新 FIND_NODE(self) 验证路由表一致性。 |
 | **重放攻击** (Invite) | 低 | Invite 含 timestamp，接收方拒绝超过 30 分钟的 invite。一次性使用。 |
 | **重放攻击** (DHT RPC) | 低 | message_id 为随机 16 字节，接收方 5 秒去重窗口。 |
