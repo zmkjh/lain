@@ -337,6 +337,10 @@ impl Transport {
     /// Accept a raw connection and return (quinn::Connection, PeerId, pubkey)
     /// Caller can then inspect control frames before proceeding
     pub async fn accept_connection(&self) -> Result<(quinn::Connection, PeerId, Ed25519PublicKey), TransportError> {
+        // Acquire connection slot (backpressure)
+        let _permit = self.conn_semaphore.clone().acquire_owned().await
+            .map_err(|_| TransportError::Connect("connection limit reached".into()))?;
+
         let incoming = self.endpoint
             .accept()
             .await
@@ -623,6 +627,40 @@ impl TransportLayer for Transport {
 }
 
 /// WebSocket handshake accept key: base64(sha1(key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"))
+/// WebSocket 帧编码（binary, FIN=1）
+#[allow(dead_code)]
+fn ws_encode_frame(payload: &[u8]) -> Vec<u8> {
+    let mut f = Vec::with_capacity(payload.len() + 10);
+    f.push(0x82); // FIN + Binary opcode
+    if payload.len() <= 125 {
+        f.push(payload.len() as u8);
+    } else if payload.len() <= 65535 {
+        f.push(126);
+        f.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+    } else {
+        f.push(127);
+        f.extend_from_slice(&(payload.len() as u64).to_be_bytes());
+    }
+    f.extend_from_slice(payload);
+    f
+}
+
+/// WebSocket 帧解码，返回 payload
+#[allow(dead_code)]
+fn ws_decode_frame(data: &[u8]) -> Option<Vec<u8>> {
+    if data.len() < 2 { return None; }
+    let masked = data[1] & 0x80 != 0;
+    let mut len = (data[1] & 0x7F) as usize;
+    let mut offset = 2usize;
+    if len == 126 { if data.len() < 4 { return None; } len = u16::from_be_bytes([data[2], data[3]]) as usize; offset = 4; }
+    else if len == 127 { if data.len() < 10 { return None; } len = u64::from_be_bytes(data[2..10].try_into().ok()?) as usize; offset = 10; }
+    let mask = if masked { if data.len() < offset + 4 { return None; } let m = [data[offset], data[offset+1], data[offset+2], data[offset+3]]; offset += 4; Some(m) } else { None };
+    if data.len() < offset + len { return None; }
+    let mut payload = data[offset..offset + len].to_vec();
+    if let Some(m) = mask { for (i, b) in payload.iter_mut().enumerate() { *b ^= m[i % 4]; } }
+    Some(payload)
+}
+
 fn ws_accept_key(key: &str) -> String {
     let mut combined = key.to_string();
     combined.push_str("258EAFA5-E914-47DA-95CA-C5AB0DC85B11");

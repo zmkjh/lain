@@ -332,19 +332,46 @@ impl Daemon {
         let connected: Arc<RwLock<HashMap<PeerId, quinn::Connection>>> =
             Arc::new(RwLock::new(HashMap::new()));
 
-        // Interface watcher: detect network changes
+        // Interface watcher: detect network changes and trigger emergency actions
         let iface_watcher = Arc::new(InterfaceWatcher::new());
         iface_watcher.snapshot().await;
         let dht_iface = dht_arc.clone();
+        let connected_iface = connected.clone();
+        let public_key_iface = public_key;
+        let capabilities_iface = capabilities;
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
             loop {
                 interval.tick().await;
                 let (added, removed) = iface_watcher.check().await;
                 if !added.is_empty() || !removed.is_empty() {
-                    tracing::warn!("network interface change: +{}/-{}", added.len(), removed.len());
-                    // Emergency DHT STORE would go here
-                    let _ = dht_iface.find_relays().await;
+                    tracing::warn!("network change: +{}/-{}", added.len(), removed.len());
+
+                    // Emergency DHT STORE with new endpoints
+                    let new_endpoints: Vec<Endpoint> = added.iter()
+                        .map(|a| Endpoint::new(*a, lain_core::endpoint::EndpointKind::STUN))
+                        .collect();
+                    if !new_endpoints.is_empty() {
+                        let _ = dht_iface.store_self(
+                            &public_key_iface,
+                            &new_endpoints,
+                            capabilities_iface,
+                        ).await;
+                    }
+
+                    // Send PATH_CHANGE to all connected peers
+                    let cons = connected_iface.read().await;
+                    for (peer_id, conn) in cons.iter() {
+                        let msg = lain_core::frame::encode_frame(
+                            1, lain_core::frame::FrameType::PathChange,
+                            &[],
+                        );
+                        if let Ok((mut send, _)) = conn.open_bi().await {
+                            let _ = send.write_all(&msg).await;
+                            let _ = send.finish();
+                            tracing::debug!("sent PATH_CHANGE to {peer_id}");
+                        }
+                    }
                 }
             }
         });
@@ -492,6 +519,13 @@ impl Daemon {
                 }
 
                 _ = heartbeat.tick() => {
+                    // Dormant check: skip heartbeat if no active connections
+                    let peer_count = connected.read().await.len();
+                    if peer_count == 0 {
+                        // All peers expired/disconnected — skip this heartbeat
+                        // routes.bin is still maintained for future reconnection
+                        continue;
+                    }
                     if let Err(e) = dht_arc.store_self(
                         &public_key, &endpoints, capabilities,
                     ).await {

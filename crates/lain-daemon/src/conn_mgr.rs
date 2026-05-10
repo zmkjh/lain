@@ -3,7 +3,6 @@
 #![deny(clippy::panic)]
 
 use lain_core::peer::PeerId;
-use lain_core::transport::TransportLayer;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -41,50 +40,40 @@ impl ConnectionManager {
     }
 
     /// 连接断开时触发重连
-    /// 返回是否需要重连（peer 已被标记为 STALE 且未 EXPIRED）
+    /// 成功时返回新的 QUIC 连接，失败返回 None
     pub async fn on_disconnect(
         &self,
         peer_id: &PeerId,
         dht: &Arc<lain_dht::DhtHandle>,
         transport: &Arc<lain_transport::Transport>,
-    ) {
+    ) -> Option<quinn::Connection> {
         tracing::warn!("ConnectionManager: {peer_id} disconnected, reconnecting...");
 
         let peer_state = {
             let peers = self.peers.read().await;
             peers.get(peer_id).cloned()
-        };
+        }?;
 
-        let peer_state = match peer_state {
-            Some(s) => s,
-            None => return,
-        };
-
-        // Exponential backoff reconnect loop
         let mut backoff = 1u64;
-        let max_backoff = 300; // 5 minutes max
-        let max_attempts = 8;
+        let max_backoff = 300;
 
-        for attempt in 0..max_attempts {
-            tracing::info!("{peer_id} reconnect attempt {}/{max_attempts}", attempt + 1);
+        for attempt in 0u32..8 {
+            tracing::info!("{peer_id} reconnect attempt {}/8", attempt + 1);
 
-            // Look up peer's latest endpoints from DHT
             let record = match dht.find_peer(peer_id).await {
                 Ok(Some(r)) => r,
                 _ => {
-                    tracing::debug!("{peer_id} not found in DHT");
                     tokio::time::sleep(std::time::Duration::from_secs(backoff)).await;
                     backoff = (backoff * 3).min(max_backoff);
                     continue;
                 }
             };
 
-            // Try reconnect
-            match transport.connect(peer_id, &record.pubkey, &record.endpoints).await {
-                Ok(_conn) => {
+            match transport.connect_raw(&record.pubkey, &record.endpoints).await {
+                Ok(conn) => {
                     tracing::info!("{peer_id} reconnected!");
 
-                    // Send STREAM_RESUME frame
+                    // Send STREAM_RESUME frame on stream 0
                     let streams: Vec<u64> = peer_state.active_streams.clone();
                     if !streams.is_empty() {
                         let mut payload = Vec::new();
@@ -99,13 +88,16 @@ impl ConnectionManager {
                             lain_core::frame::FrameType::StreamResume,
                             &payload,
                         );
-                        // In production: send this frame on stream 0 of the new connection
-                        let _ = resume;
+                        // Send on a new stream of the reconnected connection
+                        if let Ok((mut send, _recv)) = conn.open_bi().await {
+                            let _ = send.write_all(&resume).await;
+                            let _ = send.finish();
+                            tracing::info!("sent STREAM_RESUME for {} streams", streams.len());
+                        }
                     }
 
-                    // Re-add peer
                     self.peers.write().await.insert(*peer_id, peer_state);
-                    return;
+                    return Some(conn);
                 }
                 Err(e) => {
                     tracing::debug!("{peer_id} reconnect failed: {e}");
@@ -116,8 +108,9 @@ impl ConnectionManager {
             backoff = (backoff * 3).min(max_backoff);
         }
 
-        tracing::warn!("{peer_id} reconnect failed after {max_attempts} attempts, marking expired");
+        tracing::warn!("{peer_id} reconnect failed, marking expired");
         self.peers.write().await.remove(peer_id);
+        None
     }
 
     /// 处理收到的 STREAM_RESUME 帧
