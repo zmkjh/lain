@@ -11,6 +11,7 @@ lain-dht = { path = "../lain-dht" }
 lain-transport = { path = "../lain-transport" }
 lain-nat = { path = "../lain-nat" }
 lain-discovery = { path = "../lain-discovery" }
+quinn.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["net", "sync", "time", "signal"] }
 tracing.workspace = true

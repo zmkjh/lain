@@ -174,7 +174,89 @@ impl Transport {
         })
     }
 
-    /// 启动 WebSocket fallback 监听（TCP 443 或随机端口）
+    /// 主动连接并返回原始 QUIC 连接（用于 daemon 管理流）
+    pub async fn connect_raw(
+        &self,
+        remote_pubkey: &Ed25519PublicKey,
+        endpoints: &[Endpoint],
+    ) -> Result<quinn::Connection, TransportError> {
+        let client_crypto = rustls::ClientConfig::builder_with_protocol_versions(&[
+            &rustls::version::TLS13,
+        ])
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(NoVerify))
+        .with_no_client_auth();
+
+        let quic_client_cfg = quinn::ClientConfig::new(Arc::new(
+            quinn::crypto::rustls::QuicClientConfig::try_from(client_crypto)
+                .map_err(|e| TransportError::Tls(format!("client quic: {e}")))?
+        ));
+
+        let mut eps: Vec<_> = endpoints.iter().collect();
+        eps.sort_by(|a, b| b.priority.cmp(&a.priority));
+
+        for ep in eps {
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(self.config.traversal_timeout_secs),
+                self.try_connect(remote_pubkey, ep.addr, &quic_client_cfg),
+            ).await {
+                Ok(Ok(conn)) => return Ok(conn),
+                Ok(Err(e)) => tracing::debug!("connect {}: {e}", ep.addr),
+                Err(_) => tracing::debug!("connect {}: timeout", ep.addr),
+            }
+        }
+        Err(TransportError::NoPath { peer_id: PeerId([0u8; 32]) })
+    }
+
+    async fn try_connect(
+        &self,
+        remote_pubkey: &Ed25519PublicKey,
+        addr: SocketAddr,
+        client_cfg: &quinn::ClientConfig,
+    ) -> Result<quinn::Connection, TransportError> {
+        let conn = self.endpoint
+            .connect_with(client_cfg.clone(), addr, "lain")
+            .map_err(|e| TransportError::Connect(format!("connect: {e}")))?
+            .await
+            .map_err(|e| TransportError::Connect(format!("wait: {e}")))?;
+
+        let (mut send, mut recv) = conn.open_bi().await
+            .map_err(|e| TransportError::Connect(format!("bi: {e}")))?;
+
+        let mut noise = NoiseHandshake::new_initiator(&self.noise_secret, remote_pubkey)
+            .map_err(|e| TransportError::Noise(format!("init: {e}")))?;
+
+        let ik1 = noise.write_message(&[])
+            .map_err(|e| TransportError::Noise(format!("init: {e}")))?;
+        send.write_all(&encode_handshake_frame(0, &ik1)).await
+            .map_err(|e| TransportError::Io(format!("send ik1: {e}")))?;
+
+        let mut buf = vec![0u8; 4096];
+        let n = recv.read(&mut buf).await
+            .map_err(|e| TransportError::Connect(format!("recv ik2: {e}")))?
+            .ok_or_else(|| TransportError::Noise("no ik2".into()))?;
+
+        let header = parse_frame_header(&buf[..n])
+            .map_err(|e| TransportError::Noise(format!("ik2 parse: {e}")))?;
+        let payload = &buf[8..8 + header.payload_len.min(n - 8)];
+
+        noise.read_message(payload)
+            .map_err(|e| TransportError::Noise(format!("ik2 process: {e}")))?;
+
+        let _session = noise.into_transport()
+            .map_err(|e| TransportError::Noise(format!("transport: {e}")))?;
+
+        // Send HEADERS
+        let headers = frame::encode_frame(1, FrameType::Headers, b"{}");
+        let (mut ctrl_send, _) = conn.open_bi().await
+            .map_err(|e| TransportError::Connect(format!("ctrl: {e}")))?;
+        ctrl_send.write_all(&headers).await.ok();
+        let _ = ctrl_send.finish();
+
+        Ok(conn)
+    }
+
+    /// 接受原始 QUIC 连接（包含 Noise IK + HEADERS）
     /// 用于 UDP 被封锁时通过 HTTP Upgrade 建立连接
     pub async fn start_ws_listener(&self, bind_addr: SocketAddr) -> Result<u16, TransportError> {
         let listener = tokio::net::TcpListener::bind(bind_addr)

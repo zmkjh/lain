@@ -28,7 +28,7 @@ use std::path::PathBuf;
 use tracing;
 
 use std::net::SocketAddr;
-use self::ipc::{IpcCommand, IpcServer};
+use self::ipc::{IpcCommand, IpcResponse, IpcServer};
 use self::conn_mgr::ConnectionManager;
 use self::iface_watcher::InterfaceWatcher;
 
@@ -328,6 +328,10 @@ impl Daemon {
 
         let conn_mgr = Arc::new(ConnectionManager::new());
 
+        // Track active QUIC connections
+        let connected: Arc<RwLock<HashMap<PeerId, quinn::Connection>>> =
+            Arc::new(RwLock::new(HashMap::new()));
+
         // Interface watcher: detect network changes
         let iface_watcher = Arc::new(InterfaceWatcher::new());
         iface_watcher.snapshot().await;
@@ -366,7 +370,6 @@ impl Daemon {
                     match cmd {
                         IpcCommand::ConnectPeer { invite, .. } => {
                             tracing::info!("IPC: connect via {invite}");
-                            // Parse invite to get PeerID and endpoints
                             let code = invite
                                 .strip_prefix("lain://")
                                 .and_then(|c| lain_discovery::InviteCode::from_base62(c).ok());
@@ -374,9 +377,65 @@ impl Daemon {
                                 let mut peers = known_peers.write().await;
                                 peers.insert(inv.peer_id, inv.endpoints.clone());
                                 conn_mgr.add_peer(inv.peer_id).await;
-                                tracing::info!("added peer {} ({} endpoints)",
-                                    inv.peer_id, inv.endpoints.len());
-                                // Initiate DHT lookup
+
+                                // Establish QUIC connection
+                                let t = transport.clone();
+                                let ipc_ev = _ipc_ev_tx.clone();
+                                let connected_ref = connected.clone();
+                                let pid = inv.peer_id;
+                                let pubkey = inv.ed25519_pk;
+                                let eps = inv.endpoints.clone();
+                                tokio::spawn(async move {
+                                    match t.connect_raw(&pubkey, &eps).await {
+                                        Ok(conn) => {
+                                            tracing::info!("connected to {pid}");
+                                            connected_ref.write().await.insert(pid, conn.clone());
+
+                                            // Notify IPC subscribers
+                                            let _ = ipc_ev.send(IpcResponse::Event {
+                                                event: "peer_connected".into(),
+                                                peer_id: Some(pid.to_string()),
+                                                data: None,
+                                            });
+
+                                            // Spawn reader task for incoming data
+                                            let ipc_ev2 = ipc_ev.clone();
+                                            let pid2 = pid;
+                                            let c = conn.clone();
+                                            tokio::spawn(async move {
+                                                loop {
+                                                    match c.accept_bi().await {
+                                                        Ok((_send, mut recv)) => {
+                                                            match recv.read_to_end(65536).await {
+                                                                Ok(_data) => {
+                                                                    let _ = ipc_ev2.send(IpcResponse::Event {
+                                                                        event: "data".into(),
+                                                                        peer_id: Some(pid2.to_string()),
+                                                                        data: Some(serde_json::json!({
+                                                                            "bytes": "incoming_data"
+                                                                        })),
+                                                                    });
+                                                                }
+                                                                Err(_) => break,
+                                                            }
+                                                        }
+                                                        Err(_) => break,
+                                                    }
+                                                }
+                                            });
+                                        }
+                                        Err(e) => {
+                                            tracing::warn!("connect to {pid} failed: {e}");
+                                            let _ = ipc_ev.send(IpcResponse::Event {
+                                                event: "peer_error".into(),
+                                                peer_id: Some(pid.to_string()),
+                                                data: Some(serde_json::json!({"error": e.to_string()})),
+                                            });
+                                        }
+                                    }
+                                });
+
+                                // Also do DHT lookup in parallel
                                 let dht = dht_arc.clone();
                                 let pid = inv.peer_id;
                                 tokio::spawn(async move {
@@ -384,26 +443,38 @@ impl Daemon {
                                         tracing::debug!("DHT find_peer({pid}): {e}");
                                     }
                                 });
-                            } else {
-                                tracing::warn!("invalid invite: {invite}");
                             }
                         }
                         IpcCommand::DisconnectPeer { peer_id } => {
                             tracing::info!("IPC: disconnect {peer_id}");
                             known_peers.write().await.remove(&peer_id);
                             conn_mgr.remove_peer(&peer_id).await;
+                            if let Some(conn) = connected.write().await.remove(&peer_id) {
+                                conn.close(0u32.into(), b"disconnected");
+                            }
                         }
                         IpcCommand::SendToPeer { peer_id, data } => {
-                            tracing::debug!("IPC: send {}b to {peer_id}", data.len());
-                            let peers = known_peers.read().await;
-                            if let Some(endpoints) = peers.get(&peer_id) {
-                                let msg = lain_core::frame::encode_frame(
-                                    2, lain_core::frame::FrameType::Data, &data,
-                                );
-                                // In production: send through established QUIC connection
-                                // For now, send via transport's UDP to peer endpoints
-                                for ep in endpoints {
-                                    let _ = socket.send_to(&msg, ep.addr).await;
+                            let conn = {
+                                let cons = connected.read().await;
+                                cons.get(&peer_id).cloned()
+                            };
+                            match conn {
+                                Some(conn) => {
+                                    let msg = frame::encode_frame(2, FrameType::Data, &data);
+                                    match conn.open_bi().await {
+                                        Ok((mut send, _recv)) => {
+                                            if let Err(e) = send.write_all(&msg).await {
+                                                tracing::warn!("send to {peer_id}: {e}");
+                                            } else {
+                                                let _ = send.finish();
+                                                tracing::debug!("sent {}b to {peer_id}", data.len());
+                                            }
+                                        }
+                                        Err(e) => tracing::warn!("open stream to {peer_id}: {e}"),
+                                    }
+                                }
+                                None => {
+                                    tracing::warn!("no active connection to {peer_id}");
                                 }
                             }
                         }
