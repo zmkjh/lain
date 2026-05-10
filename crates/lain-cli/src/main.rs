@@ -41,6 +41,7 @@ enum Command {
     Connect { invite: String },
     Send { peer_id: String, file: String },
     Monitor,
+    Shutdown,
     Status,
 }
 
@@ -82,23 +83,34 @@ fn main() {
     match cli.command.unwrap_or(Command::Daemon) {
         Command::Daemon => run_daemon(cli.foreground),
         Command::Whoami => {
-            if let Some(v) = ipc_req(&socket_path, r#"{"cmd":"Whoami"}"#) {
-                let pid = v.get("message").and_then(|m| m.as_str()).unwrap_or("?");
-                println!("PeerID: {pid}");
+            match ipc_req(&socket_path, r#"{"cmd":"Whoami"}"#) {
+                Some(v) => {
+                    let pid = v.get("message").and_then(|m| m.as_str()).unwrap_or("?");
+                    println!("PeerID: {pid}");
+                }
+                None => eprintln!("daemon not running"),
             }
         }
         Command::Invite => {
-            if let Some(v) = ipc_req(&socket_path, r#"{"cmd":"GetInvite"}"#) {
-                let inv = v.get("message").and_then(|m| m.as_str()).unwrap_or("?");
-                println!("Invite: {inv}");
+            match ipc_req(&socket_path, r#"{"cmd":"GetInvite"}"#) {
+                Some(v) => {
+                    let inv = v.get("message").and_then(|m| m.as_str()).unwrap_or("?");
+                    println!("Invite: {inv}");
+                }
+                None => eprintln!("daemon not running"),
             }
         }
         Command::Connect { invite } => connect_feedback(&socket_path, &invite),
         Command::Send { peer_id, file } => send_file(&socket_path, &peer_id, &file),
         Command::Monitor => monitor_loop(&socket_path),
+        Command::Shutdown => {
+            let _ = ipc_req(&socket_path, r#"{"cmd":"Shutdown"}"#);
+            println!("daemon shutting down");
+        }
         Command::Status => {
-            if let Some(v) = ipc_req(&socket_path, r#"{"cmd":"ListPeers"}"#) {
-                print_status(&v);
+            match ipc_req(&socket_path, r#"{"cmd":"ListPeers"}"#) {
+                Some(v) => print_status(&v),
+                None => eprintln!("daemon not running"),
             }
         }
     }
