@@ -86,6 +86,13 @@ fn ipc_req(socket_path: &PathBuf, json: &str) -> Option<serde_json::Value> {
 
 #[cfg_attr(not(unix), allow(unused_variables))]
 fn connect_feedback(socket_path: &PathBuf, invite: &str) {
+    let owned;
+    let invite = if !invite.starts_with("lain://") {
+        owned = format!("lain://{invite}");
+        &owned
+    } else {
+        invite
+    };
     #[cfg(unix)]
     {
         let mut stream = match std::os::unix::net::UnixStream::connect(socket_path) {
@@ -170,7 +177,21 @@ fn listen_loop(socket_path: &PathBuf) {
                 match event {
                     "peer_connected" => println!("[connected] {peer}"),
                     "incoming_connection" => println!("[incoming] {peer}"),
-                    "data" => println!("[data] from {peer}"),
+                    "data" => {
+                        // Try to save received data as file
+                        if let Some(data_field) = v.get("data") {
+                            if let Some(b64) = data_field.get("bytes").and_then(|b| b.as_str()) {
+                                use base64::Engine;
+                                if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(b64) {
+                                    let filename = format!("received_from_{peer}.bin");
+                                    let _ = std::fs::write(&filename, &bytes);
+                                    println!("[data] from {peer} → saved {filename} ({} bytes)", bytes.len());
+                                }
+                            } else {
+                                println!("[data] from {peer}");
+                            }
+                        }
+                    },
                     _ => println!("[{event}] {peer}"),
                 }
             }
