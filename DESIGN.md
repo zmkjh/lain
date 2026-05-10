@@ -459,11 +459,15 @@ TTL 使用相对值而非绝对时间戳。发布方 STORE 时写入 `ttl_second
 
 每 300s 遍历路由表：STALE/EXPIRED 标记 → EXPIRED 移除 → 全部 EXPIRED 则 DHT 标记为 dormant（保留 routes.bin 和 peers.json，释放连接资源，停止心跳）。收到新 peer 的 invite 或应用层触发时，从持久化路由表恢复并重新 bootstrap。
 
-**Dormant 状态**：停止心跳 STORE 和 bucket 刷新，保留路由表序列化文件。收到新 peer 的 invite 或应用层触发连接时，从持久化路由表恢复并重新 bootstrap。此机制确保长期无活动时不消耗后台流量和 CPU。
+**Dormant 状态**：停止心跳 STORE 和 bucket 刷新，保留路由表序列化文件。收到新 peer 的 invite 或应用层触发连接时，从持久化路由表恢复并重新 bootstrap。
+
+**全部节点离线**：DHT 无在线节点时，网络进入静默状态。重启的节点从 routes.bin + peers.json 尝试 bootstrap——如果持久化列表中的节点均未上线，bootstrap 失败，节点进入 DEGRADED。此时需要至少一个持有旧路由表的节点重新上线，或通过 invite 引入新节点。这是 P2P 网络的固有特性，不是 bug。
 
 ### 8.6 接口切换
 
-检测到接口变更 → 全量重建：重新 NAT 探测 → 重新 STUN → 紧急 UPDATE DHT → 重建所有直连 → 失败的回退 relay。
+检测到接口变更（WiFi↔蜂窝、IPv6 SLAAC 轮换）→ 重新 NAT 探测 → 重新 STUN → Emergency UPDATE DHT（STORE 新 endpoints 和更新的 capabilities）→ 向所有直连 peer 发送 PATH_CHANGE 帧 → 失败的回退 relay。
+
+接收 PATH_CHANGE 的 peer 应重新执行 FIND_VALUE 获取对端最新 capabilities（NAT 类型、IPv6 状态等），因为接口切换可能改变这些属性。后续重连策略根据新 capabilities 调整——例如对方从 Cone NAT 变成 S_APDF 后，跳过 STUN 打洞。
 
 ---
 
@@ -529,6 +533,8 @@ Bootstrap 步骤:
 ```
 
 注：首次启动必须有 invite（来源 2）或公共 bootstrap 节点（来源 3）。重启则从来源 1 恢复。
+
+**第一节点**：当没有任何已知节点时（首个 Lain 用户），daemon 以空路由表启动——自己就是 DHT 的起点。此时生成 invite 分享给他人，对方通过 invite 连接后，双方互相 STORE 到彼此的 k-bucket。从这一刻起 DHT 开始运行。
 
 ### 9.5 Lookup
 
@@ -930,6 +936,9 @@ POST  /peer/connect              ← { peer_id }
 
 GET   /metrics                   → Prometheus text
 
+POST  /connection/{id}/accept     → { ws_port }  (浏览器接收入站连接)
+POST  /connection/{id}/reject     → { status }
+
 GET   /events                    → SSE event stream
   events: peer_online, peer_offline, connection_incoming, connection_established, connection_closed
 ```
@@ -1041,6 +1050,8 @@ lain://<base62_invite_code>
 | `STREAM_LIMIT_EXCEEDED` | 429 | stream 数达上限 |
 | `STREAM_CLOSED` | 410 | stream 已被对方关闭 |
 | `RELAY_UNAVAILABLE` | 503 | 无可用 relay |
+| `CONNECTION_REJECTED` | 403 | 对端应用拒绝了连接 |
+| `NO_LISTENER` | 503 | 对端 daemon 无应用监听 |
 | `VERSION_MISMATCH` | 400 | 协议版本不支持 |
 | `INTERNAL_ERROR` | 500 | daemon 内部错误 |
 | `NOT_READY` | 503 | daemon 未完成初始化 |
