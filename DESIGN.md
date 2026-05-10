@@ -11,10 +11,11 @@ Lain 是一个零服务器、零配置的 P2P 网络基础设施，以 daemon �
 **节点是暂时的，连接是持续重建的。** Lain 面向没有固定公网 IP 的终端设备——手机、笔记本、台式机。IPv6 SLAAC 临时地址静默轮换、WiFi↔蜂窝切换、NAT 映射过期都是既定事实，设计上拥抱而非对抗。
 
 - **PeerID 是永久的**：等于 `SHA256(Ed25519 公钥)`。只要密钥文件不丢，PeerID 在设备生命周期内不变。变化的只是网络地址。
-- **网络是可重连资源的集合**：节点通过定期广播证明自己是活跃资源；长期不广播则自然淘汰。
-- **Invite 码是初始寻址提示**：携带生成时刻的地址快照，接收方优先去 DHT 查找最新地址。
-- **网络没有创建者**：一个网络只是一个共享的 secret。谁生成 invite 谁就是第一个知道这个 secret 的人——没有任何特权、不拥有网络、不充当服务器。所有人地位相同。
-- **一对一连接，不是广播**：lain 在两个设备之间建立加密字节流。如果要给多个设备发数据，就分别建立多条连接——每条都是独立的加密通道。没有"全网广播"原语。
+- **全联通，无分区**：一个全局 DHT，所有 Lain 节点共用一个地址空间。节点通过 DHT 宣告在线、发现彼此。没有"网络"概念——不需要创建、加入、切换。
+- **Invite 码是 peer 介绍信**：携带对方的 PeerID、公钥、当前地址快照。拿到 invite 就能找到对方、建立加密连接。
+- **一对一连接，不是广播**：Lain 在两个设备之间建立加密字节流。如果要给多个 peer 发数据，就分别建立多条连接——每条都是独立的 Noise 端到端加密通道。
+- **零配置启动**：daemon 不带任何参数就能运行，所有参数有内置默认值。
+- **群组是应用层的事**：哪些 peer 之间通信、如何分组——Lain 不参与。基础设施只负责建通道。
 
 ---
 
@@ -26,9 +27,10 @@ Lain 是一个零服务器、零配置的 P2P 网络基础设施，以 daemon �
 | 传输协议 | QUIC (UDP)，WebSocket over TCP 兜底 |
 | 身份密钥 | Ed25519 |
 | 握手 | Noise_IK (1-RTT)，高于 QUIC 层，端到端加密 |
-| DHT | 基础 Kademlia，per-network 独立路由表 |
+| DHT | 基础 Kademlia，全局单一路由表 |
 | NAT 穿透 | IPv6 直连 → STUN 打洞 → P2P Relay（三层模型） |
-| 网络准入 | Invite-only |
+| 发现 | Invite（peer 身份介绍） |
+| 发现 | Invite（peer 身份介绍） |
 
 ---
 
@@ -65,14 +67,14 @@ Lain 是一个零服务器、零配置的 P2P 网络基础设施，以 daemon �
 
 ## 3.5 并发模型
 
-Daemon 采用 Tokio async runtime，以网络（network）为顶层调度单元。单个 UDP socket 承载所有网络的 DHT/QUIC/STUN 流量，按首字节 + NetworkID 分发到对应网络的 supervisor task。
+Daemon 采用 Tokio async runtime。单个 UDP socket 承载所有 DHT/QUIC/STUN 流量，按首字节分发。
 
 ### 任务层级
 
 ```
 ┌─ main task
 │  ├─ IPC server task (UDS + HTTP)
-│  ├─ per-network supervisor task
+│  ├─ DHT + connection supervisor task
 │  │   ├─ DHT task (UDP socket, RPC dispatch, bucket maintenance)
 │  │   ├─ Discovery task (mDNS broadcast + listen, invite code gen/parse)
 │  │   ├─ Heartbeat timer task
@@ -82,7 +84,7 @@ Daemon 采用 Tokio async runtime，以网络（network）为顶层调度单元�
 │  │       ├─ Noise handshake task (ephemeral)
 │  │       ├─ Stream multiplex task (framed read/write)
 │  │       └─ NAT traversal task (ephemeral, shared across connections)
-│  ├─ WS fallback listener task (per-network, lazily spawned)
+│  ├─ WS fallback listener task (lazily spawned)
 │  └─ Persistence flush timer
 ```
 
@@ -146,29 +148,15 @@ Initiator (PeerID 小)              Responder (PeerID 大)
   │ ───────────────────────────────> │
 ```
 
-### 4.3 Network 隔离
+### 4.3 全联通模型
 
-每个 overlay 网络由唯一的 `network_secret`（32 随机字节）定义。`NetworkID = SHA256(network_secret)` 是其全局唯一标识。
+所有 Lain 节点共享一个全局 DHT。没有 network_secret、没有 NetworkID、没有"网络"概念。
 
-**多网络并存**：一个 daemon 可以同时参与多个网络。每个网络有完全隔离的：
-- DHT 路由表（独立 k-bucket 集合）
-- 节点发现（mDNS 按 NetworkID 过滤）
-- 连接集合（per-network QUIC connection 池）
-- 持久化目录 `~/.lain/networks/<network_id>/`
+**如何发现 peer**：拿到对方的 invite 码（含 PeerID + Ed25519 公钥 + 地址快照）→ DHT `FIND_VALUE(peer_id)` 获取最新地址 → 发起 QUIC + Noise IK 连接。
 
-**协议层隔离**：NetworkID 嵌入在所有跨网络消息中（DHT RPC 头、Noise 握手帧）。收到消息时 daemon 根据 NetworkID 分发到对应网络的 supervisor task。不知道 network_secret 的节点无法伪造该 network 的消息——签名或 HMAC 都依赖 network_secret。
+**如何防止未授权连接**：Noise IK 要求发起方预先知道响应方公钥。没有对方的 invite（即没有对方的公钥），无法完成 Noise 握手。DHT 中可见 PeerID 和 IP，但不知道公钥就无法建立加密连接。
 
-**用户视角**：一个 invite 码对应一个 network。接受多个 invite 就是加入多个网络。例如：
-
-```
-$ lain invite accept lain://abc...     # 加入"家庭设备"网络
-$ lain invite accept lain://xyz...     # 加入"团队协作"网络
-$ lain network list
-  f8a2...  (来自 abc)  3 peers  状态: joined
-  7d1b...  (来自 xyz)  5 peers  状态: joined
-```
-
-**网络之间不互通**：不同网络的 peer 无法互相发现或通信——即使运行在同一台设备上。应用通过 IPC 指定 `network_id` 来选择在哪个网络内建立连接。这是安全特性，不是限制：家庭网络的剪贴板同步不应该泄露到团队网络中。
+**隐私考虑**：同一 PeerID 跨"群组"可见——这是 design choice，不是 bug。DHT 暴露的信息与 STUN server 相当（IP + 端口）。应用层可自行管理"哪些 peer 属于哪个群组"。
 
 ---
 
@@ -188,28 +176,16 @@ $ lain network list
 
 ```
 Invite = {
-  version:      u8            // 协议版本 (当前 = 1)
-  peer_id:      [u8; 32]     // SHA256(ed25519_pubkey)
-  ed25519_pk:   [u8; 32]     // Ed25519 公钥
-  network_id:   [u8; 32]     // SHA256(network_secret)
-
-  capabilities: u8            // bitmask
-    // bit 0: ipv6_available
-    // bit 1: ipv6_inbound_open
-    // bit 2-3: ipv4_nat_type (00=Cone, 01=S_ADF, 10=S_APDF)
-    // bit 4: websocket_fallback
-    // bit 5: relay_capable
-
+  version:       u8
+  peer_id:       [u8; 32]      // SHA256(ed25519_pubkey)
+  ed25519_pk:    [u8; 32]      // Ed25519 公钥
+  capabilities:  u8             // bitmask
   mappable_port_start: u16
   mappable_port_end:   u16
   port_delta_hint:     u8
-
-  endpoints: [
-    { addr, kind: IPv6|STUN|LAN|WS, priority, ttl_seconds }
-  ]
-
-  timestamp:   u64
-  signature:   [u8; 64]     // Ed25519 over all above
+  endpoints:     [ { addr, kind, priority, ttl_seconds } ]
+  timestamp:     u64
+  signature:     [u8; 64]      // Ed25519 over all above
 }
 ```
 
@@ -217,12 +193,12 @@ Invite = {
 
 ### 5.3 使用流程
 
-1. A 生成 Invite 码（包含当前时刻的网络快照）
+1. A 生成 invite 码（包含自己的 PeerID、公钥、地址快照）
 2. A 通过 out-of-band 渠道分享给 B
-3. B 解析 → 获取 PeerID、公钥、能力声明、地址提示
-4. B 用 invite 中的地址尝试直连 → 失败则 DHT `FIND_VALUE(peer_id)` 找新地址 → 还失败则节点可能离线
-5. B 反向生成自己的 Invite 码发给 A
-6. 双方完成 Noise_IK，建立对等连接
+3. B 解析 → 获取 A 的 PeerID、公钥、能力声明、地址提示
+4. B 用 invite 中的地址尝试直连 → 失败则 DHT FIND_VALUE(A的PeerID) 获取新地址 → 还失败则 A 可能离线
+5. 双方完成 Noise_IK，建立对等连接
+6. 连接成功后，B 也通过 DHT STORE 宣告自己在线（A 之后可通过 DHT 找到 B）
 
 Invite 码是**初始寻址提示**，不是永久地址。成功连过一次之后，双方 daemon 记住了 PeerID，后续重连自动走 DHT，不需要再次交换 invite。
 
@@ -376,7 +352,7 @@ relay_capable = (nat_type == Cone) || ipv6_inbound_open
 
 **阶段一（被动收集）**：每个节点在 DHT 路由表中标记所有 `relay_capable` 节点。随着路由表自然填充，候选池逐步积累。
 
-**阶段二（主动查询）**：候选池为空或全部不可达时，执行 `FIND_VALUE(RelayCapabilityMarker)` 查询。`RelayCapabilityMarker = SHA256(network_secret || "relay")` 是一个约定好的魔术 key，所有 relay 节点在心跳 STORE 中同时 STORE 自己的 `peer_id` 到这个 key。FIND_VALUE 返回的 value 是当前在线的 relay PeerID 列表。
+**阶段二（主动查询）**：候选池为空或全部不可达时，执行 `FIND_VALUE(RelayCapabilityMarker)` 查询。`RelayCapabilityMarker = SHA256("lain-relay-v1")` 是一个全局静态魔术 key，所有 relay 节点在心跳 STORE 中同时 STORE 自己的 `peer_id` 到这个 key。FIND_VALUE 返回的 value 是当前在线的 relay PeerID 列表。
 
 #### Relay 选路：为 A↔B 找到合适的中继
 
@@ -444,38 +420,18 @@ NAT_PROBING
   ▼
 RUNNING
   │
-  ├─ 有活跃网络 ──→ 心跳广播、DHT 维护、接受连接
+  ├─ 有在线 peer ──→ 心跳广播、DHT 维护、接受连接
   │
-  ├─ 全部网络 dormant ──→ IDLE (只维持 IPC 监听)
+  ├─ 全部远程节点 EXPIRED ──→ IDLE (停止 DHT 心跳，只维持 IPC 监听)
   │
   └─ 收到 SIGTERM ──→ DRAINING → 序列化 → EXIT
 ```
 
-### 8.3 网络级别状态
-
-```
-BOOTSTRAPPING
-  │ 从 seeds/peers.json 开始，PING → FIND_NODE → 填充 bucket
-  │ 超时 120s 仍无任何节点 → DEGRADED
-  ▼
-JOINED
-  │ STORE self → 接收心跳 → 接受 peer 连接
-  │
-  ├─ 所有远程节点 EXPIRED ──→ DORMANT (停止 DHT 维护)
-  │   └─ 收到新 invite 或应用触发 ──→ BOOTSTRAPPING
-  │
-  └─ DHT bootstrap 失败 ──→ DEGRADED (仅已连接的直连 peer 可用)
-      └─ 收到新 invite → 用新 peer 重新 bootstrap → BOOTSTRAPPING → JOINED
-      └─ 没有任何已知 peer + invite 过期 → 等待用户提供新 invite
-```
-
-注：BOOTSTRAPPING 超时（120s）后转入 DEGRADED。路径：无任何节点已知（peers.json 空 + routes.bin 空 + 无 invite）→ 直接进入 DEGRADED。首个创建网络的节点在此状态等待其他节点通过 invite 加入。
-
-### 8.4 防时钟漂移
+### 8.3 防时钟漂移
 
 TTL 使用相对值而非绝对时间戳。发布方 STORE 时写入 `ttl_seconds = 300`，接收方用**自己的本地时钟**计算 `expires_at = now() + ttl_seconds`。整个状态机完全基于接收方时钟，不受双方时钟偏差影响。Invite 码 timestamp 防重放窗口放宽至 30 分钟覆盖极端漂移。
 
-### 8.5 心跳
+### 8.4 心跳
 
 ```
 广播间隔 = max(ttl / 2, 60s)  // 默认 150s
@@ -488,13 +444,13 @@ TTL 使用相对值而非绝对时间戳。发布方 STORE 时写入 `ttl_second
 
 **紧急广播**：检测到 SLAAC 轮换或网络接口变更时立即触发，不等定时器。
 
-### 8.6 清理
+### 8.5 清理
 
-每 300s 遍历路由表：STALE/EXPIRED 标记 → EXPIRED 移除 → 全部 EXPIRED 则网络标记为 dormant（保留 network_secret，释放连接资源）。
+每 300s 遍历路由表：STALE/EXPIRED 标记 → EXPIRED 移除 → 全部 EXPIRED 则 DHT 标记为 dormant（保留 routes.bin 和 peers.json，释放连接资源，停止心跳）。收到新 peer 的 invite 或应用层触发时，从持久化路由表恢复并重新 bootstrap。
 
-**Dormant 状态**：停止心跳 STORE 和 bucket 刷新，保留路由表序列化文件。收到该网络的 invite 或应用层触发时，从持久化路由表恢复并重新 bootstrap。此机制确保节点加入多个网络时，长期无活动的网络不消耗后台流量和 CPU。
+**Dormant 状态**：停止心跳 STORE 和 bucket 刷新，保留路由表序列化文件。收到新 peer 的 invite 或应用层触发连接时，从持久化路由表恢复并重新 bootstrap。此机制确保长期无活动时不消耗后台流量和 CPU。
 
-### 8.7 网络切换
+### 8.6 接口切换
 
 检测到接口变更 → 全量重建：重新 NAT 探测 → 重新 STUN → 紧急 UPDATE DHT → 重建所有直连 → 失败的回退 relay。
 
@@ -528,8 +484,8 @@ insert_node(new):
 原始 UDP，简洁二进制：
 
 ```
-请求:   version(1) | message_id(16) | msg_type(1) | sender_id(32) | network_id(32) | payload | Ed25519签名(64)
-响应:   version(1) | message_id(16) | msg_type|0x80 | sender_id(32) | network_id(32) | payload | Ed25519签名(64)
+请求:   version(1) | message_id(16) | msg_type(1) | sender_id(32) | payload | Ed25519签名(64)
+响应:   version(1) | message_id(16) | msg_type|0x80 | sender_id(32) | payload | Ed25519签名(64)
 ```
 
 版本不匹配时，接收方回复错误码 `UNSUPPORTED_VERSION`，附带自身支持的版本号。双方取 min 版本进行后续通信。
@@ -542,7 +498,7 @@ insert_node(new):
 
 超时 5s，重试 2 次。
 
-**签名策略**：请求端对所有 RPC 请求签名（防篡改 + 防重放，timestamp 隐含在 message_id 中）。响应端仅对包含可验证数据 payload 的响应签名（如 FIND_VALUE 返回的 value / STORE 返回的 key 确认）。空 payload 响应（如 PING 的 k-closest 列表仅含路由信息、STORE 的 ok）使用 HMAC(network_secret, message) 快速认证，降低 CPU 开销。
+**签名策略**：请求端对所有 RPC 请求 Ed25519 签名（防篡改 + 防重放）。响应端仅对包含可验证数据 payload 的响应签名（如 FIND_VALUE 返回的 value / STORE 返回的 key 确认）。空 payload 响应（如 PING 的 k-closest 列表、STORE 的 ok）无需签名——接收方通过 message_id 关联到原始请求即可验证响应合法性。
 
 ### 9.4 Bootstrap
 
@@ -566,7 +522,7 @@ insert_node(new):
 
 ## 9.7 线格式规范
 
-以下定义所有网络消息的精确二进制编码。多字节整数统一采用**大端序（Big-Endian）**。
+以下定义所有协议消息的精确二进制编码。多字节整数统一采用**大端序（Big-Endian）**。
 
 ### 9.7.1 基本类型编码
 
@@ -590,7 +546,6 @@ Endpoint:
   ─ ttl_seconds: u32
 
 PeerID:    [u8; 32]   // SHA256 hash
-NetworkID: [u8; 32]   // SHA256 hash
 ```
 
 ### 9.7.2 DHT RPC 消息格式
@@ -598,20 +553,18 @@ NetworkID: [u8; 32]   // SHA256 hash
 所有 DHT RPC 通过单个 UDP socket 发送。消息头统一 83 字节，后跟可变长 payload：
 
 ```
-┌──────────────────────────────────────────────────────┐
-│ offset │ size │ field          │ description          │
-├────────┼──────┼────────────────┼──────────────────────┤
-│ 0      │ 1    │ version        │ 协议版本 (1)          │
-│ 1      │ 16   │ message_id     │ 随机，请求/响应对应    │
-│ 17     │ 1    │ msg_type       │ bit7=0请求 bit7=1响应  │
-│ 18     │ 32   │ sender_id      │ 发送方 PeerID          │
-│ 50     │ 32   │ network_id     │ NetworkID              │
-│ 82     │ 1    │ payload_len_hi │ payload 长度高字节     │
-│ 83     │ 2    │ payload_len_lo │ payload 长度低 2 字节  │
-│ 85     │ var  │ payload        │ 见各 RPC 定义          │
-│ 85+len │ 64   │ signature      │ Ed25519 覆盖 0..payload_end │
-│        │      │ (或 HMAC)      │ HMAC 用于无数据响应     │
-└──────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────┐
+│ offset │ size │ field         │ description  │
+├────────┼──────┼───────────────┼──────────────┤
+│ 0      │ 1    │ version       │ 协议版本 (1)  │
+│ 1      │ 16   │ message_id    │ 随机ID        │
+│ 17     │ 1    │ msg_type      │ bit7=0请求    │
+│ 18     │ 32   │ sender_id     │ 发送方 PeerID │
+│ 50     │ 1    │ payload_len_hi│               │
+│ 51     │ 2    │ payload_len_lo│               │
+│ 53     │ var  │ payload       │               │
+│ 53+len │ 64   │ signature     │               │
+└─────────────────────────────────────────────┘
 ```
 
 **msg_type 定义：**
@@ -692,9 +645,8 @@ Noise_IK 握手通过 QUIC stream ID 0（首个 stream）或 WebSocket binary me
 │        │       │   0 = IK message 1 (initiator → responder) │
 │        │       │   1 = IK message 2 (responder → initiator) │
 │        │       │   2 = payload (initiator → responder)      │
-│ 5      │ 32    │ network_id             │
-│ 37     │ 3     │ payload_len (u24 BE)   │
-│ 40     │ var   │ Noise message payload  │
+│ 5      │ 3     │ payload_len (u24 BE)   │
+│ 8      │ var   │ Noise message payload  │
 └──────────────────────────────────────────┘
 ```
 
@@ -882,7 +834,7 @@ RECONNECTING            (重连, 跳过邀请, 直接从 DHT 获取 endpoint)
 3. 重新执行穿透（跳过已确定的不可行路径，如对 S_APDF 跳过 STUN 打洞）
 4. 成功 → 对端发送 STREAM_RESUME 帧（stream 0），格式为 `[(stream_id: varint, last_seq: u64), ...]`。接收方比对已收到的数据，缺失部分由发起方重传。应用层 fd 保持不变，恢复对应用透明。
 5. 失败 → 指数退避重试，最大间隔 5 分钟。peer EXPIRED 则放弃，向上层应用发送 STREAM_LOST 通知。
-6. 重启后重连：daemon 从 peers.json 恢复已知 peer 列表，从 routes.bin 恢复 DHT 路由表，优先连接这些 peer 以快速重新加入网络。
+6. 重启后重连：daemon 从 peers.json 恢复已知 peer 列表，从 routes.bin 恢复 DHT 路由表，优先连接这些 peer 以快速重建 DHT 邻居关系。
 
 ### 并发连接限制
 
@@ -914,15 +866,13 @@ RECONNECTING            (重连, 跳过邀请, 直接从 DHT 获取 endpoint)
 
 | method | params | result | 说明 |
 |--------|--------|--------|------|
-| `status` | {} | {peer_id, nat_type, networks, uptime_secs} | daemon 状态 |
+| `status` | {} | {peer_id, nat_type, peers_online, uptime_secs} | daemon 状态 |
 | `identity` | {} | {peer_id, public_key_hex} | 查看身份 |
-| `invite.generate` | {network_name?} | {invite_code, network_id} | 生成新 invite（首次时生成 network_secret） |
-| `invite.accept` | {invite_code} | {network_id, peer_count} | 接受 invite，加入网络 |
-| `network.list` | {} | [{network_id, name, peer_count, status}] | 列出已知网络 |
-| `network.forget` | {network_id} | {status} | 删除本地 network_secret，退出网络 |
-| `network.peers` | {network_id} | [{peer_id, status, latency_ms, path}] | 列出 peers |
-| `peer.connect` | {network_id, peer_id} | {state, attempt_id} → +fd | 建立数据流 |
-| `peer.disconnect` | {network_id, peer_id} | {status} | 断开 peer |
+| `invite.generate` | {} | {invite_code} | 生成自己的 invite（身份介绍信） |
+| `invite.accept` | {invite_code} | {peer_id, status} | 添加对方 peer |
+| `peer.list` | {} | [{peer_id, status, latency_ms, path}] | 已知 peer 列表 |
+| `peer.connect` | {peer_id} | {state, attempt_id} → +fd | 建立一对一数据流 |
+| `peer.disconnect` | {peer_id} | {status} | 断开 peer |
 | `metrics` | {} | {connections, bytes_sent, ...} | 获取指标 |
 | `shutdown` | {} | {status} | 优雅关闭 daemon |
 
@@ -931,24 +881,20 @@ RECONNECTING            (重连, 跳过邀请, 直接从 DHT 获取 endpoint)
 ```
 GET   /identity                  → { peer_id, public_key }
 
-POST  /invite/generate           ← { network_name? }
-                                  → { invite_code, network_id }
+POST  /invite/generate           → { invite_code }
 POST  /invite/accept             ← { invite_code }
-                                  → { network_id, peer_count }
-GET   /networks                  → [{ network_id, name, peer_count, status }]
-POST  /network/{id}/forget       → { status }
+                                  → { peer_id, status }
+GET   /peers                     → [{ peer_id, status, latency_ms, path }]
 
-GET   /networks/{id}/peers       → [{ peer_id, status: direct|relayed, latency_ms }]
-
-POST  /networks/{id}/connect     ← { peer_id }
-      → 202 Accepted { attempt_id }
-      ... events ...
-      → connection_established | connection_failed
+POST  /peer/connect              ← { peer_id }
+       → 202 Accepted { attempt_id }
+       ... events ...
+       → connection_established | connection_failed
 
 GET   /metrics                   → Prometheus text
 
-SUBSCRIBE /events                → SSE event stream
-  events: peer_joined, peer_left, connection_changed, network_changed
+GET   /events                    → SSE event stream
+  events: peer_online, peer_offline, connection_changed
 ```
 
 ### 11.4 数据面 — Native (UDS fd 传递)
@@ -959,8 +905,7 @@ SUBSCRIBE /events                → SSE event stream
 Client                              Daemon
   │                                    │
   │  {"id":1,"method":"peer.connect",  │
-  │   "params":{"network_id":"...",    │
-  │   "peer_id":"..."}}                │
+  │   "params":{"peer_id":"..."}}        │
   │ ──────────────────────────────────→│
   │                                    │ 执行穿透/连接
   │  {"id":1,"result":{"state":        │
@@ -984,7 +929,7 @@ fd 对应用透明：read 返回解密后的上层应用数据，write 自动封
 
 ### 11.5 数据面 — WebSocket (浏览器)
 
-通过 HTTP API 获得 ws_port后连接：`ws://127.0.0.1:{ws_port}/stream/{network_id}/{peer_id}` \\
+通过 HTTP API 获得 ws_port后连接：`ws://127.0.0.1:{ws_port}/stream/{peer_id}` \\
 WS binary message = 完整 Lain 帧（含 magic）。DATA_DGRAM 不适用。
 
 | 特性 | UDS (native) | WebSocket (浏览器) |
@@ -1026,8 +971,7 @@ lain://<base62_invite_code>
 |--------|------|------|
 | `INVALID_REQUEST` | 400 | 请求格式错误 |
 | `INVALID_INVITE` | 400 | Invite 码无效/过期/签名失败 |
-| `NETWORK_NOT_FOUND` | 404 | NetworkID 不存在 |
-| `PEER_NOT_FOUND` | 404 | PeerID 不在网络中 |
+| `PEER_NOT_FOUND` | 404 | PeerID 未知或不在线 |
 | `PEER_UNREACHABLE` | 503 | 穿透穷尽，peer 不可达 |
 | `CONNECTION_FAILED` | 502 | 连接建立后异常断开 |
 | `CONNECTION_TIMEOUT` | 504 | 连接/穿透超时 |
@@ -1110,12 +1054,10 @@ INFO  NAT probed: Cone, ipv6=available
 ~/.lain/
 ├── config.toml          # 可选配置
 ├── identity.json        # Ed25519 密钥对 (0600)
-├── logs/lain.log        # 可选日志文件
-├── networks/<id>/
-│   ├── network.json     # network_secret + 元数据
-│   ├── peers.json       # 已知 peer 公钥 + 最后一次连接的地址
-│   └── routes.bin       # Kademlia 路由表序列化
-└── cache/nat_type.json  # NAT 探测缓存
+├── peers.json           # 已知 peer 公钥 + 最后连接地址
+├── routes.bin           # Kademlia 路由表序列化
+├── cache/nat_type.json  # NAT 探测缓存
+└── logs/lain.log        # 可选日志文件
 ```
 
 #### routes.bin (DHT 路由表)
@@ -1128,7 +1070,7 @@ INFO  NAT probed: Cone, ipv6=available
 **读取时机**：
 - daemon 启动时读取。如果存在且未损坏 → 加载为初始路由表，跳过 bootstrap 的第一步（直接从已有邻居 PING 开始）。如果损坏或不存在 → 丢弃，从 invite/mDNS 重新 bootstrap。
 
-**格式**：每个网络一条记录，序列化为 `[(node_id, address, last_seen), ...]`。lightweight 二进制格式（MessagePack），不存完整的 peer endpoint info（那些在 DHT STORE 中冗余存储）。
+**格式**：序列化为 `[(node_id, address, last_seen), ...]`。lightweight 二进制格式（MessagePack），不存完整的 peer endpoint info（那些在 DHT STORE 中冗余存储）。
 
 **损坏处理**：读取失败 → WARN 日志，丢弃文件，从零 bootstrap。不影响 daemon 启动。
 
@@ -1145,7 +1087,6 @@ STUN:  stun.miwifi.com, stun.qq.com, stun.cloudflare.com, stun.l.google.com (按
 QUIC:  idle_timeout=30s, keep_alive=15s, max_udp_payload=1232 bytes
        (移动网络下 idle_timeout 自动调整为 120s, keep_alive 为 60s)
 DHT:   k=20, alpha=3, ttl=300s, heartbeat=150s, republish=3600s
-       max_active_networks=32 (活跃网络数上限，超出部分自动标记 dormant)
 连接:  connect_timeout=10s, traversal_timeout=30s, max_connections=256
        max_streams_per_conn=128, max_relay_streams=32
 穿透:  traversal_timeout=30s
@@ -1188,7 +1129,7 @@ QUIC short-header 包的首字节为 `01xxxxxx`（与 DHT version=1 冲突）。
 
 结构化 JSON 行 → stderr（systemd/容器友好）。可选文件轮转（保留 10MB）和 syslog。
 
-关键事件：启动、NAT 探测、连接建立/断开、节点生命周期迁移、DHT 操作、网络切换、错误。
+关键事件：启动、NAT 探测、连接建立/断开、节点生命周期迁移、DHT 操作、接口切换、错误。
 
 ### 12.6 指标
 
@@ -1214,7 +1155,7 @@ QUIC short-header 包的首字节为 `01xxxxxx`（与 DHT version=1 冲突）。
 
 #### 12.7.2 蜂窝数据优化
 
-**流量预算**（单活跃网络，移动模式，24 小时）：
+**流量预算**（移动模式，24 小时）：
 
 | 组件 | 频率 | 单次流量 | 日流量 |
 |------|------|---------|--------|
@@ -1251,7 +1192,6 @@ QUIC short-header 包的首字节为 `01xxxxxx`（与 DHT version=1 冲突）。
 | 接收 buffer 总量 | 8 MB | 2 MB | QUIC connection-level flow control 窗口 |
 | DHT k-bucket 容量 | k=20 | k=8 | 减少路由表内存（~200KB → ~80KB per network） |
 | relay candidate pool | 无上限 | 最多 16 个 | 减少 QUIC 连接数 |
-| max_active_networks | 32 | 8 | 减少并发 DHT 实例 |
 
 #### 12.7.5 连接策略
 
@@ -1297,7 +1237,7 @@ Level 4 — 最小存活: 仅 Relay 路径（所有直连不可用）
 
 ### 14.1 信任假设
 
-- **网络边界**：拥有 `network_secret` 即可加入网络。network_secret 通过 out-of-band 渠道分发（invite code），不经过 Lain 协议本身传递。
+- **访问控制**：知道对方公钥（通过 invite 获取）即可发起 Noise IK 连接。DHT 公开可查询。
 - **身份**：PeerID 与 Ed25519 公钥密码学绑定，无法伪造。
 - **DHT 节点**：零信任。任何节点可能恶意、投毒、或不响应。
 - **Relay 节点**：不可见明文（端到端 Noise 加密），但可观察元数据（谁和谁通信、流量大小、时间模式）。
@@ -1316,21 +1256,20 @@ Level 4 — 最小存活: 仅 Relay 路径（所有直连不可用）
 | **Relay 流量分析** | 低 | Relay 可见通信对、流量大小、时间模式。应对：padding 帧（可选），多 relay 分散流量。 |
 | **QUIC 降级攻击** | 低 | QUIC TLS 1.3 自身防降级。Lain 固定使用 QUIC v1，不协商更低版本。 |
 | **DoS (连接洪泛)** | 中 | 全局 max_connections=256。STUN server 请求限速。DHT RPC 每 bucket 队列上限。 |
-| **密钥泄露** | 高 | Ed25519 密钥文件 0600 权限。泄露后 PeerID 永久不可信——需生成新身份重新加入所有网络。 |
+| **密钥泄露** | 高 | Ed25519 密钥文件 0600 权限。泄露后 PeerID 永久不可信——需生成新身份，重新通过 invite 建立所有 peer 关系。 |
 
 ### 14.3 数据分类与保护
 
 | 数据 | 位置 | 保护方式 |
 |------|------|---------|
 | Ed25519 私钥 | `identity.json` (磁盘) | 文件权限 0600。不加密存储（依赖 OS 用户隔离）。未来可选 passphrase 加密。 |
-| network_secret | `network.json` (磁盘) | 文件权限 0600。 |
 | 应用层 payload | 网络传输 | Noise ChaChaPoly 加密 + QUIC TLS 1.3 双重加密。 |
 | DHT 路由表 | 内存 + `routes.bin` | 仅含 node_id + address，不含密钥材料。 |
 | Invite code 传输 | out-of-band (用户控制) | Ed25519 签名防篡改。传输通道安全性由用户保证。 |
 
 ### 14.4 隐私考虑
 
-- **DHT 可见性**：任何拥有 network_secret 的节点可查询 DHT 获取所有节点的 PeerID 和 endpoint。PeerID 不直接关联真实身份（除非用户将 PeerID 公之于众）。
+- **DHT 可见性**：任何 lain 节点可查询 DHT 获取任意 PeerID 的 endpoint 记录。PeerID 是公钥哈希，不直接关联真实身份。暴露的信息与 STUN server 相当（IP + 端口 + 在线状态）。
 - **Relay 元数据**：Relay 可见通信双方 PeerID。在小型网络中可以推断社交图。缓解：大网络（node 多）自然模糊；多 relay 分散。
 - **mDNS 广播**：局域网内任何人可见 PeerID。可在信任的局域网内使用。
 
@@ -1378,7 +1317,7 @@ Level 4 — 最小存活: 仅 Relay 路径（所有直连不可用）
 ### 16.3 升级路径
 
 - **identity.json**：从 v1 起格式固定（Ed25519 密钥对 JSON），不随协议版本变更。
-- **network.json / peers.json**：JSON 格式，新增字段向后兼容（旧版本忽略未知字段）。
+- **peers.json**：JSON 格式，新增字段向后兼容（旧版本忽略未知字段）。
 - **routes.bin**：MessagePack 格式，版本号嵌入文件头。不兼容时丢弃重建（从 DHT 自然恢复）。
 - **config.toml**：新增 key 有默认值，删除 key 被忽略。
 
@@ -1434,7 +1373,7 @@ lain/
 ├── coverage-analysis.md     # NAT 覆盖率分析论文
 ├── crates/
 │   ├── lain-core/           # 核心类型、trait、协议定义
-│   ├── lain-identity/       # Ed25519 密钥、PeerID、NetworkID
+│   ├── lain-identity/       # Ed25519 密钥、PeerID
 │   ├── lain-noise/          # Noise IK 握手
 │   ├── lain-nat/            # NAT 探测、STUN 客户端
 │   ├── lain-discovery/      # mDNS、invite code 编解码
@@ -1455,55 +1394,43 @@ Lain 的核心能力：**在两个设备之间建立加密字节流，不需要�
 
 ---
 
-### 19.1 用户视角：多网络并存
+### 19.1 用户视角：全联通
 
-**场景**：笔记本、手机、NAS 组成"家庭"网络；笔记本还能加入同事的"团队"网络。两个网络互不干扰。
+**场景**：笔记本、手机、NAS、同事的机器——所有设备在同一个全局 DHT 中，通过 invite 互相认识。
 
 ```
 笔记本$ lain daemon
   INFO  identity=b3f1..., IPv6 inbound open, NAT Cone
 
-# ── 家庭网络 ──
 笔记本$ lain invite generate
   invite: lain://3KqWx7...          ← 发到家庭群
 
 手机$ lain invite accept lain://3KqWx7...
-  INFO  network f8a2...  2 peers    ← 手机 + 笔记本
+  INFO  peer d7e4... connected      ← 一键直连
 
 NAS$ lain invite accept lain://3KqWx7...
-  INFO  network f8a2...  3 peers    ← NAS + 手机 + 笔记本
+  INFO  peer a1c2... connected
 
-# ── 团队网络（另一群人的 secret）──
+# 同事也发了他的 invite
 笔记本$ lain invite accept lain://7mZpL2...
-  INFO  network 9c1d...  4 peers    ← 同事的 invite
+  INFO  peer x9b3... connected      ← 同事的 machine
 
-笔记本$ lain network list
-  f8a2...  (家庭)  3 peers  joined
-  9c1d...  (团队)  4 peers  joined
-
-笔记本$ lain network peers f8a2...
+笔记本$ lain peer list
   d7e4...  (手机)  direct_quic,  12ms
   a1c2...  (NAS)   relayed,      28ms
-
-笔记本$ lain network peers 9c1d...
-  x9b3...  (同事A) direct_quic,  8ms
-  y2k7...  (同事B) direct_quic,  15ms
-  z4m1...  (同事C) relayed,      35ms
+  x9b3...  (同事)  direct_quic,  8ms
 ```
 
-关键：手机和 NAS 看不到团队网络——他们没有那个 secret。同事看不到家庭网络——他们没有家庭网络的 secret。笔记本的两个网络完全隔离，daemon 内部各跑各的 DHT 路由表。
+关键：没有"网络"——所有 peer 在同一个列表里。应用层负责分组（比如剪贴板同步只连家人，代码协作只连同事）。手机和 NAS 没加过同事的 invite，所以看不到同事。同事没加过手机的 invite，所以看不到手机。
 
-应用通过 IPC 连接时指定 `network_id`：
+应用连接 peer 时只指定 PeerID：
 
 ```python
-# 发文件给 NAS，走家庭网络
-rpc("peer.connect", {"network_id": "f8a2...", "peer_id": "a1c2..."})
-
-# 发消息给同事，走团队网络
-rpc("peer.connect", {"network_id": "9c1d...", "peer_id": "x9b3..."})
+rpc("peer.connect", {"peer_id": "a1c2..."})   # 连 NAS
+rpc("peer.connect", {"peer_id": "x9b3..."})   # 连同事
 ```
 
-同一个 daemon 进程，同一个 UDP 端口，靠 NetworkID 区分流量。
+同一个 daemon，同一个 DHT，同一个 UDP 端口。没有分区。
 
 ---
 
@@ -1527,14 +1454,14 @@ def rpc(method, params={}):
 
 rpc("invite.accept", {"invite_code": "3KqWx7..."})
 
-# 2. 获取网络中的所有 peer
-peers = rpc("network.peers", {"network_id": "f8a2..."})
+# 2. 获取已知 peer 列表
+peers = rpc("peer.list")
 # → [{"peer_id":"d7e4...","status":"direct"}, {"peer_id":"a1c2...","status":"relayed"}]
 
 # 3. 逐一到每个 peer 建立连接，获取独立的字节流 fd
 connections = {}
 for p in peers["result"]:
-    result = rpc("peer.connect", {"network_id": "f8a2...", "peer_id": p["peer_id"]})
+    result = rpc("peer.connect", {"peer_id": p["peer_id"]})
     fd = received_fd  # daemon 通过 SCM_RIGHTS 传回
     connections[p["peer_id"]] = fd
 
@@ -1556,9 +1483,9 @@ let mut client = Client::connect_default().await?;
 client.accept_invite("3KqWx7...").await?;
 
 // 获取所有 peer，逐一建立一对一连接
-let peers = client.list_peers("f8a2...").await?;
+let peers = client.list_peers().await?;
 for peer in peers {
-    let mut stream = client.connect("f8a2...", &peer.peer_id).await?;
+    let mut stream = client.connect(&peer.peer_id).await?;
     stream.write_all(b"clipboard: hello").await?;
     let mut buf = [0u8; 4096];
     let n = stream.read(&mut buf).await?;
@@ -1574,21 +1501,21 @@ for peer in peers {
 浏览器通过 HTTP/WebSocket 与 daemon 通信：
 
 ```javascript
-// 加入网络
+// 加入（添加 peer）
 const resp = await fetch('http://127.0.0.1:9177/invite/accept', {
   method: 'POST',
   body: JSON.stringify({ invite_code: '3KqWx7...' })
 });
-const { network_id } = await resp.json();
+const { peer_id } = await resp.json();
 
 // 连接 peer（数据面）
 const { ws_port } = await fetch(
-  `http://127.0.0.1:9177/networks/${network_id}/connect`,
+  'http://127.0.0.1:9177/peer/connect',
   { method: 'POST', body: JSON.stringify({ peer_id: 'd7e4...' }) }
 ).then(r => r.json());
 
 // WebSocket 直连 daemon 数据面
-const ws = new WebSocket(`ws://127.0.0.1:${ws_port}/stream/${network_id}/d7e4...`);
+const ws = new WebSocket(`ws://127.0.0.1:${ws_port}/stream/d7e4...`);
 ws.binaryType = 'arraybuffer';
 ws.onopen  = () => ws.send(new TextEncoder().encode('clipboard: hello'));
 ws.onmessage = (e) => console.log('收到:', new TextDecoder().decode(e.data));
@@ -1606,7 +1533,7 @@ $ lain daemon                                        $ lain daemon
   → 生成 identity, 启动 QUIC, 开启 IPC                   → 同上
 
 $ lain invite generate
-  → 生成 network_secret
+  → 生成自己的 invite，含公钥 + 地址快照
   → 输出 invite: lain://3KqWx7...
   → A 把 invite 发到微信群 / AirDrop 给 B
 
@@ -1615,8 +1542,9 @@ $ lain invite generate
                                                        → QUIC → Noise IK → 连接建立 ✓
                                                        → DHT 已 bootstrap（通过 A）
 
-$ lain network list
-  f8a2...  1 peer (B的机器)
+$ lain peer list
+  b3f1... (self)        direct_quic
+  d7e4... (B的机器)      direct_quic, 8ms, IPv6
 
 # 两个 app（各自用 IPC 连接 daemon）开始通信
 A的app ──IPC fd──→ lain daemon ──IPv6 QUIC──→ B的daemon ──IPC fd──→ B的app
