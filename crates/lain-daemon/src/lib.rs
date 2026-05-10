@@ -238,6 +238,7 @@ impl Daemon {
                                                 let target = PeerId(pid);
                                                 tracing::info!("relay: forward to {target}");
                                                 if let Ok(Some(record)) = d.find_peer(&target).await {
+                                                    // TODO: relay migration — when pipe ends, reconnect via different relay
                                                     let _ = t.handle_relay_request(
                                                         c.clone(), target, record.pubkey, &record.endpoints,
                                                     ).await;
