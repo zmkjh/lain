@@ -125,6 +125,13 @@ pub struct Daemon {
 
 impl Daemon {
     pub async fn new(config: DaemonConfig) -> Result<Self, DaemonError> {
+        // Check for existing daemon via IPC socket
+        if let Some(socket_path) = ipc_socket_path(&config) {
+            if ipc_socket_alive(&socket_path) {
+                return Err(DaemonError::Config("daemon already running".into()));
+            }
+        }
+
         tracing::info!("Lain daemon starting...");
         let identity = Identity::load_or_generate()
             .map_err(|e| DaemonError::Identity(e.to_string()))?;
@@ -671,6 +678,23 @@ impl Daemon {
 
     pub async fn state(&self) -> DaemonState {
         self.state.read().await.clone()
+    }
+}
+
+fn ipc_socket_path(config: &DaemonConfig) -> Option<PathBuf> {
+    config.ipc.uds_path.as_ref().map(PathBuf::from)
+        .or_else(|| dirs_home().map(|d| d.join(".lain").join("socket")))
+}
+
+fn ipc_socket_alive(path: &PathBuf) -> bool {
+    #[cfg(unix)]
+    {
+        std::os::unix::net::UnixStream::connect(path).is_ok()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        false
     }
 }
 
