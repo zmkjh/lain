@@ -765,6 +765,7 @@ dependencies = [
 name = "lain-cli"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "clap",
  "lain-core",
  "lain-daemon",
@@ -795,6 +796,7 @@ dependencies = [
 name = "lain-daemon"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "hex",
  "if-addrs",
  "lain-core",

@@ -28,7 +28,7 @@ pub enum IpcRequest {
     Whoami,
     Subscribe,
     Shutdown,
-    Send { peer_id: String, data: Vec<u8> },
+    Send { peer_id: String, data: String },  // base64-encoded bytes
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -358,7 +358,10 @@ async fn dispatch(
         }
         IpcRequest::Send { peer_id, data } => {
             if let Ok(pid) = PeerId::from_hex(&peer_id) {
-                send_or_warn(cmd_tx, IpcCommand::SendToPeer { peer_id: pid, data }, "send");
+                // Decode base64
+                if let Ok(bytes) = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, &data) {
+                    send_or_warn(cmd_tx, IpcCommand::SendToPeer { peer_id: pid, data: bytes }, "send");
+                }
             }
             IpcResponse::Ok { message: Some("sent".into()), data: None }
         }
