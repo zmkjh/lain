@@ -150,3 +150,150 @@ impl RoutingTable {
         self.buckets.iter().map(|b| b.entries().len()).sum()
     }
 }
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+    use std::net::{Ipv4Addr, SocketAddrV4};
+
+    fn entry(id: u8) -> BucketEntry {
+        let mut bytes = [0u8; 32];
+        bytes[0] = id;
+        BucketEntry {
+            node_id: PeerId(bytes),
+            address: SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 1), id as u16)),
+            last_seen: Instant::now(),
+        }
+    }
+
+    fn entry_full(id: usize) -> BucketEntry {
+        let mut bytes = [0u8; 32];
+        for (i, b) in id.to_be_bytes().iter().enumerate() {
+            bytes[32 - 8 + i] = *b;
+        }
+        BucketEntry {
+            node_id: PeerId(bytes),
+            address: SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 1), 1)),
+            last_seen: Instant::now(),
+        }
+    }
+
+    #[test]
+    fn test_distance_symmetric() {
+        let a = PeerId([1u8; 32]);
+        let b = PeerId([2u8; 32]);
+        assert_eq!(a.distance(&b), b.distance(&a));
+    }
+
+    #[test]
+    fn test_distance_self_zero() {
+        let a = PeerId([42u8; 32]);
+        assert_eq!(a.distance(&a), [0u8; 32]);
+    }
+
+    #[test]
+    fn test_bucket_index() {
+        let local = PeerId([0u8; 32]);
+        // MSB of first byte = position 0
+        let mut far = [0u8; 32];
+        far[0] = 0x80;
+        assert_eq!(local.bucket_index(&PeerId(far)), 0);
+        // Bit 6 of first byte = position 1
+        far[0] = 0x40;
+        assert_eq!(local.bucket_index(&PeerId(far)), 1);
+        // LSB of first byte = position 7
+        far[0] = 1;
+        assert_eq!(local.bucket_index(&PeerId(far)), 7);
+        // LSB of last byte = position 255
+        far = [0u8; 32];
+        far[31] = 1;
+        assert_eq!(local.bucket_index(&PeerId(far)), 255);
+    }
+
+    #[test]
+    fn test_kbucket_insert_and_contains() {
+        let mut kb = KBucket::new(20);
+        let e = entry(1);
+        assert!(kb.insert_or_update(e.clone()));
+        assert!(kb.contains(&e.node_id));
+        assert_eq!(kb.entries().len(), 1);
+    }
+
+    #[test]
+    fn test_kbucket_move_to_tail_on_update() {
+        let mut kb = KBucket::new(20);
+        kb.insert_or_update(entry(1));
+        kb.insert_or_update(entry(2));
+        kb.insert_or_update(entry(1)); // update moves to tail
+        // Last entry should be node 1
+        assert_eq!(kb.entries().back().unwrap().node_id.0[0], 1);
+    }
+
+    #[test]
+    fn test_kbucket_full_rejects() {
+        let mut kb = KBucket::new(3);
+        assert!(kb.insert_or_update(entry(1)));
+        assert!(kb.insert_or_update(entry(2)));
+        assert!(kb.insert_or_update(entry(3)));
+        // Bucket is full, insertion rejected
+        assert!(!kb.insert_or_update(entry(4)));
+    }
+
+    #[test]
+    fn test_routing_table_insert_and_find() {
+        let local = PeerId([0u8; 32]);
+        let mut rt = RoutingTable::new(local, 20);
+        rt.insert_or_update(entry(1));
+        rt.insert_or_update(entry(2));
+        rt.insert_or_update(entry(3));
+        assert_eq!(rt.size(), 3);
+    }
+
+    #[test]
+    fn test_closest_nodes_ordering() {
+        let local = PeerId([0u8; 32]);
+        let mut rt = RoutingTable::new(local, 20);
+        // Insert nodes at different XOR distances
+        rt.insert_or_update(entry_full(0x01));
+        rt.insert_or_update(entry_full(0xFF));
+        rt.insert_or_update(entry_full(0x42));
+        // Closest to local should be 0x01 (smallest XOR)
+        let target = PeerId([0u8; 32]);
+        let closest = rt.closest_nodes(&target, 3);
+        assert_eq!(closest.len(), 3);
+        // Closest should have smallest distance to target
+        for i in 1..closest.len() {
+            let d1 = closest[i - 1].node_id.distance(&target);
+            let d2 = closest[i].node_id.distance(&target);
+            // d1 should be lexicographically smaller or equal
+            assert!(d1 <= d2, "closest nodes not ordered by distance");
+        }
+    }
+
+    #[test]
+    fn test_remove_node() {
+        let local = PeerId([0u8; 32]);
+        let mut rt = RoutingTable::new(local, 20);
+        let e = entry(5);
+        rt.insert_or_update(e.clone());
+        assert_eq!(rt.size(), 1);
+        rt.remove_node(&e.node_id);
+        assert_eq!(rt.size(), 0);
+    }
+
+    #[test]
+    fn test_stress_many_nodes() {
+        let local = PeerId([0u8; 32]);
+        let mut rt = RoutingTable::new(local, 20);
+        for i in 0u32..500 {
+            let e = entry_full(i as usize * 7919 % 1000007);
+            let _ = rt.insert_or_update(e);
+        }
+        // Should have at least some nodes (buckets fill up)
+        assert!(rt.size() > 20);
+        // All nodes should be findable
+        let all = rt.all_nodes();
+        assert_eq!(all.len(), rt.size());
+    }
+}

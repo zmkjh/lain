@@ -385,7 +385,7 @@ mod tests {
         ];
         for (value, expected) in test_cases {
             let mut buf = Vec::new();
-            encode_varint(value, &mut buf);
+            lain_core::frame::encode_varint(value, &mut buf);
             assert_eq!(buf, expected, "varint encode {value}");
         }
     }

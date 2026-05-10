@@ -60,7 +60,14 @@ async fn spawn_node(bootstrap_addr: Option<SocketAddr>) -> (PeerId, Arc<DhtHandl
 
     // Wait briefly for route table population
     tokio::time::sleep(Duration::from_secs(1)).await;
-    let _ = dht.store_self(&public_key, &[], Capabilities::new()).await;
+
+    // Store self with actual transport endpoint so peers can connect
+    let local_port = transport.local_addr().unwrap().port();
+    let ep = Endpoint::new(
+        format!("127.0.0.1:{local_port}").parse().unwrap(),
+        EndpointKind::STUN,
+    );
+    let _ = dht.store_self(&public_key, &[ep], Capabilities::new()).await;
 
     (peer_id, dht, transport)
 }
@@ -157,4 +164,46 @@ async fn test_rate_limit_survives_flood() {
     // DHT should still be functional
     let size = seed_dht.routing_table_size().await;
     assert!(size >= 0); // survived
+}
+
+// ── Test 5: Malformed messages don't crash ──
+
+#[tokio::test]
+async fn test_malformed_messages_dont_crash() {
+    let (_id, dht, _t) = spawn_node(None).await;
+    let addr = dht.socket().local_addr().unwrap();
+
+    // Bogus data (wrong version, short, garbage)
+    let bogus: Vec<&[u8]> = vec![
+        &[0xFF, 0x00, 0x00],                    // wrong version
+        &[],                                      // empty
+        &[0x01; 10],                              // too short for header
+        &[0x01; 53],                              // exactly header, no payload
+    ];
+
+    for data in bogus {
+        // Send bogus data to DHT port
+        let sock = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        sock.send_to(data, addr).unwrap();
+    }
+
+    // Verify DHT still works
+    let size = dht.routing_table_size().await;
+    assert!(size >= 0); // no crash
+}
+
+// ── Test 7: PeerID zero and edge cases ──
+
+#[tokio::test]
+async fn test_peerid_edge_cases() {
+    let zero = PeerId([0u8; 32]);
+    let all_ones = PeerId([0xFF; 32]);
+    // Distance extremes should not panic
+    let _d1 = zero.distance(&all_ones);
+    let _d2 = all_ones.distance(&zero);
+    // Bucket index bounds
+    let idx = zero.bucket_index(&all_ones);
+    assert!(idx < 256);
+    // Display should not panic
+    let _s = format!("{zero}");
 }

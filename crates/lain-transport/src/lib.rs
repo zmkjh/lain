@@ -209,6 +209,12 @@ impl Transport {
         addr: SocketAddr,
         client_cfg: &quinn::ClientConfig,
     ) -> Result<quinn::Connection, TransportError> {
+        // Convert Ed25519 pubkey → X25519 for Noise IK (use Montgomery form)
+        let x25519_pub = match ed25519_dalek::VerifyingKey::from_bytes(remote_pubkey) {
+            Ok(vk) => vk.to_montgomery().to_bytes(),
+            Err(_) => return Err(TransportError::Noise("invalid ed25519 pubkey".into())),
+        };
+
         let conn = self.endpoint
             .connect_with(client_cfg.clone(), addr, "lain")
             .map_err(|e| TransportError::Connect(format!("connect: {e}")))?
@@ -218,7 +224,7 @@ impl Transport {
         let (mut send, mut recv) = conn.open_bi().await
             .map_err(|e| TransportError::Connect(format!("bi: {e}")))?;
 
-        let mut noise = NoiseHandshake::new_initiator(&self.noise_secret, remote_pubkey)
+        let mut noise = NoiseHandshake::new_initiator(&self.noise_secret, &x25519_pub)
             .map_err(|e| TransportError::Noise(format!("init: {e}")))?;
 
         let ik1 = noise.write_message(&[])
@@ -473,6 +479,11 @@ impl Transport {
         path: PathType,
         client_cfg: &quinn::ClientConfig,
     ) -> Result<(CoreConn, PathType, quinn::Connection), TransportError> {
+        // Convert Ed25519 pubkey → X25519 for Noise IK
+        let x25519_pub = ed25519_dalek::VerifyingKey::from_bytes(remote_pubkey)
+            .map(|vk| vk.to_montgomery().to_bytes())
+            .map_err(|_| TransportError::Noise("invalid pubkey".into()))?;
+
         let conn = self.endpoint
             .connect_with(client_cfg.clone(), addr, "lain")
             .map_err(|e| TransportError::Connect(format!("connect: {e}")))?
@@ -484,7 +495,7 @@ impl Transport {
             .await
             .map_err(|e| TransportError::Connect(format!("bi: {e}")))?;
 
-        let mut noise = NoiseHandshake::new_initiator(&self.noise_secret, remote_pubkey)
+        let mut noise = NoiseHandshake::new_initiator(&self.noise_secret, &x25519_pub)
             .map_err(|e| TransportError::Noise(format!("init: {e}")))?;
 
         let ik1 = noise.write_message(&[])
