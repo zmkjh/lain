@@ -424,12 +424,15 @@ For each incompatible pair (i, j):
 
 ### 6.4 Results
 
-| Scenario | Direct Success Rate |
-|----------|-------------------|
-| General Internet Users | **97.8%** |
-| Technical Users (adjusted v6 rates) | **~99.5%** |
+| Layer | Technique | Cumulative Coverage |
+|-------|-----------|-------------------|
+| Layer 1 | IPv6 Direct (asymmetric initiation) | **~84%** |
+| Layer 1+2 | + IPv4 STUN Hole Punch | **~97.8%** |
+| Layer 1+2+3 | + P2P Relay (any Cone/IPv6 node) | **~100%** |
 
-**Table 4: Full 7×7 Pair Success Matrix**
+The coverage figures above assume the Chinese ISP environment as modeled. Layer 3 (P2P relay) closes the remaining ~2.2% gap — the only requirement is that the overlay network contains at least one node with Cone NAT or IPv6 inbound, a condition satisfied in virtually any network of ≥3 nodes.
+
+**Table 4: Full 7×7 Pair Success Matrix (infrastructure-free, Layers 1+2 only)**
 
 |  | A(1) | B(2) | C(3) | D(4) | E(5) | F(6) | G(7) |
 |--|------|------|------|------|------|------|------|
@@ -523,12 +526,14 @@ Our analysis has several limitations that affect the precision and generalizabil
 
 ## 8. Conclusion
 
-This paper provides the first systematic analysis of infrastructure-free direct P2P connectivity across China's heterogeneous ISP NAT environment. We demonstrate that through combined IPv6 asymmetric initiation and IPv4 STUN-based hole punching, **97.8%** of random user pairs can achieve direct communication without relay infrastructure, DHT supernodes, or fixed public-IP servers. For technical early-adopter users, this figure reaches approximately **99.5%**. Sensitivity analysis confirms the robustness of these estimates, with worst-case scenarios (pessimistic assumptions on all parameters simultaneously) still yielding >95% coverage.
+This paper provides the first systematic analysis of infrastructure-free direct P2P connectivity across China's heterogeneous ISP NAT environment. We demonstrate that through combined IPv6 asymmetric initiation and IPv4 STUN-based hole punching, **97.8%** of random user pairs can achieve direct communication without relying on any centralized infrastructure (the only external dependency is STUN). The remaining ~2.2% can be covered by peer-to-peer relay — any node in the overlay network with Cone NAT or IPv6 inbound capability can serve this role, requiring no dedicated servers. Sensitivity analysis confirms the robustness of these estimates, with worst-case scenarios still yielding >95% direct coverage.
 
-The key findings are:
-1. Only China Mobile broadband (S_APDF) users present a hard boundary for IPv4 NAT traversal. All other ISP-NAT combinations are compatible through suitable techniques (STUN hole punching for Cone-inclusive pairs, asymmetric routing for Cone × Symmetric pairs, simultaneous exchange for ADF × ADF pairs).
-2. Mobile cellular networks (China Mobile 4G/5G) use ADF (not APDF) filtering, making STUN-based traversal viable—a critical distinction from broadband CGNAT.
-3. IPv6 requires only one peer to have inbound reachability, dramatically increasing effective coverage by transforming the connectivity condition from P(IPv4) to max(P(IPv4), P(IPv6)).
+By layer:
+1. **IPv6 alone covers ~84%** of random pairs through asymmetric initiation — only one peer needs inbound IPv6.
+2. **STUN hole punching adds ~14%**, covering most IPv4-only cases where at least one peer has Cone NAT.
+3. **P2P relay covers the remaining ~2%** — S_APDF × S_APDF/S_ADF pairs without IPv6 — via any relay-capable node already in the network.
+
+This suggests that a practical P2P library requires only three core components: IPv6 direct connection, STUN-based UDP hole punching, and peer-to-peer relay routing. More complex techniques (Birthday Attack, TCP Simultaneous Open, WebSocket fallback) are optional enhancements for edge cases where relay is temporarily unavailable — not required for near-universal connectivity.
 4. The remaining <3% gap is attributable to CM broadband users who haven't configured IPv6—a problem solvable through user education rather than additional technical complexity.
 
 ### 8.1 Future Work
@@ -548,10 +553,10 @@ Several directions emerge from this analysis:
 ### 8.2 Practical Implications
 
 These results have direct implications for the design of next-generation P2P libraries:
-- A two-layer strategy (IPv6-priority + IPv4-fallback) with minimal fallback to multi-hop overlay can achieve near-universal connectivity in practice.
-- The complexity budget should be allocated to getting IPv6 right (firewall detection, asymmetric initiation) and reliable STUN (multi-server, CHANGE-REQUEST methodology), rather than to exotic traversal techniques.
-- Relay infrastructure, while necessary for the residual ~2.2%, can be lightweight: peer-to-peer relay (volunteer nodes in the overlay) rather than dedicated TURN servers, justified by the low demand.
-- Birth certificate (SigCapture-style) NAT queries and Birthday Attacks are not required for the common case but remain useful as a diagnostic tool and fallback for edge cases.
+- **Three layers suffice**: IPv6 direct → STUN hole punch → P2P relay. This covers ~100% of cases with zero infrastructure dependency beyond STUN.
+- **Relay is P2P, not infrastructure**: Any node with Cone NAT or IPv6 inbound can relay. A network of ≥3 nodes virtually guarantees relay availability without any dedicated servers.
+- **Complexity budget**: Invest in getting IPv6 right (firewall detection, asymmetric initiation) and reliable STUN (multi-server, CHANGE-REQUEST). Birthday Attack and TSO are optional.
+- **Mobile is the norm**: Design for mobile-first with adaptive timers, data budgets, and background suspend/resume — not as an afterthought.
 
 ---
 

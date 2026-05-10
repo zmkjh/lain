@@ -227,50 +227,54 @@ Invite 码是**初始寻址提示**，不是永久地址。成功连过一次之
 
 结果缓存到 `~/.lain/cache/nat_type.json`，仅网络接口变更时重新探测。
 
-### 6.2 穿透降级链
+### 6.2 连接建立：三层模型
+
+连接建立策略分为三层，按优先级执行。上层成功后不再尝试下层。
 
 ```
-Step 1: IPv6 直连
-  ─ 条件: 至少一方有 IPv6 inbound
-  ─ 发起方主动向对方 IPv6 地址发起 QUIC connection
+Layer 1: IPv6 直连
+  ─ 条件: 至少一方有 IPv6 inbound reachable
+  ─ 发起方通过 invite code 或 DHT lookup 获取 IPv6 地址，直接发起 QUIC connection
+  ─ 覆盖: ~77% 的中国互联网用户（当前 IPv6 部署率），技术用户接近 100%
+  ─ 延迟: 1-RTT（QUIC handshake）+ 1-RTT（Noise IK）= 2-RTT
 
-Step 2: UDP STUN 打洞
-  ─ 双方通过 STUN 获取映射地址
-  ─ 同时发送 UDP probe，对方地址通过 invite code 交换（一次性信令）
-  ─ 成功条件: 至少一方是 Cone NAT（覆盖率 ~95%，见 coverage-analysis.md）
-  ─ 探测包为裸 UDP 帧，成功后升级到 QUIC
+Layer 2: IPv4 STUN 打洞
+  ─ 条件: 双方均无 IPv6 inbound，且至少一方为 Cone NAT
+  ─ 双方通过 STUN 获取 IPv4 映射地址，通过 invite code 交换，同时发送 UDP probe
+  ─ 覆盖: 在 Layer 1 未覆盖的 ~23% 中，再覆盖大部分（Cone NAT 在剩余中约占 70%）
+  ─ 延迟: STUN 查询 (1-RTT) + 打洞 (1-RTT) + QUIC + Noise IK = 4-RTT
 
-Step 3: Birthday Attack (relay 辅助)
-  ─ 前提: 已有 relay 连接可用作信令通道
-  ─ 渐进式打开额外端口: 1 → 16 → 64 → 256（桌面）/ 1 → 8 → 32 → 128（移动端）
-  ─ K×K 探测矩阵，端口列表通过 relay 通道实时交换
-  ─ 所有探测包为裸 UDP 帧，成功后升级到 QUIC
-  ─ 无 relay 时: 仅使用 invite code 中的初始端口集合做单轮尝试
-
-Step 4: TCP Simultaneous Open (relay 辅助)
-  ─ 双方同时向对方发起 TCP connect
-  ─ 5 秒时间窗口（通过 relay 做精确时钟同步）
-  ─ 利用 SO_REUSEADDR 和 SYN 碰撞
-  ─ 无 relay 时: 双方在本机时钟 ±3s 窗口内尝试，成功率降低
-
-Step 5: WebSocket over TCP 443
-  ─ 需一方可监听 TCP 入站 + 另一方出站 TCP 443
-  ─ HTTP Upgrade → WebSocket → Noise_IK → Lain Frames
-  ─ 适用场景: 企业防火墙封 UDP 只放 TCP 443
-
-Step 6: Overlay Relay
-  ─ 通过中继发现机制找到中间 relay 节点（见 §7）
-  ─ 噪声端到端加密，relay 不可见明文
-
-附加策略：Hairpin NAT 检测
-  ─ 若双方 STUN mapped address 的 IP 相同，判定为同 NAT 后节点
-  ─ 跳过公网地址直连尝试，优先使用 invite 中的 LAN endpoint 或 mDNS 发现的局域网地址直连
-  ─ LAN 不可达时回退到 relay
-
-穿透策略执行模型：不严格串行。Step 1-6 按优先级启动，上层步骤的尝试可与下层步骤并行进行。Step 3-4 依赖 relay 信令通道——daemon 启动后即预连 relay 候选（角色二：临时数据桥），使穿透阶段有信令可用。首个成功的连接被采用，其余尝试取消。整个流程受 traversal_timeout (30s) 全局约束。
+Layer 3: P2P Relay
+  ─ 条件: 以上两层均失败
+  ─ daemon 启动后即主动连接 relay 候选节点（临时数据桥），穿透阶段立即可用
+  ─ 覆盖: 所有剩余不可直连对，包括 S_APDF × S_APDF/S_ADF 硬边界
+  ─ 延迟: 己方↔relay (2-RTT) + relay↔对端 (2-RTT) = 4-RTT + relay 内部转发
+  ─ 直连探测持续后台运行，一旦成功自动从 relay 切换为直连
 ```
 
-### 6.3 硬边界
+Layer 3 依赖 P2P relay 节点（见 §7），不依赖任何中心化服务器。网络中任意一个 Cone NAT 或 IPv6-reachable 的节点即可充当 relay。
+
+### 6.3 高级穿透技术（可选增强）
+
+以下技术适用于 relay 暂时不可用的边界场景，不作为核心路径。实现优先级低于三层模型。
+
+**Birthday Attack**：双方在 UDP 多端口上做 K×K 探测矩阵。需要 relay 提供实时信令通道来交换动态端口列表。无 relay 时仅可用 invite code 中的初始端口集合做单轮尝试。移动端降级为较低的端口数（max 128）。
+
+**TCP Simultaneous Open**：利用 TCP SYN 碰撞建立连接。需要 relay 提供精确时钟同步（5s 窗口）。无 relay 时使用本机时钟 ±3s 窗口，成功率下降。依赖 SO_REUSEADDR。
+
+**WebSocket over TCP 443**：当 UDP 被完全封锁（如部分企业防火墙）时，通过 HTTP Upgrade 建立 WebSocket 连接。需一方可监听 TCP 入站。WS 路径不支持 QUIC Datagram（不可靠传输），所有数据退化为可靠。
+
+以上三项技术的信令都依赖 relay。在当前设计中，如果 relay 不可用，这些技术的实用性大幅下降。因此将它们定位为"有 relay 辅助的增强技术"而非"无 relay 时的替代方案"。
+
+### 6.4 穿透执行细节
+
+**Hairpin NAT 检测**：若双方 STUN mapped address 的 IP 相同，判定为同 NAT 后节点。跳过公网地址直连尝试，优先使用 invite 中的 LAN endpoint 或 mDNS 发现的局域网地址直连。LAN 不可达时回退到 relay。
+
+**执行模型**：Layer 1-2 并行启动（IPv6 和 STUN 互不依赖），Layer 3 在启动时即预连 relay 候选。首个成功的 Layer 被采用，其余尝试取消。整个流程受 traversal_timeout (30s) 全局约束。
+
+**穿透记忆**：连接成功后记录使用的路径类型（IPv6 / STUN / relay）和对方 NAT 类型。后续重连时跳过已知不可行路径。例如对 S_APDF 对端，直接走 IPv6 或 relay，不尝试 STUN 打洞。
+
+### 6.5 硬边界
 
 | Peer A | Peer B | 直连 | 兜底 |
 |--------|--------|------|------|
@@ -279,7 +283,9 @@ Step 6: Overlay Relay
 
 其他所有 NAT 组合均可直连（详见 `coverage-analysis.md` 第 4 章证明）。
 
-### 6.4 WebSocket Fallback
+### 6.6 WebSocket Fallback 细节
+
+WebSocket 路径用于 UDP 被完全封锁的场景。在 Layer 3 (relay) 可用时优先使用 relay（QUIC），WS 仅作为 relay 不可用时的最后兜底。
 
 #### 角色决策
 
@@ -301,10 +307,10 @@ Listener                              Connector
 ───────────────────────────────────────────────────
 bind TCP socket, random port
 发送 ws_endpoint 给对方 (via invite)
-                                      TCP connect → ws_endpoint
-                                      HTTP Upgrade: GET /lain
-                                        Lain-PeerID: xxx
-                                        Lain-Network: xxx
+                                       TCP connect → ws_endpoint
+                                       HTTP Upgrade: GET /lain
+                                         Lain-PeerID: xxx
+                                         Lain-Network: xxx
 验证 PeerID 和 Network 匹配
 发送 101 Switching Protocols
 ────────── WebSocket 建立 ──────────
@@ -312,29 +318,28 @@ Noise_IK 握手 (与 QUIC 路径相同)
 Lain Frames (与 QUIC 路径相同帧格式)
 ```
 
-#### WS 路径与 QUIC 路径对比
+#### WS vs QUIC
 
 | 特性 | QUIC | WebSocket |
 |------|------|-----------|
 | NAT 穿透力 | 强 (UDP 打洞) | 弱 (需一方监听) |
-| Datagram | 支持 | 不支持 (退化为可靠) |
+| Datagram | 支持 | 不支持 |
 | 连接迁移 | 原生支持 | 不支持 |
-| 0-RTT | 支持 | 不支持 |
 | 场景 | UDP 可达 | UDP 被封 |
 
 ---
 
 ## 7. Relay
 
-### 7.1 三角色模型
+### 7.1 角色模型
 
-Relay 不只是数据面兜底通道，而是有三种角色，按需切换：
+Relay 是 P2P 网络内其他节点，不依赖任何中心化服务器。有两种角色：
 
-**角色一：信令助手** — A 和 B 无法直连但都能连到 R。R 充当 TSO 的精确时钟源，协调双方同时发 TCP SYN。TSO 成功则 R 退出。
+**角色一：临时数据桥（主动）** — daemon 启动后即预连 relay 候选节点。穿透阶段，Layer 1 和 Layer 2 并行尝试的同时，relay 路径已就绪——连接立即可用。背后持续探测直连路径，一旦直连建立即切换。绝大多数连接在几秒内从 relay 切换到直连。
 
-**角色二：临时数据桥** — 初始通过 relay 建立连接保证即时可用，背后持续尝试 IPv6 → STUN → Birthday Attack 直连。一旦直连建立即切换。
+**角色二：稳定 Relay（被动）** — 直连确认不可行（如双方 S_APDF 且无 IPv6，或 UDP 被完全封锁）后承担长期数据转发。
 
-**角色三：稳定 Relay** — 直连确认不可行后承担长期数据转发。
+注：TSO 时钟同步、Birthday Attack 端口列表传递等信令角色，仅在 relay 可用时作为增值功能可选启用（见 §6.3）。
 
 ### 7.2 Relay 发现、选举与路由
 
@@ -1062,9 +1067,13 @@ INFO  NAT probed: Cone, ipv6=available
 # idle_timeout_secs = 30
 # keep_alive_interval_secs = 15
 
-[traversal]
+# 高级穿透技术（可选，默认关闭。仅在 relay 不可用时启用）
+[traversal.advanced]
+# birthday_enabled = false
 # birthday_levels = [1, 16, 64, 256]
+# tso_enabled = false
 # tso_window_secs = 5
+# ws_fallback_enabled = false
 
 [stun]
 # servers = ["stun.miwifi.com", "stun.qq.com", "stun.cloudflare.com", "stun.l.google.com"]
@@ -1118,8 +1127,14 @@ DHT:   k=20, alpha=3, ttl=300s, heartbeat=150s, republish=3600s
        max_active_networks=32 (活跃网络数上限，超出部分自动标记 dormant)
 连接:  connect_timeout=10s, traversal_timeout=30s, max_connections=256
        max_streams_per_conn=128, max_relay_streams=32
-穿透:  birthday_levels=[1,16,64,256], tso_window=5s
-       (移动端 birthday_levels=[1,8,32,128])
+穿透:  traversal_timeout=30s
+
+# 高级穿透（可选，默认禁用，仅 relay 不可用时启用）
+[traversal.advanced]
+# birthday_enabled = false
+# birthday_levels = [1, 16, 64, 256]
+# tso_enabled = false
+# tso_window_secs = 5
 ```
 
 ### 12.4 端口分配
