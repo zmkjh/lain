@@ -877,7 +877,7 @@ RECONNECTING            (重连, 跳过邀请, 直接从 DHT 获取 endpoint)
 
 ### 11.2 CLI 命令 (JSON-RPC over UDS)
 
-每行一条完整 JSON（换行符分隔），格式：
+每行一条完整 JSON（换行符分隔）：
 
 ```
 → {"id":1,"method":"status","params":{}}
@@ -888,13 +888,28 @@ RECONNECTING            (重连, 跳过邀请, 直接从 DHT 获取 endpoint)
 |--------|--------|--------|------|
 | `status` | {} | {peer_id, nat_type, peers_online, uptime_secs} | daemon 状态 |
 | `identity` | {} | {peer_id, public_key_hex} | 查看身份 |
-| `invite.generate` | {} | {invite_code} | 生成自己的 invite（快捷方式） |
-| `invite.accept` | {invite_code} | {peer_id, status} | 通过 invite 添加 peer（可选，等价于 peer.connect 但跳过 DHT 查找） |
+| `invite.generate` | {} | {invite_code} | 生成自己的 invite |
+| `invite.accept` | {invite_code} | {peer_id, status} | 通过 invite 快捷添加 peer |
 | `peer.list` | {} | [{peer_id, status, latency_ms, path}] | 已知 peer 列表 |
-| `peer.connect` | {peer_id} | {state, attempt_id} → +fd | 建立一对一数据流（自动 DHT 查找公钥和地址） |
+| `peer.connect` | {peer_id} | {attempt_id} → +fd | **发起**连接，自动 DHT 查公钥+地址 |
 | `peer.disconnect` | {peer_id} | {status} | 断开 peer |
 | `metrics` | {} | {connections, bytes_sent, ...} | 获取指标 |
 | `shutdown` | {} | {status} | 优雅关闭 daemon |
+
+**入站连接通知**（daemon → app，JSON-RPC notification）：
+
+```
+← {"method":"connection.incoming","params":{"peer_id":"...","connection_id":"..."}}
+```
+
+**接受/拒绝入站连接**（app → daemon）：
+
+| method | params | result | 说明 |
+|--------|--------|--------|------|
+| `connection.accept` | {connection_id} | +fd | 接收入站连接，获取 fd |
+| `connection.reject` | {connection_id} | {status} | 拒绝入站连接 |
+
+任何连接到 daemon 的应用自动成为潜在监听者。当远程 peer 发起连接时，daemon 完成 Noise IK 握手（透明），然后向所有已连接应用广播 `connection.incoming`。第一个 `connection.accept` 的应用获得 fd。若 30 秒内无应用接受，daemon 自动拒绝并向对方发送 CLOSE。应用可通过 peer_id 过滤自己关心的连接，拒绝不感兴趣的即可。
 
 ### 11.3 管理面 HTTP API
 
@@ -914,7 +929,7 @@ POST  /peer/connect              ← { peer_id }
 GET   /metrics                   → Prometheus text
 
 GET   /events                    → SSE event stream
-  events: peer_online, peer_offline, connection_changed
+  events: peer_online, peer_offline, connection_incoming, connection_established, connection_closed
 ```
 
 ### 11.4 数据面 — Native (UDS fd 传递)
@@ -946,6 +961,32 @@ Client                              Daemon
 ```
 
 fd 对应用透明：read 返回解密后的上层应用数据，write 自动封装为 DATA 帧 + Noise 加密 + QUIC 传输。
+
+#### 入站连接流程
+
+```
+远程 Peer                            Daemon                           App A            App B
+  │                                    │                                │                │
+  │ ──── QUIC + Noise IK ────→        │                                │                │
+  │                                    │ 握手完成，生成 connection_id    │                │
+  │                                    │                                │                │
+  │                                    │ ← connection.incoming ───────→│                │
+  │                                    │   {peer_id, connection_id}     │                │
+  │                                    │                                │                │
+  │                                    │         App A 决定接受          │                │
+  │                                    │ ← connection.accept ──────────│                │
+  │                                    │   {connection_id}              │                │
+  │                                    │ ── +fd (SCM_RIGHTS) ─────────→│                │
+  │                                    │                                │                │
+  │                                    │         App B 收不到 fd         │                │
+  │                                    │         （已被 A 接受）           │                │
+  │                                    │                                │                │
+  │ ←══════ DATA (stream 2+) ═══════→ │ ←══════ fd read/write ══════→│                │
+```
+
+**Noise IK 角色**：Initiator/Responder 由 PeerID 大小决定（小的一方发起）。daemon 自动处理，应用无感知。即使本地没有应用监听，daemon 也能完成握手——但 30 秒内无应用接受则发送 CLOSE。
+
+**多应用场景**：同一设备的多个应用可以同时连接 daemon。每个应用独立发起 `peer.connect`（出站）或响应 `connection.incoming`（入站）。已建立的连接和 fd 归属具体应用，互不干扰。
 
 ### 11.5 数据面 — WebSocket (浏览器)
 
@@ -1480,6 +1521,31 @@ for peer_id, fd in connections.items():
 
 `sendall(b"clipboard: hello")` 走的是 `笔记本 ──QUIC/Noise──→ 手机` 这条加密通道，NAS 收不到。发给 NAS 的是另一条独立的加密通道。lain 不提供广播——如果你需要群发，在应用层自己遍历所有连接即可。
 
+#### 接收入站连接
+
+应用不需要"listen"命令——任何连接 daemon 的应用自动成为潜在监听者。远程 peer 发起连接时，daemon 完成 Noise IK 握手，然后广播通知：
+
+```python
+# 主循环：同时处理主动连接和入站通知
+while True:
+    msg = json.loads(sock.recv(4096).decode())
+
+    if msg.get("method") == "connection.incoming":
+        peer_id = msg["params"]["peer_id"]
+        conn_id = msg["params"]["connection_id"]
+
+        # 应用决定接受或拒绝（可以根据 peer_id 过滤）
+        if peer_id in my_contacts:
+            rpc("connection.accept", {"connection_id": conn_id})
+            fd = received_fd  # daemon 通过 SCM_RIGHTS 传回
+            print(f"{peer_id} 连入了")
+            # 之后在 fd 上正常 read/write
+        else:
+            rpc("connection.reject", {"connection_id": conn_id})
+```
+
+Noise IK 角色（Initiator/Responder）由 PeerID 大小自动决定，应用不必关心。
+
 **Rust 版本**（使用 `lain-core` crate）：
 
 ```rust
@@ -1554,7 +1620,17 @@ $ lain peer connect b3f1...                           $ lain peer connect d7e4..
   → QUIC → Noise IK → 连接建立 ✓                          → 连接建立 ✓
 
 # 两个 app（各自用 IPC 连接 daemon）开始通信
-A的app ──IPC fd──→ lain daemon ──IPv6 QUIC──→ B的daemon ──IPC fd──→ B的app
+
+# B 发起连接
+B的app → peer.connect(d7e4...) → B的daemon
+                                      → DHT查A的公钥+地址
+                                      → IPv6 QUIC → Noise IK
+                                      → A的daemon
+                                           → connection.incoming(b3f1...)
+A的app ← connection.accept ←──────────────┘
+                                           → SCM_RIGHTS fd
+
+A的app ──fd read/write──→ A的daemon ──QUIC──→ B的daemon ──fd──→ B的app
   │                                                                       │
   └──────────── 端到端 Noise_IK 加密，零服务器 ────────────────────────────┘
 ```
