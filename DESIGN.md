@@ -13,6 +13,7 @@ Lain 是一个零服务器、零配置的 P2P 网络基础设施，以 daemon �
 - **PeerID 是永久的**：等于 `SHA256(Ed25519 公钥)`。只要密钥文件不丢，PeerID 在设备生命周期内不变。变化的只是网络地址。
 - **网络是可重连资源的集合**：节点通过定期广播证明自己是活跃资源；长期不广播则自然淘汰。
 - **Invite 码是初始寻址提示**：携带生成时刻的地址快照，接收方优先去 DHT 查找最新地址。
+- **网络没有创建者**：一个网络只是一个共享的 secret。谁生成 invite 谁就是第一个知道这个 secret 的人——没有任何特权、不拥有网络、不充当服务器。所有人地位相同。
 - **零配置启动**：daemon 不带任何参数就能运行，所有参数有内置默认值。
 
 ---
@@ -898,9 +899,10 @@ RECONNECTING            (重连, 跳过邀请, 直接从 DHT 获取 endpoint)
 |--------|--------|--------|------|
 | `status` | {} | {peer_id, nat_type, networks, uptime_secs} | daemon 状态 |
 | `identity` | {} | {peer_id, public_key_hex} | 查看身份 |
-| `networks.list` | {} | [{network_id, name, peer_count, status}] | 列出网络 |
-| `network.join` | {invite_code} | {network_id, status} | 加入网络 |
-| `network.leave` | {network_id} | {status} | 离开网络 |
+| `invite.generate` | {network_name?} | {invite_code, network_id} | 生成新 invite（首次时生成 network_secret） |
+| `invite.accept` | {invite_code} | {network_id, peer_count} | 接受 invite，加入网络 |
+| `network.list` | {} | [{network_id, name, peer_count, status}] | 列出已知网络 |
+| `network.forget` | {network_id} | {status} | 删除本地 network_secret，退出网络 |
 | `network.peers` | {network_id} | [{peer_id, status, latency_ms, path}] | 列出 peers |
 | `peer.connect` | {network_id, peer_id} | {state, attempt_id} → +fd | 建立数据流 |
 | `peer.disconnect` | {network_id, peer_id} | {status} | 断开 peer |
@@ -912,17 +914,19 @@ RECONNECTING            (重连, 跳过邀请, 直接从 DHT 获取 endpoint)
 ```
 GET   /identity                  → { peer_id, public_key }
 
-POST  /network/join              ← { invite_code }
-                                  → { network_id, status }
-GET   /networks                  → [{ network_id, peer_count }]
-POST  /network/{id}/leave        → { status }
+POST  /invite/generate           ← { network_name? }
+                                  → { invite_code, network_id }
+POST  /invite/accept             ← { invite_code }
+                                  → { network_id, peer_count }
+GET   /networks                  → [{ network_id, name, peer_count, status }]
+POST  /network/{id}/forget       → { status }
 
 GET   /networks/{id}/peers       → [{ peer_id, status: direct|relayed, latency_ms }]
 
 POST  /networks/{id}/connect     ← { peer_id }
-     → 202 Accepted { attempt_id }
-     ... events ...
-     → connection_established | connection_failed
+      → 202 Accepted { attempt_id }
+      ... events ...
+      → connection_established | connection_failed
 
 GET   /metrics                   → Prometheus text
 
@@ -985,7 +989,7 @@ WS binary message = 完整 Lain 帧（含 magic）。DATA_DGRAM 不适用。
 lain://<base62_invite_code>
 ```
 
-浏览器点击 → 系统 handler 转发给 lain daemon → 解析并加入网络。
+浏览器点击 → 系统 handler 转发给 lain daemon → 解析 invite 并接受。
 
 ### 11.8 错误响应
 
@@ -1443,7 +1447,7 @@ Lain 的核心能力：**在两个设备之间建立加密字节流，不需要�
   INFO  NAT: Cone, IPv6: inbound open
   INFO  IPC ready on ~/.lain/socket + 127.0.0.1:9177
 
-笔记本$ lain network create my-net
+笔记本$ lain invite generate
   invite: lain://3KqWx7...  ← 把这个发给其他设备
 ```
 
@@ -1451,12 +1455,12 @@ Lain 的核心能力：**在两个设备之间建立加密字节流，不需要�
 
 ```
 手机$ lain daemon                    # 只需一次，之后开机自启
-手机$ lain network join lain://3KqWx7...
-  INFO  joined network my-net (f8a2...), 2 peers online
+手机$ lain invite accept lain://3KqWx7...
+  INFO  joined network f8a2..., 2 peers online
 
 NAS$   lain daemon
-NAS$   lain network join lain://3KqWx7...
-  INFO  joined network my-net (f8a2...), 3 peers online
+NAS$   lain invite accept lain://3KqWx7...
+  INFO  joined network f8a2..., 3 peers online
 ```
 
 现在三台设备已互联。笔记本上查看：
@@ -1489,7 +1493,7 @@ def rpc(method, params={}):
     sock.sendall(msg.encode())
     return json.loads(sock.recv(4096).decode())
 
-rpc("network.join", {"invite_code": "3KqWx7..."})
+rpc("invite.accept", {"invite_code": "3KqWx7..."})
 
 # 3. 连接 peer，获取裸字节流 fd
 result = rpc("peer.connect", {"network_id": "f8a2...", "peer_id": "d7e4..."})
@@ -1510,7 +1514,7 @@ print(f"收到: {data}")
 use lain_core::ipc::Client;
 
 let mut client = Client::connect_default().await?;
-client.join_network("3KqWx7...").await?;
+client.accept_invite("3KqWx7...").await?;
 
 let stream = client.connect("f8a2...", "d7e4...").await?;
 stream.write_all(b"clipboard: hello world").await?;
@@ -1528,13 +1532,13 @@ println!("收到: {}", String::from_utf8_lossy(&buf[..n]));
 
 ```javascript
 // 加入网络
-const resp = await fetch('http://127.0.0.1:9177/network/join', {
+const resp = await fetch('http://127.0.0.1:9177/invite/accept', {
   method: 'POST',
   body: JSON.stringify({ invite_code: '3KqWx7...' })
 });
 const { network_id } = await resp.json();
 
-// 连接 peer
+// 连接 peer（数据面）
 const { ws_port } = await fetch(
   `http://127.0.0.1:9177/networks/${network_id}/connect`,
   { method: 'POST', body: JSON.stringify({ peer_id: 'd7e4...' }) }
@@ -1558,12 +1562,12 @@ A 的机器                                              B 的机器
 $ lain daemon                                        $ lain daemon
   → 生成 identity, 启动 QUIC, 开启 IPC                   → 同上
 
-$ lain network create team-chat
+$ lain invite generate
   → 生成 network_secret
   → 输出 invite: lain://3KqWx7...
   → A 把 invite 发到微信群 / AirDrop 给 B
 
-                                                     $ lain network join lain://3KqWx7...
+                                                     $ lain invite accept lain://3KqWx7...
                                                        → 解析 invite，获取 A 的 IPv6 地址
                                                        → QUIC → Noise IK → 连接建立 ✓
                                                        → DHT 已 bootstrap（通过 A）
