@@ -109,6 +109,8 @@ pub struct Transport {
     peer_id: PeerId,
     #[allow(dead_code)]
     public_key: Ed25519PublicKey,
+    #[allow(dead_code)]
+    conn_semaphore: Arc<tokio::sync::Semaphore>,
 }
 
 impl Transport {
@@ -150,6 +152,7 @@ impl Transport {
         let runtime = quinn::default_runtime()
             .ok_or_else(|| TransportError::Io("no runtime".into()))?;
 
+        let max_conns = config.max_connections;
         let endpoint = quinn::Endpoint::new(
             quinn::EndpointConfig::default(),
             Some(server_cfg),
@@ -167,6 +170,7 @@ impl Transport {
             noise_secret,
             peer_id,
             public_key,
+            conn_semaphore: Arc::new(tokio::sync::Semaphore::new(max_conns)),
         })
     }
 
@@ -242,6 +246,17 @@ impl Transport {
     }
 
     pub async fn accept_incoming(&self) -> Result<IncomingConnection, TransportError> {
+        let (_, peer_id, pubkey) = self.accept_connection().await?;
+        Ok(IncomingConnection {
+            peer_id,
+            peer_pubkey: pubkey,
+            stream: lain_core::transport::QuicStream,
+        })
+    }
+
+    /// Accept a raw connection and return (quinn::Connection, PeerId, pubkey)
+    /// Caller can then inspect control frames before proceeding
+    pub async fn accept_connection(&self) -> Result<(quinn::Connection, PeerId, Ed25519PublicKey), TransportError> {
         let incoming = self.endpoint
             .accept()
             .await
@@ -306,11 +321,7 @@ impl Transport {
 
         tracing::info!("incoming connection from {remote_peer_id}");
 
-        Ok(IncomingConnection {
-            peer_id: PeerId(pid),
-            peer_pubkey: remote_pk,
-            stream: lain_core::transport::QuicStream,
-        })
+        Ok((conn, remote_peer_id, remote_pk))
     }
 
     async fn connect_internal(

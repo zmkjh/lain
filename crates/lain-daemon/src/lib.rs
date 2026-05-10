@@ -7,6 +7,7 @@ pub mod ipc;
 
 use lain_core::capabilities::Capabilities;
 use lain_core::endpoint::Endpoint;
+use lain_core::frame::{self, FrameType};
 use lain_core::identity::IdentityProvider;
 use lain_core::nat::NatProber as NatProberTrait;
 use lain_core::peer::PeerId;
@@ -14,6 +15,7 @@ use lain_identity::Identity;
 use lain_nat::NatProbe;
 use lain_dht::DhtHandle;
 use lain_discovery::MdnsDiscovery;
+use lain_transport::{Transport, TransportConfig};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use thiserror::Error;
@@ -159,7 +161,24 @@ impl Daemon {
             }
         }
 
-        // 5. STORE self
+        // 5. 初始化 Transport
+        let (_noise_secret, _noise_public) = self.identity.noise_keypair();
+
+        let transport = Transport::new(
+            TransportConfig::default(),
+            _noise_secret,
+            peer_id,
+            public_key,
+        )
+        .map_err(|e| DaemonError::Config(e.to_string()))?;
+
+        let transport = Arc::new(transport);
+        let transport_local_port = transport.local_addr()
+            .map(|a| a.port())
+            .unwrap_or(0);
+        tracing::info!("Transport on port {transport_local_port}");
+
+        // 6. STORE self
         let capabilities = Capabilities::new()
             .with(if nat_result.ipv6_inbound { Capabilities::IPV6_INBOUND } else { 0 })
             .with(if nat_result.nat_type.is_symmetric() { 0 } else { Capabilities::RELAY_CAPABLE });
@@ -174,6 +193,46 @@ impl Daemon {
 
         // 6. mDNS LAN 发现
         let dht_for_mdns = Arc::new(dht);
+
+        // Spawn relay accept loop: handle incoming RelayConnect frames
+        let transport_relay = transport.clone();
+        let dht_relay = dht_for_mdns.clone();
+        tokio::spawn(async move {
+            loop {
+                let t = transport_relay.clone();
+                let d = dht_relay.clone();
+                match t.accept_connection().await {
+                    Ok((conn, _peer_id, _pubkey)) => {
+                        let c = conn.clone();
+                        tokio::spawn(async move {
+                            if let Ok((mut _send, mut recv)) = c.accept_bi().await {
+                                let mut buf = vec![0u8; 2048];
+                                if let Ok(Some(n)) = recv.read(&mut buf).await {
+                                    if let Some((_sid, ft, _len, hdr_len)) = frame::decode_frame_header(&buf[..n]) {
+                                        if ft == FrameType::RelayConnect {
+                                            let payload = &buf[hdr_len..hdr_len + (_len as usize).min(n - hdr_len)];
+                                            if payload.len() >= 32 {
+                                                let mut pid = [0u8; 32];
+                                                pid.copy_from_slice(&payload[..32]);
+                                                let target = PeerId(pid);
+                                                tracing::info!("relay: forward to {target}");
+                                                if let Ok(Some(record)) = d.find_peer(&target).await {
+                                                    let _ = t.handle_relay_request(
+                                                        c.clone(), target, record.pubkey, &record.endpoints,
+                                                    ).await;
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        });
+                    }
+                    Err(e) => tracing::debug!("transport accept: {e}"),
+                }
+            }
+        });
+
         let local_port = dht_for_mdns.socket().local_addr()
             .map(|a| a.port())
             .unwrap_or(53617);
