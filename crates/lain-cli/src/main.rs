@@ -14,6 +14,9 @@ struct Cli {
     command: Option<Command>,
     #[arg(short = 's', long, default_value = "")]
     socket: String,
+    /// Run in foreground (log to stdout instead of file)
+    #[arg(short = 'f', long)]
+    foreground: bool,
 }
 
 fn ipc_socket(path: &str) -> PathBuf {
@@ -31,6 +34,8 @@ fn dirs_home() -> Option<PathBuf> {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Start the daemon
+    Daemon,
     Whoami,
     Invite,
     Connect { invite: String },
@@ -42,7 +47,40 @@ enum Command {
 fn main() {
     let cli = Cli::parse();
     let socket_path = ipc_socket(&cli.socket);
-    match cli.command.unwrap_or(Command::Status) {
+
+    // Set up logging
+    if cli.foreground {
+        tracing_subscriber::fmt::init();
+    } else {
+        // Log to file
+        let log_path = {
+            let mut d = if let Ok(h) = std::env::var("LAIN_HOME") {
+                PathBuf::from(h)
+            } else if let Ok(h) = std::env::var("HOME") {
+                PathBuf::from(h).join(".lain")
+            } else {
+                PathBuf::from(".")
+            };
+            d.push("daemon.log");
+            d
+        };
+        if let Some(parent) = log_path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        if let Ok(file) = std::fs::OpenOptions::new()
+            .create(true).append(true).open(&log_path)
+        {
+            tracing_subscriber::fmt()
+                .with_writer(std::sync::Mutex::new(file))
+                .with_ansi(false)
+                .init();
+        } else {
+            tracing_subscriber::fmt::init();
+        }
+    }
+
+    match cli.command.unwrap_or(Command::Daemon) {
+        Command::Daemon => run_daemon(cli.foreground),
         Command::Whoami => {
             if let Some(v) = ipc_req(&socket_path, r#"{"cmd":"Whoami"}"#) {
                 let pid = v.get("message").and_then(|m| m.as_str()).unwrap_or("?");
@@ -64,6 +102,28 @@ fn main() {
             }
         }
     }
+}
+
+fn run_daemon(foreground: bool) {
+    let rt = tokio::runtime::Runtime::new().expect("tokio");
+    rt.block_on(async {
+        let config = lain_daemon::config::DaemonConfig::load_or_default().unwrap_or_default();
+        match lain_daemon::Daemon::new(config).await {
+            Ok(daemon) => {
+                let pid = daemon.peer_id();
+                // Always print PeerID to stdout
+                if !foreground {
+                    println!("Lain daemon started");
+                    println!("PeerID: {pid}");
+                    println!("Logs: ~/.lain/daemon.log");
+                }
+                if let Err(e) = daemon.run().await {
+                    eprintln!("daemon error: {e}");
+                }
+            }
+            Err(e) => eprintln!("daemon init failed: {e}"),
+        }
+    });
 }
 
 fn ipc_req(socket_path: &PathBuf, json: &str) -> Option<serde_json::Value> {
