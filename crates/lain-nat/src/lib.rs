@@ -1,0 +1,285 @@
+#![deny(clippy::unwrap_used)]
+#![deny(clippy::expect_used)]
+#![deny(clippy::panic)]
+
+use async_trait::async_trait;
+use lain_core::error::CoreError;
+use lain_core::nat::{NatProbeResult, NatProber, NatType};
+use std::net::{SocketAddr, UdpSocket};
+use thiserror::Error;
+use tracing;
+
+#[derive(Error, Debug)]
+pub enum NatError {
+    #[error("STUN probe failed: {0}")]
+    StunProbeFailed(String),
+    #[error("DHT reflection failed: {0}")]
+    DhtReflectionFailed(String),
+    #[error("no STUN servers available")]
+    NoStunServers,
+    #[error("network error: {0}")]
+    NetworkError(String),
+}
+
+pub struct NatProbe {
+    stun_servers: Vec<SocketAddr>,
+    timeout: std::time::Duration,
+}
+
+impl NatProbe {
+    pub fn new(stun_servers: Vec<SocketAddr>, timeout_secs: u64) -> Self {
+        Self {
+            stun_servers,
+            timeout: std::time::Duration::from_secs(timeout_secs),
+        }
+    }
+}
+
+#[async_trait]
+impl NatProber for NatProbe {
+    async fn probe(&self) -> Result<NatProbeResult, CoreError> {
+        let socket = UdpSocket::bind("0.0.0.0:0")
+            .map_err(|e| CoreError::InvalidEndpoint(e.to_string()))?;
+        socket
+            .set_read_timeout(Some(self.timeout))
+            .ok();
+
+        let result = self.probe_with_socket(&socket)?;
+
+        Ok(result)
+    }
+}
+
+impl NatProbe {
+    fn probe_with_socket(&self, socket: &UdpSocket) -> Result<NatProbeResult, CoreError> {
+        if self.stun_servers.is_empty() {
+            return Ok(NatProbeResult {
+                nat_type: NatType::Unknown,
+                ipv6_inbound: false,
+                mapped_addr: None,
+            });
+        }
+
+        let mut mapped_port: Option<u16> = None;
+        let mut mapped_ip: Option<std::net::IpAddr> = None;
+        let mut results = Vec::new();
+
+        for stun_addr in &self.stun_servers {
+            match self.probe_stun(socket, *stun_addr) {
+                Ok(addr) => {
+                    if mapped_ip.is_none() {
+                        mapped_ip = Some(addr.ip());
+                        mapped_port = Some(addr.port());
+                    }
+                    results.push(addr);
+                }
+                Err(_e) => {
+                    tracing::debug!("STUN probe to {stun_addr} failed");
+                }
+            }
+        }
+
+        if results.is_empty() {
+            return Ok(NatProbeResult {
+                nat_type: NatType::Unknown,
+                ipv6_inbound: false,
+                mapped_addr: None,
+            });
+        }
+
+        let nat_type = if results.len() >= 2 && results[0].port() != results[1].port() {
+            NatType::APDFSymmetric
+        } else {
+            NatType::Cone
+        };
+
+        let mapped_addr = mapped_ip.map(|ip| SocketAddr::new(ip, mapped_port.unwrap_or(0)));
+
+        Ok(NatProbeResult {
+            nat_type,
+            ipv6_inbound: self.check_ipv6(),
+            mapped_addr,
+        })
+    }
+
+    fn probe_stun(
+        &self,
+        socket: &UdpSocket,
+        stun_addr: SocketAddr,
+    ) -> Result<SocketAddr, CoreError> {
+        let binding_request = Self::build_binding_request();
+
+        socket
+            .send_to(&binding_request, stun_addr)
+            .map_err(|e| CoreError::InvalidEndpoint(e.to_string()))?;
+
+        let mut buf = [0u8; 1024];
+        let (len, _src) = socket
+            .recv_from(&mut buf)
+            .map_err(|e| CoreError::InvalidEndpoint(e.to_string()))?;
+
+        let addr = Self::parse_binding_response(&buf[..len], stun_addr)
+            .ok_or_else(|| CoreError::InvalidEndpoint("STUN parse failed".into()))?;
+
+        Ok(addr)
+    }
+
+    fn build_binding_request() -> Vec<u8> {
+        let mut packet = vec![0u8; 20];
+        packet[0] = 0x00; // Binding Request
+        packet[1] = 0x01;
+        // Magic cookie
+        packet[4] = 0x21;
+        packet[5] = 0x12;
+        packet[6] = 0xA4;
+        packet[7] = 0x42;
+        // Transaction ID: random
+        for i in 8..20 {
+            packet[i] = rand::random::<u8>();
+        }
+        packet
+    }
+
+    fn parse_binding_response(data: &[u8], stun_addr: SocketAddr) -> Option<SocketAddr> {
+        if data.len() < 20 {
+            return None;
+        }
+        if data[0] != 0x01 && data[0] != 0x01 {
+            return None;
+        }
+        let msg_len = u16::from_be_bytes([data[2], data[3]]) as usize;
+        let mut offset = 20usize;
+        let end = (20 + msg_len).min(data.len());
+
+        while offset + 4 <= end {
+            let attr_type = u16::from_be_bytes([data[offset], data[offset + 1]]);
+            let attr_len = u16::from_be_bytes([data[offset + 2], data[offset + 3]]) as usize;
+            offset += 4;
+
+            if attr_type == 0x0001 {
+                // MAPPED-ADDRESS
+                if offset + 4 > data.len() {
+                    break;
+                }
+                let addr = parse_mapped_address(&data[offset..], attr_len)?;
+                return Some(addr);
+            } else if attr_type == 0x0020 {
+                // XOR-MAPPED-ADDRESS
+                if offset + 4 > data.len() {
+                    break;
+                }
+                let cookie = [0x21, 0x12, 0xA4, 0x42];
+                let addr = parse_xor_mapped(&data[offset..offset + attr_len], &cookie)?;
+                return Some(addr);
+            }
+
+            offset += attr_len;
+            while offset % 4 != 0 {
+                offset += 1;
+            }
+        }
+
+        // Fallback: if we can't parse, use stun server as reference
+        Some(stun_addr)
+    }
+
+    fn check_ipv6(&self) -> bool {
+        match UdpSocket::bind("[::1]:0") {
+            Ok(_) => true,
+            Err(_) => {
+                tracing::debug!("IPv6 not available on this host");
+                false
+            }
+        }
+    }
+}
+
+fn parse_mapped_address(data: &[u8], _len: usize) -> Option<SocketAddr> {
+    if data.len() < 6 {
+        return None;
+    }
+    let family = data[1];
+    let port = u16::from_be_bytes([data[2], data[3]]);
+    if family == 0x01 {
+        // IPv4
+        if data.len() < 8 {
+            return None;
+        }
+        let ip = std::net::Ipv4Addr::new(data[4], data[5], data[6], data[7]);
+        Some(SocketAddr::new(std::net::IpAddr::V4(ip), port))
+    } else if family == 0x02 {
+        // IPv6
+        if data.len() < 20 {
+            return None;
+        }
+        let mut ip_bytes = [0u8; 16];
+        ip_bytes.copy_from_slice(&data[4..20]);
+        let ip = std::net::Ipv6Addr::from(ip_bytes);
+        Some(SocketAddr::new(std::net::IpAddr::V6(ip), port))
+    } else {
+        None
+    }
+}
+
+fn parse_xor_mapped(data: &[u8], cookie: &[u8; 4]) -> Option<SocketAddr> {
+    if data.len() < 6 {
+        return None;
+    }
+    let family = data[1];
+    let port_xor = u16::from_be_bytes([data[2], data[3]]);
+    let port = port_xor ^ u16::from_be_bytes([cookie[0], cookie[1]]);
+
+    if family == 0x01 {
+        if data.len() < 8 {
+            return None;
+        }
+        let mut ip_xor = [data[4], data[5], data[6], data[7]];
+        for i in 0..4 {
+            ip_xor[i] ^= cookie[i];
+        }
+        let ip = std::net::Ipv4Addr::new(ip_xor[0], ip_xor[1], ip_xor[2], ip_xor[3]);
+        Some(SocketAddr::new(std::net::IpAddr::V4(ip), port))
+    } else {
+        None
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_build_binding_request() {
+        let req = NatProbe::build_binding_request();
+        assert_eq!(req.len(), 20);
+        assert_eq!(req[0], 0x00); // Binding Request
+        assert_eq!(req[1], 0x01);
+    }
+
+    #[test]
+    fn test_probe_with_no_servers() {
+        let probe = NatProbe::new(vec![], 5);
+        let socket = UdpSocket::bind("0.0.0.0:0").unwrap();
+        let result = probe.probe_with_socket(&socket).unwrap();
+        assert_eq!(result.nat_type, NatType::Unknown);
+    }
+
+    #[test]
+    fn test_parse_xor_mapped_basic() {
+        // Test XOR-MAPPED-ADDRESS parsing
+        let cookie = [0x21, 0x12, 0xA4, 0x42];
+        let ip = [192, 168, 1, 1];
+        let port: u16 = 1234;
+        let port_xor = port ^ u16::from_be_bytes([cookie[0], cookie[1]]);
+        let mut data = vec![0u8; 8];
+        data[0] = 0;
+        data[1] = 0x01; // IPv4
+        data[2..4].copy_from_slice(&port_xor.to_be_bytes());
+        for i in 0..4 {
+            data[4 + i] = ip[i] ^ cookie[i];
+        }
+        let result = parse_xor_mapped(&data, &cookie).unwrap();
+        assert_eq!(result.port(), port);
+    }
+}

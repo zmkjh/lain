@@ -1,0 +1,17 @@
+[package]
+name = "lain-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+lain-core = { path = "../lain-core" }
+lain-identity = { path = "../lain-identity" }
+lain-discovery = { path = "../lain-discovery" }
+lain-daemon = { path = "../lain-daemon" }
+clap.workspace = true
+tokio = { workspace = true, features = ["net", "io-util", "rt-multi-thread"] }
+tracing.workspace = true
+tracing-subscriber.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true

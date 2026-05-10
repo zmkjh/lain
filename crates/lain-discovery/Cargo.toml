@@ -1,0 +1,13 @@
+[package]
+name = "lain-discovery"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+lain-core = { path = "../lain-core" }
+lain-dht = { path = "../lain-dht" }
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+mdns-sd.workspace = true

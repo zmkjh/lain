@@ -1,0 +1,39 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/lain-core",
+    "crates/lain-identity",
+    "crates/lain-noise",
+    "crates/lain-nat",
+    "crates/lain-dht",
+    "crates/lain-discovery",
+    "crates/lain-transport",
+    "crates/lain-daemon",
+    "crates/lain-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/lain-p2p/lain"
+
+[workspace.dependencies]
+thiserror = "2"
+bytes = "1"
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+async-trait = "0.1"
+bincode = "1"
+base62 = "2"
+mdns-sd = "0.11"
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+sha2 = "0.10"
+rand = "0.8"
+snow = "0.9"
+quinn = "0.11"
+clap = { version = "4", features = ["derive"] }
+toml = "0.8"
+tracing-subscriber = "0.3"

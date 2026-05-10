@@ -1,0 +1,13 @@
+[package]
+name = "lain-noise"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+lain-core = { path = "../lain-core" }
+snow.workspace = true
+rand.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
