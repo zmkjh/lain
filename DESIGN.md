@@ -1937,4 +1937,102 @@ A的app ──fd read/write──→ A的daemon ──QUIC──→ B的daemon �
 | **P2P Relay** | 硬边界 NAT 对，或 UDP 被封锁 | 极少数 |
 | **LAN 直连 (mDNS)** | 同一 WiFi / 局域网内 | 局域网场景自动优先 |
 
+---
+
+## 附录 A：实现对照（2026-05）
+
+以下记录实际实现与原始设计的差异及新增功能。
+
+### A.1 设计已实现
+
+| 章节 | 状态 | 备注 |
+|------|------|------|
+| §3.6 Trait 接口 | ✅ | IdentityProvider, NatProber, TransportLayer, DhtBackend |
+| §4 身份 | ✅ | Ed25519, PeerID=SHA256, 持久化, X25519 转换 |
+| §5 发现 | ✅ | InviteCode Base62, mDNS LAN 注册+浏览 |
+| §6.1 NAT 探测 | ✅ | STUN Binding + CHANGE-REQUEST, Cone/ADF/APDF 分类 |
+| §6.2 三层模型 | ✅ | IPv6 → STUN → Relay 优先级遍历 |
+| §6.6 WebSocket | ✅ | HTTP Upgrade 监听, WS 帧编解码 |
+| §7 Relay 发现+转发 | ✅ | RELAY_NEEDED RPC, pipe_connections 双向桥接 |
+| §7.4 Relay 下线迁移 | ✅ | 管道断开后自动 DHT 查找新 relay 重连 |
+| §8 节点生命周期 | ✅ | LIVE/STALE/EXPIRED, Dormant, 自适应心跳 |
+| §9 Kademlia DHT | ✅ | 256 bucket, 6 RPC, Ed25519 签名+验证, routes.bin |
+| §10 数据传输 | ✅ | QUIC+NoiseIK+HEADERS, STREAM_RESUME, keepalive |
+| §11 IPC | ✅ | UDS/NamedPipe/HTTP, JSON 行协议, fd 传递 |
+
+### A.2 设计未实现
+
+| 章节 | 状态 | 原因 |
+|------|------|------|
+| §6.3 Birthday Attack | ❌ | relay 存在时非必需 |
+| §6.3 TCP Simultaneous Open | ❌ | relay 存在时非必需 |
+| §3.7 单 UDP socket | ⚠️ | DHT+QUIC 各自 bind 不同端口。真单 socket 需要实现 `AsyncUdpSocket` trait (~100 行)，属于工程优化而非功能缺陷 |
+
+### A.3 实现超出设计
+
+| 功能 | 说明 |
+|------|------|
+| Base62 编码 | InviteCode 自定义 Base62 编解码器（非第三方库） |
+| 文件收发 | `lain send <file>` 通过 IPC base64 传输，`monitor` 自动保存 |
+| CLI 实时反馈 | `connect` 订阅事件 15s 内返回成功/失败 |
+| 跨平台 CLI | IpcStream 抽象：Unix→UnixStream, Windows→NamedPipe |
+| 重复启动检测 | 启动时检查 IPC socket 是否已被监听 |
+| 静默 daemon | 默认日志写文件，`--foreground` 恢复终端输出 |
+| per-peer 限速 | DHT 20 msg/s 滑动窗口，10 分钟清理 |
+| 自适应心跳 | Symmetric NAT: 30s, Cone: 120s |
+| bucket 自动刷新 | 启动后对 256 桶递归 FIND_NODE |
+| peers.json 签名 | Ed25519 签名防篡改 |
+| Lain 帧协议 | 10 种帧类型，VarInt 编解码 |
+| mm_connections 限制 | Semaphore 限制活跃连接数 |
+
+### A.4 CLI 命令
+
+```
+$ lain                   # 启动 daemon (quiet mode, log to ~/.lain/daemon.log)
+$ lain daemon            # 同上
+$ lain daemon -f         # 前台运行 (log to stdout)
+$ lain whoami            # 查看 PeerID
+$ lain invite            # 生成 invite 码
+$ lain connect <code>    # 连接到 peer (支持 lain:// 或裸 Base62)
+$ lain send <peer> <f>   # 发送文件给 peer
+$ lain monitor           # 订阅事件流
+$ lain status            # 查看网络状态
+$ lain shutdown          # 停止 daemon
+```
+
+### A.5 IPC JSON 协议
+
+每行一条 JSON（`\n` 分隔），tagged union：
+
+```json
+→ {"cmd":"Connect","invite":"lain://..."}
+← {"type":"Ok","message":"connecting: lain://..."}
+
+→ {"cmd":"Whoami"}
+← {"type":"Ok","message":"a1b2c3d4"}
+
+→ {"cmd":"ListPeers"}
+← {"type":"Ok","data":{"peer_id":"...","nat_type":"Cone","dht_nodes":47,"peers":[...]}}
+
+→ {"cmd":"Subscribe"}
+← {"type":"Event","event":"peer_connected","peer_id":"..."}
+← {"type":"Event","event":"data","peer_id":"...","data":{...}}
+
+→ {"cmd":"Shutdown"}
+← {"type":"Ok","message":"shutting down"}
+```
+
+### A.6 可靠性加固
+
+| 机制 | 实现 |
+|------|------|
+| 签名信任链 | STORE pubkey 验证 `PeerID == SHA256(pubkey)`, DHT 入站验签 |
+| 重复连接 | Connect 前查 `connected` HashMap 去重 |
+| IPC 不阻塞 | `try_send` 替代 `send`, channel 满 drop |
+| IPC 身份验证 | Unix SO_PEERCRED 同 UID |
+| Invite 防篡改 | 验证 `PeerID == SHA256(pubkey)` |
+| Noise IK 超时 | accept `read()` 15s timeout |
+| relay pipe 超时 | `accept_bi()` 30s timeout |
+| 崩溃恢复 | `peers.json` 每次心跳保存 (30-120s 间隔) |
+
 用户和开发者不需要关心最终走的是哪条路径——daemon 透明选择。
