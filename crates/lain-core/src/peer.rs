@@ -43,6 +43,17 @@ impl PeerId {
         Ok(PeerId(id))
     }
 
+    /// PeerID = SHA256(Ed25519 pubkey)
+    pub fn from_pubkey(pubkey: &[u8; 32]) -> Self {
+        use sha2::Digest;
+        let mut hasher = sha2::Sha256::new();
+        sha2::Digest::update(&mut hasher, pubkey);
+        let hash = sha2::Digest::finalize(hasher);
+        let mut id = [0u8; 32];
+        id.copy_from_slice(&hash);
+        PeerId(id)
+    }
+
     /// XOR 距离，用于 Kademlia DHT
     pub fn distance(&self, other: &PeerId) -> [u8; 32] {
         let mut dist = [0u8; 32];

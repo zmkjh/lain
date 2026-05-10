@@ -286,34 +286,11 @@ pub fn parse_frame_header(data: &[u8]) -> Result<FrameHeader, NoiseError> {
 pub fn encode_frame(stream_id: u64, frame_type: u64, payload: &[u8]) -> Vec<u8> {
     let mut frame = Vec::new();
     frame.extend_from_slice(&MAGIC);
-    encode_varint(stream_id, &mut frame);
-    encode_varint(frame_type, &mut frame);
-    encode_varint(payload.len() as u64, &mut frame);
+    lain_core::frame::encode_varint(stream_id, &mut frame);
+    lain_core::frame::encode_varint(frame_type, &mut frame);
+    lain_core::frame::encode_varint(payload.len() as u64, &mut frame);
     frame.extend_from_slice(payload);
     frame
-}
-
-fn encode_varint(value: u64, buf: &mut Vec<u8>) {
-    if value <= 63 {
-        buf.push(value as u8);
-    } else if value <= 16383 {
-        buf.push(0x40 | ((value >> 8) as u8 & 0x3F));
-        buf.push(value as u8);
-    } else if value <= 1073741823 {
-        buf.push(0x80 | ((value >> 24) as u8 & 0x3F));
-        buf.push((value >> 16) as u8);
-        buf.push((value >> 8) as u8);
-        buf.push(value as u8);
-    } else {
-        buf.push(0xC0 | ((value >> 56) as u8 & 0x3F));
-        buf.push((value >> 48) as u8);
-        buf.push((value >> 40) as u8);
-        buf.push((value >> 32) as u8);
-        buf.push((value >> 24) as u8);
-        buf.push((value >> 16) as u8);
-        buf.push((value >> 8) as u8);
-        buf.push(value as u8);
-    }
 }
 
 /// 生成 Noise 临时密钥对（用于 IK 模式中的 e）

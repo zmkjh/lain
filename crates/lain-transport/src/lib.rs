@@ -9,7 +9,6 @@ use lain_core::peer::PeerId;
 use lain_core::transport::{Connection as CoreConn, IncomingConnection, PathType, TransportLayer};
 use lain_core::error::CoreError;
 use lain_noise::{NoiseHandshake, encode_handshake_frame, parse_frame_header};
-use sha2::Digest;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -409,13 +408,7 @@ impl Transport {
             }
         });
 
-        // Verify PeerID = SHA256(remote_pubkey)
-        let mut hasher = sha2::Sha256::new();
-        hasher.update(&remote_pk);
-        let hash = hasher.finalize();
-        let mut pid = [0u8; 32];
-        pid.copy_from_slice(&hash);
-        let remote_peer_id = PeerId(pid);
+        let remote_peer_id = PeerId::from_pubkey(&remote_pk);
 
         tracing::info!("incoming connection from {remote_peer_id}");
 

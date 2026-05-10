@@ -7,7 +7,6 @@ use lain_core::identity::{Ed25519PublicKey, Ed25519Signature, IdentityProvider};
 use lain_core::peer::PeerId;
 use rand::rngs::OsRng;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use std::path::PathBuf;
 use thiserror::Error;
 use tracing;
@@ -128,12 +127,7 @@ impl Identity {
     }
 
     fn compute_peer_id(pubkey: &Ed25519PublicKey) -> PeerId {
-        let mut hasher = Sha256::new();
-        hasher.update(pubkey);
-        let hash = hasher.finalize();
-        let mut peer_id = [0u8; 32];
-        peer_id.copy_from_slice(&hash);
-        PeerId(peer_id)
+        PeerId::from_pubkey(pubkey)
     }
 
     fn identity_path() -> Option<PathBuf> {

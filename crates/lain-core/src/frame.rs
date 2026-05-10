@@ -58,7 +58,7 @@ pub fn decode_frame_header(data: &[u8]) -> Option<(u64, FrameType, u64, usize)> 
     Some((sid, ft, plen, header_len))
 }
 
-fn encode_varint(value: u64, buf: &mut Vec<u8>) {
+pub fn encode_varint(value: u64, buf: &mut Vec<u8>) {
     if value <= 63 {
         buf.push(value as u8);
     } else if value <= 16383 {
@@ -81,7 +81,7 @@ fn encode_varint(value: u64, buf: &mut Vec<u8>) {
     }
 }
 
-fn decode_varint(data: &[u8]) -> Option<(u64, usize)> {
+pub fn decode_varint(data: &[u8]) -> Option<(u64, usize)> {
     if data.is_empty() {
         return None;
     }

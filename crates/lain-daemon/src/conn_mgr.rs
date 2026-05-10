@@ -2,6 +2,7 @@
 #![deny(clippy::expect_used)]
 #![deny(clippy::panic)]
 
+use lain_core::frame::{encode_varint, decode_varint};
 use lain_core::peer::PeerId;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -139,56 +140,6 @@ impl ConnectionManager {
     /// 列出所有活跃 peer
     pub async fn active_peers(&self) -> Vec<PeerId> {
         self.peers.read().await.keys().copied().collect()
-    }
-}
-
-fn encode_varint(value: u64, buf: &mut Vec<u8>) {
-    if value <= 63 {
-        buf.push(value as u8);
-    } else if value <= 16383 {
-        buf.push(0x40 | ((value >> 8) as u8 & 0x3F));
-        buf.push(value as u8);
-    } else if value <= 1073741823 {
-        buf.push(0x80 | ((value >> 24) as u8 & 0x3F));
-        buf.push((value >> 16) as u8);
-        buf.push((value >> 8) as u8);
-        buf.push(value as u8);
-    } else {
-        buf.push(0xC0 | ((value >> 56) as u8 & 0x3F));
-        buf.push((value >> 48) as u8);
-        buf.push((value >> 40) as u8);
-        buf.push((value >> 32) as u8);
-        buf.push((value >> 24) as u8);
-        buf.push((value >> 16) as u8);
-        buf.push((value >> 8) as u8);
-        buf.push(value as u8);
-    }
-}
-
-fn decode_varint(data: &[u8]) -> Option<(u64, usize)> {
-    if data.is_empty() { return None; }
-    let first = data[0];
-    if first & 0xC0 == 0 {
-        Some((first as u64, 1))
-    } else if first & 0xC0 == 0x40 {
-        if data.len() < 2 { return None; }
-        Some((((first & 0x3F) as u64) << 8 | data[1] as u64, 2))
-    } else if first & 0xC0 == 0x80 {
-        if data.len() < 4 { return None; }
-        Some((((first & 0x3F) as u64) << 24
-            | (data[1] as u64) << 16
-            | (data[2] as u64) << 8
-            | data[3] as u64, 4))
-    } else {
-        if data.len() < 8 { return None; }
-        Some((((first & 0x3F) as u64) << 56
-            | (data[1] as u64) << 48
-            | (data[2] as u64) << 40
-            | (data[3] as u64) << 32
-            | (data[4] as u64) << 24
-            | (data[5] as u64) << 16
-            | (data[6] as u64) << 8
-            | data[7] as u64, 8))
     }
 }
 
