@@ -65,7 +65,7 @@ Lain 是一个零服务器、零配置的 P2P 网络基础设施，以 daemon �
 
 ## 3.5 并发模型
 
-Daemon 采用 Tokio async runtime，以网络（network）为顶层调度单元。
+Daemon 采用 Tokio async runtime，以网络（network）为顶层调度单元。单个 UDP socket 承载所有网络的 DHT/QUIC/STUN 流量，按首字节 + NetworkID 分发到对应网络的 supervisor task。
 
 ### 任务层级
 
@@ -148,7 +148,27 @@ Initiator (PeerID 小)              Responder (PeerID 大)
 
 ### 4.3 Network 隔离
 
-每个 overlay 网络有唯一的 `network_secret` (32 bytes)。`NetworkID = SHA256(network_secret)`。NetworkID 嵌入 Noise 握手和 DHT RPC，不同网络的流量、路由表、节点发现完全隔离。
+每个 overlay 网络由唯一的 `network_secret`（32 随机字节）定义。`NetworkID = SHA256(network_secret)` 是其全局唯一标识。
+
+**多网络并存**：一个 daemon 可以同时参与多个网络。每个网络有完全隔离的：
+- DHT 路由表（独立 k-bucket 集合）
+- 节点发现（mDNS 按 NetworkID 过滤）
+- 连接集合（per-network QUIC connection 池）
+- 持久化目录 `~/.lain/networks/<network_id>/`
+
+**协议层隔离**：NetworkID 嵌入在所有跨网络消息中（DHT RPC 头、Noise 握手帧）。收到消息时 daemon 根据 NetworkID 分发到对应网络的 supervisor task。不知道 network_secret 的节点无法伪造该 network 的消息——签名或 HMAC 都依赖 network_secret。
+
+**用户视角**：一个 invite 码对应一个 network。接受多个 invite 就是加入多个网络。例如：
+
+```
+$ lain invite accept lain://abc...     # 加入"家庭设备"网络
+$ lain invite accept lain://xyz...     # 加入"团队协作"网络
+$ lain network list
+  f8a2...  (来自 abc)  3 peers  状态: joined
+  7d1b...  (来自 xyz)  5 peers  状态: joined
+```
+
+**网络之间不互通**：不同网络的 peer 无法互相发现或通信——即使运行在同一台设备上。应用通过 IPC 指定 `network_id` 来选择在哪个网络内建立连接。这是安全特性，不是限制：家庭网络的剪贴板同步不应该泄露到团队网络中。
 
 ---
 
