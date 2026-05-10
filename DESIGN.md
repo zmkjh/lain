@@ -66,7 +66,203 @@ Lain 是一个零服务器、零配置的 P2P 网络基础设施，以 daemon �
 
 ---
 
-## 3.5 并发模型
+## 3.6 接口层次与设计模式
+
+### 3.6.1 核心原则：Trait 契约，而非具体类型
+
+`lain-core` 定义 trait 接口。其他 crate 提供实现。Daemon 通过 trait 组装，不直接依赖实现 crate 的具体类型。这使得测试可以注入 mock，实现可以按需替换。
+
+### 3.6.2 关键 Trait 定义
+
+```rust
+// ── lain-core/src/identity.rs
+/// 设备级永久身份
+pub trait IdentityProvider: Send + Sync {
+    fn peer_id(&self) -> PeerId;                 // SHA256(公钥)
+    fn public_key(&self) -> &Ed25519PublicKey;
+    fn sign(&self, data: &[u8]) -> Ed25519Signature;
+}
+
+// ── lain-core/src/dht.rs
+pub struct NodeInfo {
+    pub node_id: PeerId,
+    pub address: SocketAddr,
+}
+
+pub struct PeerRecord {
+    pub pubkey: Ed25519PublicKey,
+    pub endpoints: Vec<Endpoint>,
+    pub capabilities: Capabilities,
+    pub ttl_remaining: u32,
+}
+
+#[async_trait]
+pub trait DhtBackend: Send + Sync {
+    /// 启动 DHT，bootstrap 到给定地址列表（按优先级尝试）
+    async fn bootstrap(&self, seeds: &[SocketAddr]) -> Result<()>;
+    /// 宣告自己在线
+    async fn store_self(&self, record: PeerRecord) -> Result<()>;
+    /// 查找 peer 的公钥和地址
+    async fn find_peer(&self, peer_id: &PeerId) -> Result<Option<PeerRecord>>;
+    /// 查找 relay 候选
+    async fn find_relays(&self) -> Result<Vec<NodeInfo>>;
+    /// 订阅路由表变更事件
+    fn subscribe_events(&self) -> broadcast::Receiver<DhtEvent>;
+}
+
+// ── lain-core/src/nat.rs
+#[async_trait]
+pub trait NatProber: Send + Sync {
+    async fn probe(&self) -> Result<NatType>;
+}
+
+// ── lain-core/src/transport.rs
+pub struct Connection {
+    pub peer_id: PeerId,
+    pub stream: QuicStream,          // QUIC stream（可靠）
+    pub datagram: QuicDatagramSender, // QUIC datagram（不可靠）
+}
+
+#[async_trait]
+pub trait TransportLayer: Send + Sync {
+    /// 主动连接 peer（执行完整穿透流程）
+    async fn connect(&self, peer_id: &PeerId, record: &PeerRecord) -> Result<Connection>;
+    /// 处理入站连接（Noise IK 已完成）
+    async fn accept(&self, conn: QuicConnection) -> Result<IncomingConnection>;
+    /// 监听地址变更事件（由 DHT 更新触发）
+    fn on_endpoints_changed(&self, peer_id: &PeerId, endpoints: Vec<Endpoint>);
+}
+```
+
+### 3.6.3 Crate 依赖图
+
+```
+lain-core          （零内部依赖 — trait、类型、协议常量）
+  ↑
+  ├── lain-identity  （Ed25519 密钥管理、PeerID）
+  ├── lain-nat       （STUN 客户端、NAT 探测）
+  ├── lain-noise     （Noise IK 握手实现）
+  ├── lain-dht       （Kademlia DHT 实现）
+  │     ↑
+  │     └── lain-discovery （mDNS、invite 编解码）
+  │
+  └── lain-transport （QUIC 管理、帧协议、穿透编排）
+        ↑
+        └── lain-daemon   （IPC、任务编排、持久化）
+              ↑
+              └── lain-cli  （CLI 工具，通过 UDS 与 daemon 通信）
+```
+
+编译依赖是**单向无环**的。运行时交互通过 trait 和 Tokio channel。
+
+### 3.6.4 错误处理策略
+
+每个 crate 定义自己的错误枚举，使用 `thiserror`。跨 crate 调用链上，错误逐层包装但不丢失上下文。
+
+```rust
+// 典型模式
+#[derive(Error, Debug)]
+pub enum DhtError {
+    #[error("bootstrap failed: {0}")]
+    BootstrapFailed(String),
+    #[error("RPC timeout after {0} retries")]
+    RpcTimeout(u8),
+    #[error("signature verification failed for {peer_id}")]
+    InvalidSignature { peer_id: PeerId },
+}
+
+// Daemon 层将所有子错误统一映射到 IPC 错误码
+impl From<DhtError> for IpcError {
+    fn from(e: DhtError) -> Self { /* 根据具体变体映射到 INTERNAL_ERROR / PEER_UNREACHABLE 等 */ }
+}
+```
+
+**错误边界**：Rust 不 panic。所有可能失败的操作返回 `Result`。tokio task panic 由 `JoinHandle` 捕获，上层 task 重启失败的子 task（退避重试，最多 3 次）。
+
+### 3.6.5 配置流
+
+```
+config.toml (文件)
+  → DaemonConfig (lain-daemon 内解析)
+    → 分发给各组件构造函数
+      → DhtConfig { k, alpha, ttl, heartbeat }
+      → TransportConfig { max_connections, idle_timeout, keep_alive }
+      → NatConfig { stun_servers, timeout }
+```
+
+零配置启动：所有字段有 `Default` 实现。`config.toml` 只覆写需要改的字段。
+
+### 3.6.6 Daemon 主事件循环
+
+```rust
+// lain-daemon/src/main.rs 的骨架
+#[tokio::main]
+async fn main() -> Result<()> {
+    let config = DaemonConfig::load_or_default();
+    let identity = Identity::load_or_generate().await?;
+    let nat_type = NatProber::probe(&config.nat).await?;
+
+    // 初始化 DHT（从 routes.bin 恢复 或 空启动）
+    let dht = Dht::new(identity.peer_id(), config.dht);
+    dht.bootstrap(config.bootstrap_seeds()).await?;
+
+    // 预连 relay 候选
+    let relay_pool = RelayPool::new(&dht, &transport);
+
+    // 启动 IPC 服务（UDS + HTTP）
+    let ipc = IpcServer::new(config.ipc, identity.peer_id());
+
+    // 心跳 + 路由表维护
+    tokio::spawn(heartbeat_loop(dht.clone(), config.timing));
+    tokio::spawn(bucket_refresh_loop(dht.clone(), config.dht));
+
+    // 事件循环
+    loop {
+        tokio::select! {
+            // IPC 请求（来自本地应用）
+            Some(req) = ipc.recv() => handle_ipc(req, &dht, &transport).await?,
+
+            // 入站连接（来自远程 peer）
+            Some(conn) = transport.accept_incoming() => {
+                let (peer_id, stream) = noise_handshake(conn).await?;
+                ipc.broadcast_incoming(peer_id, stream.id());
+            }
+
+            // DHT 事件
+            Ok(event) = dht.recv_event() => match event {
+                DhtEvent::PeerDiscovered(peer_id, record) => {
+                    // 更新本地缓存，可触发自动重连
+                }
+                DhtEvent::PeerExpired(peer_id) => {
+                    // 清理本地状态
+                }
+            }
+
+            // 信号
+            _ = tokio::signal::ctrl_c() => {
+                dht.shutdown().await?;  // 序列化 routes.bin
+                break;
+            }
+        }
+    }
+    Ok(())
+}
+```
+
+### 3.6.7 测试架构
+
+| 测试层级 | 做法 | 依赖 |
+|---------|------|------|
+| **单元测试** | 每个 crate 内部，mock trait 的实现注入 | 仅本 crate |
+| **集成测试** | `tests/` 目录，启动真实 DHT + QUIC，mock 网络 | 跨 crate |
+| **表现测试** | Docker + Linux netns 模拟 NAT | 全栈 |
+| **互操作测试** | CI matrix，跨版本通信 | 全栈 |
+
+Mock 的关键：`IdentityProvider`、`DhtBackend`、`NatProber`、`TransportLayer` 都在 `lain-core` 中定义为 trait。单元测试中注入 mock 实现，不需要真实的网络或密钥。
+
+---
+
+## 3.7 并发模型
 
 Daemon 采用 Tokio async runtime。单个 UDP socket 承载所有 DHT/QUIC/STUN 流量，按首字节分发。
 
