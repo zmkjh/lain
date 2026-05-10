@@ -57,6 +57,7 @@ pub enum IpcCommand {
     RejectConnection { connection_id: u64 },
     Shutdown,
     SendToPeer { peer_id: PeerId, data: Vec<u8> },
+    GetStatus { reply: tokio::sync::oneshot::Sender<serde_json::Value> },
 }
 
 pub struct IpcConfig {
@@ -320,7 +321,12 @@ async fn dispatch(
             IpcResponse::Ok { message: Some("rejected".into()), data: None }
         }
         IpcRequest::ListPeers => {
-            IpcResponse::Ok { message: None, data: Some(serde_json::json!({"peers": []})) }
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            send_or_warn(cmd_tx, IpcCommand::GetStatus { reply: tx }, "status");
+            match rx.await {
+                Ok(data) => IpcResponse::Ok { message: None, data: Some(data) },
+                Err(_) => IpcResponse::Error { code: "TIMEOUT".into(), message: "daemon busy".into() },
+            }
         }
         IpcRequest::GetInvite => {
             IpcResponse::Ok { message: None, data: Some(serde_json::json!({"invite": "pending"})) }

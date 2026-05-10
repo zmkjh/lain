@@ -51,20 +51,26 @@ fn main() {
     let socket_path = ipc_socket(&cli.socket);
 
     match cli.command.unwrap_or(Command::Status) {
-        Command::Whoami => ipc_request(&socket_path, r#"{"cmd":"Whoami"}"#),
-        Command::Invite => ipc_request(&socket_path, r#"{"cmd":"GetInvite"}"#),
+        Command::Whoami => { let _ = ipc_request(&socket_path, r#"{"cmd":"Whoami"}"#); },
+        Command::Invite => { let _ = ipc_request(&socket_path, r#"{"cmd":"GetInvite"}"#); },
         Command::Connect { invite } => {
             let req = serde_json::json!({"cmd":"Connect","invite":invite}).to_string();
-            ipc_request(&socket_path, &req);
+            let _ = ipc_request(&socket_path, &req);
+            println!("connecting... (use 'lain status' to check)");
         }
-        Command::Status => ipc_request(&socket_path, r#"{"cmd":"ListPeers"}"#),
+        Command::Status => {
+            let resp = ipc_request(&socket_path, r#"{"cmd":"ListPeers"}"#);
+            if let Some(v) = resp {
+                print_status(&v);
+            }
+        }
     }
 }
 
-fn ipc_request(socket_path: &PathBuf, json: &str) {
+fn ipc_request(socket_path: &PathBuf, json: &str) -> Option<serde_json::Value> {
     #[cfg(unix)]
     {
-        use std::io::{BufRead, BufReader, Write, Read};
+        use std::io::{BufRead, BufReader, Write};
         match std::os::unix::net::UnixStream::connect(socket_path) {
             Ok(mut stream) => {
                 let mut req = json.to_string() + "\n";
@@ -72,11 +78,8 @@ fn ipc_request(socket_path: &PathBuf, json: &str) {
                 let mut reader = BufReader::new(&stream);
                 let mut response = String::new();
                 if reader.read_line(&mut response).is_ok() {
-                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&response) {
-                        println!("{}", serde_json::to_string_pretty(&v).unwrap_or(response));
-                    }
+                    return serde_json::from_str::<serde_json::Value>(&response).ok();
                 }
-                return;
             }
             Err(_) => {}
         }
@@ -84,11 +87,32 @@ fn ipc_request(socket_path: &PathBuf, json: &str) {
 
     #[cfg(not(unix))]
     {
-        // Try HTTP IPC on localhost
         let _ = socket_path;
         let _ = json;
     }
 
-    // Fallback: daemon not running
-    println!("daemon not running");
+    None
+}
+
+fn print_status(v: &serde_json::Value) {
+    let data = v.get("data").and_then(|d| d.as_object());
+    let peer_id = data.and_then(|d| d.get("peer_id")).and_then(|p| p.as_str()).unwrap_or("?");
+    let nat = data.and_then(|d| d.get("nat_type")).and_then(|p| p.as_str()).unwrap_or("?");
+    let ipv6 = data.and_then(|d| d.get("ipv6")).and_then(|p| p.as_bool()).unwrap_or(false);
+    let dht = data.and_then(|d| d.get("dht_nodes")).and_then(|p| p.as_u64()).unwrap_or(0);
+    let known = data.and_then(|d| d.get("known_peers")).and_then(|p| p.as_u64()).unwrap_or(0);
+    let active = data.and_then(|d| d.get("connected_peers")).and_then(|p| p.as_u64()).unwrap_or(0);
+    let peers = data.and_then(|d| d.get("peers")).and_then(|p| p.as_array())
+        .map(|a| a.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>()).unwrap_or_default();
+
+    println!("PeerID:    {}", peer_id);
+    println!("NAT:       {}", nat);
+    println!("IPv6:      {}", if ipv6 { "yes" } else { "no" });
+    println!("DHT nodes: {}", dht);
+    println!("Known:     {}", known);
+    println!("Connected: {}", active);
+    if !peers.is_empty() {
+        println!("Peers:");
+        for p in peers { println!("  {}", p); }
+    }
 }

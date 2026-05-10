@@ -608,6 +608,23 @@ impl Daemon {
                             tracing::info!("IPC: shutdown requested");
                             break;
                         }
+                        IpcCommand::GetStatus { reply } => {
+                            let rt_size = dht_arc.routing_table_size().await;
+                            let known = known_peers.read().await.len();
+                            let active = connected.read().await.len();
+                            let peers: Vec<String> = connected.read().await.keys()
+                                .map(|p| p.to_string())
+                                .collect();
+                            let _ = reply.send(serde_json::json!({
+                                "peer_id": peer_id.to_string(),
+                                "nat_type": format!("{:?}", nat_result.nat_type),
+                                "ipv6": nat_result.ipv6_inbound,
+                                "dht_nodes": rt_size,
+                                "known_peers": known,
+                                "connected_peers": active,
+                                "peers": peers,
+                            }));
+                        }
                     }
                 }
 
