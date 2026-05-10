@@ -691,10 +691,10 @@ fn ipc_socket_alive(path: &PathBuf) -> bool {
     {
         std::os::unix::net::UnixStream::connect(path).is_ok()
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
     {
-        let _ = path;
-        false
+        // Try opening the named pipe — if it exists, daemon is running
+        std::fs::OpenOptions::new().read(true).write(true).open(path).is_ok()
     }
 }
 
