@@ -3,9 +3,54 @@
 #![deny(clippy::panic)]
 
 use clap::{Parser, Subcommand};
-#[cfg_attr(not(unix), allow(unused_imports))]
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::PathBuf;
+
+/// Cross-platform IPC connection
+enum IpcStream {
+    #[cfg(unix)]
+    Unix(std::os::unix::net::UnixStream),
+    #[cfg(windows)]
+    Pipe(std::fs::File),
+}
+
+impl IpcStream {
+    fn connect(path: &PathBuf) -> std::io::Result<Self> {
+        #[cfg(unix)]
+        { std::os::unix::net::UnixStream::connect(path).map(IpcStream::Unix) }
+        #[cfg(windows)]
+        {
+            let file = std::fs::OpenOptions::new()
+                .read(true).write(true)
+                .open(path)?;
+            Ok(IpcStream::Pipe(file))
+        }
+    }
+}
+
+impl Read for IpcStream {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        match self {
+            #[cfg(unix)] IpcStream::Unix(s) => s.read(buf),
+            #[cfg(windows)] IpcStream::Pipe(f) => f.read(buf),
+        }
+    }
+}
+
+impl Write for IpcStream {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        match self {
+            #[cfg(unix)] IpcStream::Unix(s) => s.write(buf),
+            #[cfg(windows)] IpcStream::Pipe(f) => f.write(buf),
+        }
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self {
+            #[cfg(unix)] IpcStream::Unix(s) => s.flush(),
+            #[cfg(windows)] IpcStream::Pipe(f) => f.flush(),
+        }
+    }
+}
 
 #[derive(Parser)]
 #[command(name = "lain", about = "Zero-server P2P network daemon")]
@@ -139,24 +184,15 @@ fn run_daemon(foreground: bool) {
 }
 
 fn ipc_req(socket_path: &PathBuf, json: &str) -> Option<serde_json::Value> {
-    #[cfg(unix)]
-    {
-        let mut stream = std::os::unix::net::UnixStream::connect(socket_path).ok()?;
-        let mut req = json.to_string() + "\n";
-        stream.write_all(req.as_bytes()).ok()?;
-        let mut reader = BufReader::new(&stream);
-        let mut response = String::new();
-        reader.read_line(&mut response).ok()?;
-        serde_json::from_str(&response).ok()
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = socket_path; let _ = json;
-        None
-    }
+    let mut stream = IpcStream::connect(socket_path).ok()?;
+    let req = json.to_string() + "\n";
+    stream.write_all(req.as_bytes()).ok()?;
+    let mut reader = BufReader::new(stream);
+    let mut response = String::new();
+    reader.read_line(&mut response).ok()?;
+    serde_json::from_str(&response).ok()
 }
 
-#[cfg_attr(not(unix), allow(unused_variables))]
 fn connect_feedback(socket_path: &PathBuf, invite: &str) {
     let owned;
     let invite = if !invite.starts_with("lain://") {
@@ -165,52 +201,46 @@ fn connect_feedback(socket_path: &PathBuf, invite: &str) {
     } else {
         invite
     };
-    #[cfg(unix)]
-    {
-        let mut stream = match std::os::unix::net::UnixStream::connect(socket_path) {
-            Ok(s) => s,
-            Err(e) => { eprintln!("cannot connect to daemon: {e}"); return; }
-        };
-        // Send connect
-        let req = serde_json::json!({"cmd":"Connect","invite":invite}).to_string() + "\n";
-        stream.write_all(req.as_bytes()).ok();
-        // Read OK
-        let mut reader = BufReader::new(&stream);
-        let mut line = String::new();
-        reader.read_line(&mut line).ok();
-        println!("connecting...");
-        // Subscribe
-        stream.write_all(b"{\"cmd\":\"Subscribe\"}\n").ok();
+
+    let mut stream = match IpcStream::connect(socket_path) {
+        Ok(s) => s,
+        Err(e) => { eprintln!("cannot connect to daemon: {e}"); return; }
+    };
+    let req = serde_json::json!({"cmd":"Connect","invite":invite}).to_string() + "\n";
+    stream.write_all(req.as_bytes()).ok();
+    let mut reader = BufReader::new(stream);
+    let mut line = String::new();
+    reader.read_line(&mut line).ok();
+    println!("connecting...");
+    // Subscribe
+    reader.get_mut().write_all(b"{\"cmd\":\"Subscribe\"}\n").ok();
+    line.clear();
+    let start = std::time::Instant::now();
+    loop {
         line.clear();
-        let start = std::time::Instant::now();
-        loop {
-            line.clear();
-            if reader.read_line(&mut line).is_err() { break; }
-            if start.elapsed().as_secs() > 15 {
-                println!("timeout — check 'lain status'");
-                break;
-            }
-            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) {
-                if let Some(ev) = v.get("event").and_then(|e| e.as_str()) {
-                    match ev {
-                        "peer_connected" => {
-                            let pid = v.get("peer_id").and_then(|p| p.as_str()).unwrap_or("?");
-                            println!("connected to {pid}");
-                            break;
-                        }
-                        "peer_error" => {
-                            let err = v.get("data").and_then(|d| d.get("error")).and_then(|e| e.as_str()).unwrap_or("?");
-                            println!("connection failed: {err}");
-                            break;
-                        }
-                        _ => {}
+        if reader.read_line(&mut line).is_err() { break; }
+        if start.elapsed().as_secs() > 15 {
+            println!("timeout — check 'lain status'");
+            break;
+        }
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) {
+            if let Some(ev) = v.get("event").and_then(|e| e.as_str()) {
+                match ev {
+                    "peer_connected" => {
+                        let pid = v.get("peer_id").and_then(|p| p.as_str()).unwrap_or("?");
+                        println!("connected to {pid}");
+                        break;
                     }
+                    "peer_error" => {
+                        let err = v.get("data").and_then(|d| d.get("error")).and_then(|e| e.as_str()).unwrap_or("?");
+                        println!("connection failed: {err}");
+                        break;
+                    }
+                    _ => {}
                 }
             }
         }
-        return;
     }
-    eprintln!("not supported on this platform");
 }
 
 fn send_file(socket_path: &PathBuf, peer_id: &str, file: &str) {
@@ -228,49 +258,42 @@ fn send_file(socket_path: &PathBuf, peer_id: &str, file: &str) {
     }
 }
 
-#[cfg_attr(not(unix), allow(unused_variables))]
 fn monitor_loop(socket_path: &PathBuf) {
-    #[cfg(unix)]
-    {
-        let mut stream = match std::os::unix::net::UnixStream::connect(socket_path) {
-            Ok(s) => s,
-            Err(e) => { eprintln!("cannot connect to daemon: {e}"); return; }
-        };
-        stream.write_all(b"{\"cmd\":\"Subscribe\"}\n").ok();
-        println!("monitoring events... (Ctrl+C to stop)");
-        let mut reader = BufReader::new(&stream);
-        let mut line = String::new();
-        loop {
-            line.clear();
-            if reader.read_line(&mut line).is_err() { break; }
-            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) {
-                let event = v.get("event").and_then(|e| e.as_str()).unwrap_or("?");
-                let peer = v.get("peer_id").and_then(|p| p.as_str()).unwrap_or("-");
-                match event {
-                    "peer_connected" => println!("[connected] {peer}"),
-                    "incoming_connection" => println!("[incoming] {peer}"),
-                    "data" => {
-                        // Try to save received data as file
-                        if let Some(data_field) = v.get("data") {
-                            if let Some(b64) = data_field.get("bytes").and_then(|b| b.as_str()) {
-                                use base64::Engine;
-                                if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(b64) {
-                                    let filename = format!("received_from_{peer}.bin");
-                                    let _ = std::fs::write(&filename, &bytes);
-                                    println!("[data] from {peer} → saved {filename} ({} bytes)", bytes.len());
-                                }
-                            } else {
-                                println!("[data] from {peer}");
+    let mut stream = match IpcStream::connect(socket_path) {
+        Ok(s) => s,
+        Err(e) => { eprintln!("cannot connect to daemon: {e}"); return; }
+    };
+    stream.write_all(b"{\"cmd\":\"Subscribe\"}\n").ok();
+    println!("monitoring... (Ctrl+C to stop)");
+    let mut reader = BufReader::new(stream);
+    let mut line = String::new();
+    loop {
+        line.clear();
+        if reader.read_line(&mut line).is_err() { break; }
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) {
+            let event = v.get("event").and_then(|e| e.as_str()).unwrap_or("?");
+            let peer = v.get("peer_id").and_then(|p| p.as_str()).unwrap_or("-");
+            match event {
+                "peer_connected" => println!("[connected] {peer}"),
+                "incoming_connection" => println!("[incoming] {peer}"),
+                "data" => {
+                    if let Some(data_field) = v.get("data") {
+                        if let Some(b64) = data_field.get("bytes").and_then(|b| b.as_str()) {
+                            use base64::Engine;
+                            if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(b64) {
+                                let filename = format!("received_from_{peer}.bin");
+                                let _ = std::fs::write(&filename, &bytes);
+                                println!("[data] from {peer} → saved {filename} ({} bytes)", bytes.len());
                             }
+                        } else {
+                            println!("[data] from {peer}");
                         }
-                    },
-                    _ => println!("[{event}] {peer}"),
-                }
+                    }
+                },
+                _ => println!("[{event}] {peer}"),
             }
         }
-        return;
     }
-    eprintln!("not supported on this platform");
 }
 
 fn print_status(v: &serde_json::Value) {
