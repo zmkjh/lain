@@ -27,7 +27,7 @@ Lain 是一个零服务器、零配置的 P2P 网络基础设施，以 daemon �
 | 身份密钥 | Ed25519 |
 | 握手 | Noise_IK (1-RTT)，高于 QUIC 层，端到端加密 |
 | DHT | 基础 Kademlia，per-network 独立路由表 |
-| NAT 穿透 | IPv6 直连 → STUN → Birthday Attack → TCP Simultaneous Open → WS → Relay |
+| NAT 穿透 | IPv6 直连 → STUN 打洞 → P2P Relay（三层模型） |
 | 网络准入 | Invite-only |
 
 ---
@@ -177,7 +177,7 @@ $ lain network list
 ### 5.1 发现路径
 
 ```
-优先级:  mDNS (局域网) → Invite Code (广域网) → DHT lookup → Overlay relay
+优先级:  mDNS (局域网) → Invite Code (广域网) → DHT lookup（持续）
 ```
 
 - **mDNS**: LAN 内通过非特权端口（默认 53617，可配置）广播 `_lain._udp.local`，TXT record 含 PeerID + 实际 QUIC 端口。使用非标准 mDNS 端口避免与系统 mDNS 服务（avahi/Bonjour/mDNSResponder，占用 5353）冲突。
@@ -857,12 +857,9 @@ NAT_PROBING             (若需要: 自身 NAT 类型未缓存)
   │
   ▼
 TRAVERSING
-  ├─ IPv6_ATTEMPT       (若有 IPv6 地址)
-  ├─ STUN_HOLE_PUNCH    (并行)
-  ├─ BIRTHDAY_ATTACK    (并行, 若 STUN 初步探测失败)
-  ├─ TCP_SIM_OPEN       (若 UDP 全部失败)
-  ├─ WS_FALLBACK        (若 TCP 入站可行)
-  └─ RELAY_CONNECT      (若已预连 relay)
+  ├─ IPv6_ATTEMPT       (Layer 1, 若有 IPv6)
+  ├─ STUN_HOLE_PUNCH    (Layer 2, 并行)
+  └─ RELAY_CONNECT      (Layer 3, 预连 relay 候选，立即可用)
   │
   ├─ 任一路径成功 ──→ CONNECTED
   ├─ 全部路径失败 ──→ FAILED
@@ -1180,6 +1177,9 @@ DHT:   k=20, alpha=3, ttl=300s, heartbeat=150s, republish=3600s
 | 0xC0-0xFF | QUIC long-header | 首 2 bit = 11（Initial/Handshake），或 0x40-0x7F（short-header，按 CID 匹配已注册 connection） |
 
 QUIC short-header 包的首字节为 `01xxxxxx`（与 DHT version=1 冲突）。区分方式：收到 0x01 开头的包时，先尝试按已注册 QUIC Connection ID 匹配，无匹配则按 DHT RPC 解析。QUIC 握手完成后所有包均可按 CID 匹配，不存在歧义。
+
+| 端口 | 用途 |
+|------|------|
 | TCP 临时 | TSO / WS fallback listener |
 | UDS 路径 | IPC native |
 | TCP 127.0.0.1 随机 | IPC HTTP/WS |
@@ -1272,12 +1272,11 @@ QUIC short-header 包的首字节为 `01xxxxxx`（与 DHT version=1 冲突）。
 ### 13.2 优雅降级
 
 ```
-Level 0 — 全功能: IPv6 + IPv4 NAT + DHT + 直连 + Relay
-Level 1 — IPv4 降级: STUN server 全部不可达 → IPv6-only
-Level 2 — IPv6 降级: 无 IPv6 → IPv4-only
-Level 3 — 直连降级: 部分 peer 不可直连 → relay 补全
-Level 4 — DHT 降级: bootstrap 不可达 → 仅现有直连 peer
-Level 5 — 最小存活: 仅 relay 路径
+Level 0 — 全功能: IPv6 + IPv4 STUN + DHT + Relay（正常状态）
+Level 1 — IPv4 降级: STUN server 全部不可达 → IPv6 + Relay
+Level 2 — IPv6 降级: 无 IPv6 → STUN + Relay
+Level 3 — DHT 降级: bootstrap 不可达 → 仅现有直连 peer + Relay
+Level 4 — 最小存活: 仅 Relay 路径（所有直连不可用）
 ```
 
 ### 13.3 重试策略
@@ -1616,9 +1615,8 @@ $ lain invite generate
                                                        → QUIC → Noise IK → 连接建立 ✓
                                                        → DHT 已 bootstrap（通过 A）
 
-$ lain network peers team-chat
-  b3f1... (self)       direct_quic
-  d7e4... (B的机器)     direct_quic, 8ms, IPv6
+$ lain network list
+  f8a2...  1 peer (B的机器)
 
 # 两个 app（各自用 IPC 连接 daemon）开始通信
 A的app ──IPC fd──→ lain daemon ──IPv6 QUIC──→ B的daemon ──IPC fd──→ B的app
