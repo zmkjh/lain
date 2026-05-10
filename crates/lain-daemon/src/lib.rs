@@ -625,6 +625,14 @@ impl Daemon {
                                 "peers": peers,
                             }));
                         }
+                        IpcCommand::GetWhoami { reply } => {
+                            let _ = reply.send(peer_id.to_string());
+                        }
+                        IpcCommand::GetInviteCode { reply } => {
+                            // _invite was printed to log at startup — save it
+                            let invite_str = _invite.to_base62();
+                            let _ = reply.send(format!("lain://{}", invite_str));
+                        }
                     }
                 }
 

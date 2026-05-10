@@ -58,6 +58,8 @@ pub enum IpcCommand {
     Shutdown,
     SendToPeer { peer_id: PeerId, data: Vec<u8> },
     GetStatus { reply: tokio::sync::oneshot::Sender<serde_json::Value> },
+    GetWhoami { reply: tokio::sync::oneshot::Sender<String> },
+    GetInviteCode { reply: tokio::sync::oneshot::Sender<String> },
 }
 
 pub struct IpcConfig {
@@ -74,12 +76,15 @@ pub struct IpcServer {
     cmd_tx: mpsc::Sender<IpcCommand>,
     event_tx: broadcast::Sender<IpcResponse>,
     next_conn_id: u64,
+    /// Daemon metadata (set after construction)
+    pub peer_id: Option<PeerId>,
+    pub invite_code: Option<String>,
 }
 
 impl IpcServer {
     pub fn new(config: IpcConfig, cmd_tx: mpsc::Sender<IpcCommand>) -> Self {
         let (event_tx, _) = broadcast::channel(256);
-        Self { config, cmd_tx, event_tx, next_conn_id: 1 }
+        Self { config, cmd_tx, event_tx, next_conn_id: 1, peer_id: None, invite_code: None }
     }
 
     pub fn event_sender(&self) -> broadcast::Sender<IpcResponse> {
@@ -328,11 +333,21 @@ async fn dispatch(
                 Err(_) => IpcResponse::Error { code: "TIMEOUT".into(), message: "daemon busy".into() },
             }
         }
-        IpcRequest::GetInvite => {
-            IpcResponse::Ok { message: None, data: Some(serde_json::json!({"invite": "pending"})) }
-        }
         IpcRequest::Whoami => {
-            IpcResponse::Ok { message: Some("unknown".into()), data: None }
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            send_or_warn(cmd_tx, IpcCommand::GetWhoami { reply: tx }, "whoami");
+            match rx.await {
+                Ok(pid) => IpcResponse::Ok { message: Some(pid), data: None },
+                Err(_) => IpcResponse::Error { code: "TIMEOUT".into(), message: "daemon busy".into() },
+            }
+        }
+        IpcRequest::GetInvite => {
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            send_or_warn(cmd_tx, IpcCommand::GetInviteCode { reply: tx }, "invite");
+            match rx.await {
+                Ok(code) => IpcResponse::Ok { message: Some(code), data: None },
+                Err(_) => IpcResponse::Error { code: "TIMEOUT".into(), message: "daemon busy".into() },
+            }
         }
         IpcRequest::Subscribe => {
             IpcResponse::Ok { message: Some("subscribed".into()), data: None }

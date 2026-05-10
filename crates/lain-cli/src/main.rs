@@ -51,8 +51,20 @@ fn main() {
     let socket_path = ipc_socket(&cli.socket);
 
     match cli.command.unwrap_or(Command::Status) {
-        Command::Whoami => { let _ = ipc_request(&socket_path, r#"{"cmd":"Whoami"}"#); },
-        Command::Invite => { let _ = ipc_request(&socket_path, r#"{"cmd":"GetInvite"}"#); },
+        Command::Whoami => {
+            if let Some(v) = ipc_request(&socket_path, r#"{"cmd":"Whoami"}"#) {
+                if let Some(msg) = v.get("message").and_then(|m| m.as_str()) {
+                    println!("PeerID: {}", msg);
+                }
+            }
+        },
+        Command::Invite => {
+            if let Some(v) = ipc_request(&socket_path, r#"{"cmd":"GetInvite"}"#) {
+                if let Some(msg) = v.get("message").and_then(|m| m.as_str()) {
+                    println!("Invite: {}", msg);
+                }
+            }
+        },
         Command::Connect { invite } => {
             let req = serde_json::json!({"cmd":"Connect","invite":invite}).to_string();
             let _ = ipc_request(&socket_path, &req);
