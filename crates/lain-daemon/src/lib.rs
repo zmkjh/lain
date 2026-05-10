@@ -4,6 +4,7 @@
 
 pub mod config;
 pub mod ipc;
+pub mod conn_mgr;
 
 use lain_core::capabilities::Capabilities;
 use lain_core::endpoint::Endpoint;
@@ -26,6 +27,7 @@ use tracing;
 
 use std::net::SocketAddr;
 use self::ipc::{IpcCommand, IpcServer};
+use self::conn_mgr::ConnectionManager;
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 struct StoredPeer {
@@ -33,6 +35,8 @@ struct StoredPeer {
     pubkey_hex: String,
     endpoints: Vec<String>,
 }
+
+pub use config::DaemonConfig;
 
 fn peers_json_path() -> Option<PathBuf> {
     dirs_home().map(|d| d.join(".lain").join("peers.json"))
@@ -48,7 +52,6 @@ fn save_peers(peers: &HashMap<PeerId, Vec<Endpoint>>) {
         if let Ok(json) = serde_json::to_string_pretty(&entries) {
             if let Some(d) = path.parent() { std::fs::create_dir_all(d).ok(); }
             let _ = std::fs::write(&path, json);
-            tracing::info!("saved {} peers to {}", entries.len(), path.display());
         }
     }
 }
@@ -67,14 +70,11 @@ fn load_peers() -> HashMap<PeerId, Vec<Endpoint>> {
                         map.insert(pid, eps);
                     }
                 }
-                tracing::info!("loaded {} peers from {}", map.len(), path.display());
             }
         }
     }
     map
 }
-
-pub use config::DaemonConfig;
 
 #[derive(Error, Debug)]
 pub enum DaemonError {
@@ -317,6 +317,8 @@ impl Daemon {
         let known_peers: Arc<RwLock<HashMap<PeerId, Vec<Endpoint>>>> =
             Arc::new(RwLock::new(load_peers()));
 
+        let conn_mgr = Arc::new(ConnectionManager::new());
+
         if !known_peers.read().await.is_empty() {
             tracing::info!("restored {} known peers", known_peers.read().await.len());
         }
@@ -345,6 +347,7 @@ impl Daemon {
                             if let Some(inv) = code {
                                 let mut peers = known_peers.write().await;
                                 peers.insert(inv.peer_id, inv.endpoints.clone());
+                                conn_mgr.add_peer(inv.peer_id).await;
                                 tracing::info!("added peer {} ({} endpoints)",
                                     inv.peer_id, inv.endpoints.len());
                                 // Initiate DHT lookup
