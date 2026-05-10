@@ -474,7 +474,7 @@ invite 是最便捷的方式，但不是唯一方式。
 
 ### 6.1 NAT 类型探测
 
-启动时执行 RFC 5780 简化探测：
+启动时执行 RFC 5780 简化探测。**STUN server 不可达时，回退到 DHT 反射探测**（见下文）。
 
 1. 向 STUN server A 发送两次 Binding Request：一次正常，一次带 CHANGE-REQUEST（要求服务器从不同 IP 回包）
 2. 向 STUN server B 发送一次 Binding Request（交叉验证 CGNAT 多 IP 出口）
@@ -487,6 +487,20 @@ invite 是最便捷的方式，但不是唯一方式。
 | 两次相同 IP，不同 Port | — | EDM → Symmetric → 进一步测 ADF vs APDF |
 
 进一步区分 ADF vs APDF：从第二个 STUN server 的备用 IP 向本地 mapped address 发包，检测是否可达。可达为 ADF，不可达为 APDF。
+
+#### DHT 反射探测（STUN 不可达时的回退）
+
+STUN 是整个设计中唯一的外部依赖。当所有 STUN server 均不可达时，使用 P2P 网络自身做地址发现：
+
+1. 从 DHT 路由表中选取若干个已知在线的 peer
+2. 向每个 peer 发送 `ADDR_REFLECT` RPC（msg_type=0x06）——空 payload
+3. peer 收到后，直接从 UDP 包头读取源地址，构造响应：`{ observed_addr: Address }`
+4. 向多个 peer 发送，比较返回的 observed_addr：
+   - 全部相同 IP+Port → EIM（Cone NAT）
+   - 相同 IP、不同 Port → EDM（Symmetric NAT）
+5. 结果与 STUN 探测一致。功能等价，延迟略高（依赖 DHT 查找 vs 直连 STUN server）
+
+DHT 反射不依赖任何第三方服务器——peer 在 P2P 网络内部，天然防墙。只要 DHT 里有一个能连上的 peer，就能获取公网地址映射。这是 STUN 的完全去中心化替代品。
 
 结果缓存到 `~/.lain/cache/nat_type.json`，仅网络接口变更时重新探测。
 
@@ -858,6 +872,7 @@ PeerID:    [u8; 32]   // SHA256 hash
 | 0x03 | FIND_NODE | 请求: Ed25519, 响应: HMAC |
 | 0x04 | RELAY_NEEDED | 请求: Ed25519, 响应: HMAC |
 | 0x05 | ERROR | HMAC |
+| 0x06 | ADDR_REFLECT | 请求: Ed25519, 响应: HMAC |
 
 **各 RPC payload 格式：**
 
@@ -912,6 +927,12 @@ ERROR 响应:
   error_code: u8
   // 错误码: 1=UNSUPPORTED_VERSION, 2=INVALID_SIGNATURE
   //         3=MESSAGE_TOO_LARGE, 4=INTERNAL_ERROR
+
+ADDR_REFLECT 请求:
+  (空 payload)
+
+ADDR_REFLECT 响应:
+  observed_addr: Address    // 从 UDP 包头读取的源地址
 ```
 
 ### 9.7.3 Noise IK 握手帧
