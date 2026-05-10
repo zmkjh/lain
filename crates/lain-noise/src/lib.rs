@@ -372,10 +372,13 @@ mod tests {
 
     #[test]
     fn test_full_handshake() {
-        let (secret, _public) = generate_keypair();
+        // Generate two independent keypairs
+        let (init_secret, init_public) = generate_keypair();
+        let (resp_secret, resp_public) = generate_keypair();
 
-        let init = NoiseHandshake::new_initiator(&secret, &_public).unwrap();
-        let resp = NoiseHandshake::new_responder(&secret).unwrap();
+        // Initiator knows responder's public key
+        let init = NoiseHandshake::new_initiator(&init_secret, &resp_public).unwrap();
+        let resp = NoiseHandshake::new_responder(&resp_secret).unwrap();
 
         let (init_session, resp_session) = perform_full_handshake(init, resp).unwrap();
 

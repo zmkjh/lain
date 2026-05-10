@@ -144,7 +144,8 @@ impl Daemon {
             heartbeat_interval_secs: self.config.dht.heartbeat_interval_secs,
             republish_interval_secs: lain_core::DHT_REPUBLISH_SECS,
             idle_peer_timeout_secs: 900,
-            local_addr: self.config.dht.local_addr.unwrap_or("0.0.0.0:0".parse().unwrap()),
+            local_addr: self.config.dht.local_addr
+                .unwrap_or_else(|| "0.0.0.0:0".parse().expect("valid addr")),
             bootstrap_nodes: self.config.dht.bootstrap_nodes.clone(),
         };
 
@@ -192,7 +193,9 @@ impl Daemon {
             vec![]
         };
 
-        let _ = dht.store_self(&public_key, &endpoints, capabilities).await;
+        if let Err(e) = dht.store_self(&public_key, &endpoints, capabilities).await {
+            tracing::warn!("initial DHT STORE failed: {e}");
+        }
 
         // 6. mDNS LAN 发现
         let dht_for_mdns = Arc::new(dht);
@@ -238,7 +241,10 @@ impl Daemon {
 
         let local_port = dht_for_mdns.socket().local_addr()
             .map(|a| a.port())
-            .unwrap_or(53617);
+            .unwrap_or_else(|_| {
+                tracing::warn!("cannot determine DHT local port, using default 53617");
+                53617
+            });
 
         let _mdns = match MdnsDiscovery::register(peer_id, local_port) {
             Ok(mdns) => {
@@ -385,16 +391,18 @@ impl Daemon {
                         IpcCommand::DisconnectPeer { peer_id } => {
                             tracing::info!("IPC: disconnect {peer_id}");
                             known_peers.write().await.remove(&peer_id);
+                            conn_mgr.remove_peer(&peer_id).await;
                         }
                         IpcCommand::SendToPeer { peer_id, data } => {
-                            tracing::info!("IPC: send {}b to {peer_id}", data.len());
+                            tracing::debug!("IPC: send {}b to {peer_id}", data.len());
                             let peers = known_peers.read().await;
                             if let Some(endpoints) = peers.get(&peer_id) {
-                                // Try each endpoint
+                                let msg = lain_core::frame::encode_frame(
+                                    2, lain_core::frame::FrameType::Data, &data,
+                                );
+                                // In production: send through established QUIC connection
+                                // For now, send via transport's UDP to peer endpoints
                                 for ep in endpoints {
-                                    let msg = lain_core::frame::encode_frame(
-                                        2, lain_core::frame::FrameType::Data, &data,
-                                    );
                                     let _ = socket.send_to(&msg, ep.addr).await;
                                 }
                             }

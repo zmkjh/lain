@@ -185,9 +185,7 @@ impl Transport {
             .map_err(|e| TransportError::Io(format!("WS local_addr: {e}")))?
             .port();
 
-        let _endpoint_arc = self.endpoint.clone();
-        let _noise_secret = self.noise_secret;
-
+        // Spawn WS accept loop
         tokio::spawn(async move {
             loop {
                 match listener.accept().await {

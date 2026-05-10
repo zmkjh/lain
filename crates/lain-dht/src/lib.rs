@@ -340,7 +340,7 @@ impl DhtHandle {
                 if msg.payload.len() >= 36 {
                     let key = PeerId(msg.payload[..32].try_into().unwrap_or([0u8; 32]));
                     let ttl = u32::from_be_bytes([msg.payload[32], msg.payload[33], msg.payload[34], msg.payload[35]]);
-                    let _ = ttl;
+                    let effective_ttl = if ttl == 0 || ttl > 3600 { 300 } else { ttl };
                     // Store the record locally (parse pubkey + endpoints)
                     if msg.payload.len() >= 68 {
                         let mut pubkey = [0u8; 32];
@@ -349,15 +349,15 @@ impl DhtHandle {
                             pubkey,
                             endpoints: vec![],
                             capabilities: Capabilities::new(),
-                            ttl_remaining: 300,
-                            expires_at: std::time::Instant::now() + std::time::Duration::from_secs(300),
+                            ttl_remaining: effective_ttl,
+                            expires_at: std::time::Instant::now() + std::time::Duration::from_secs(effective_ttl as u64),
                         };
                         self.peer_records.write().await.insert(key, record);
                         let _ = self.event_tx.send(CoreDhtEvent::PeerDiscovered(key, PeerRecord {
                             pubkey,
                             endpoints: vec![],
                             capabilities: Capabilities::new(),
-                            ttl_remaining: 300,
+                            ttl_remaining: effective_ttl,
                             expires_at: std::time::Instant::now(),
                         }.into_core(&key)));
                     }
