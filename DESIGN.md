@@ -155,29 +155,88 @@ lain-core          （零内部依赖 — trait、类型、协议常量）
 
 编译依赖是**单向无环**的。运行时交互通过 trait 和 Tokio channel。
 
-### 3.6.4 错误处理策略
+### 3.6.4 错误处理：零 Panic 策略
 
-每个 crate 定义自己的错误枚举，使用 `thiserror`。跨 crate 调用链上，错误逐层包装但不丢失上下文。
+**铁律**：生产代码中不允许 `.unwrap()`、`.expect()`、`panic!()`、`unreachable!()`。即使是"理论上不可能"的代码路径也必须返回 `Result` 或记录错误后优雅降级。
+
+**Lint 强制执行**：每个 crate 的 `lib.rs` 顶部：
 
 ```rust
-// 典型模式
+#![deny(clippy::unwrap_used)]
+#![deny(clippy::expect_used)]
+#![deny(clippy::panic)]
+```
+
+**例外（仅限以下场景可用 `.expect()`）**：
+- 锁中毒恢复：`mutex.lock().expect("lock poisoned")` —— 此时进程状态已不可信，重启 task 是唯一选择
+- 静态初始化：`OnceLock::get_or_init(|| ...)` 中的构造逻辑
+- 所有例外必须在代码注释中说明理由
+
+**错误类型设计**：每个 crate 用 `thiserror` 定义精确的错误枚举，不允许 `Box<dyn Error>` 模糊传播。
+
+```rust
 #[derive(Error, Debug)]
 pub enum DhtError {
-    #[error("bootstrap failed: {0}")]
-    BootstrapFailed(String),
-    #[error("RPC timeout after {0} retries")]
-    RpcTimeout(u8),
+    #[error("bootstrap failed after {attempts} attempts: {last_error}")]
+    BootstrapFailed { attempts: u8, last_error: String },
+
+    #[error("RPC timeout for {rpc_type} to {peer_id}")]
+    RpcTimeout { rpc_type: &'static str, peer_id: PeerId },
+
     #[error("signature verification failed for {peer_id}")]
     InvalidSignature { peer_id: PeerId },
+
+    #[error("routing table corrupted: {detail}")]
+    RoutingTableCorrupted { detail: String },
 }
 
-// Daemon 层将所有子错误统一映射到 IPC 错误码
+// Daemon 层将所有子错误映射到 IPC 错误码
 impl From<DhtError> for IpcError {
-    fn from(e: DhtError) -> Self { /* 根据具体变体映射到 INTERNAL_ERROR / PEER_UNREACHABLE 等 */ }
+    fn from(e: DhtError) -> Self {
+        match e {
+            DhtError::BootstrapFailed { .. } => IpcError::peer_unreachable(e),
+            DhtError::RpcTimeout { .. } => IpcError::connection_timeout(e),
+            DhtError::InvalidSignature { .. } => IpcError::internal_error(e),
+            DhtError::RoutingTableCorrupted { .. } => IpcError::internal_error(e),
+        }
+    }
 }
 ```
 
-**错误边界**：Rust 不 panic。所有可能失败的操作返回 `Result`。tokio task panic 由 `JoinHandle` 捕获，上层 task 重启失败的子 task（退避重试，最多 3 次）。
+**Task 边界保护**：每个 tokio task 外层包裹 catch_unwind。task panic 不传播到父 task。
+
+```rust
+// lain-daemon 中的 task 启动模式
+fn spawn_protected(name: &str, fut: impl Future<Output = Result<()>> + Send + 'static) {
+    tokio::spawn(async move {
+        let result = AssertUnwindSafe(fut).catch_unwind().await;
+        match result {
+            Ok(Ok(())) => tracing::info!("{name} exited normally"),
+            Ok(Err(e)) => tracing::error!("{name} error: {e:#}"),
+            Err(panic) => {
+                let msg = panic.downcast_ref::<&str>()
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| "unknown panic".into());
+                tracing::error!("{name} PANICKED: {msg}");
+            }
+        }
+        // 关键 task（DHT、IPC）在这里重启，退避重试最多 3 次
+    });
+}
+```
+
+**优雅降级而非崩溃**：
+
+| 场景 | 行为 |
+|------|------|
+| 单个 peer 连接断开 | 记录日志，触发重连，其余 peer 不受影响 |
+| DHT RPC 超时 | 重试 2 次，失败则标记该 peer STALE，继续使用其他路由 |
+| routes.bin 损坏 | WARN 日志，丢弃文件，从零 bootstrap |
+| OOM（内存不足） | 关闭空闲连接，拒绝新连接，发送 backpressure 信号给应用 |
+| QUIC socket 错误 | 关闭受影响的 connection，重建——不重启 daemon |
+| tokio runtime 崩溃 | 致命——daemon 退出，由 systemd/launchd 重启 |
+
+**核心原则**：一个 peer 的故障不应该影响另一个 peer。一个网络的故障不应该影响另一个网络。一个 crate 的 bug 不应该拖垮整个进程。Lain daemon 应该比它连接的任何单个 peer 都更稳定。
 
 ### 3.6.5 配置流
 
@@ -1628,7 +1687,7 @@ Level 4 — 最小存活: 仅 Relay 路径（所有直连不可用）
 
 ### 17.3 CI/CD
 
-- `cargo fmt --check` + `cargo clippy` + `cargo test`
+- `cargo fmt --check` + `cargo clippy -- -D clippy::unwrap_used -D clippy::expect_used -D clippy::panic` + `cargo test`
 - NAT 穿透矩阵用 GitHub Actions + Docker（每个 PR 运行）
 - 长时间 soak test (24h): 多节点加入/离开/重连（nightly）
 
