@@ -5,6 +5,8 @@
 pub mod config;
 pub mod ipc;
 pub mod conn_mgr;
+pub mod iface_watcher;
+pub mod fd_pass;
 
 use lain_core::capabilities::Capabilities;
 use lain_core::endpoint::Endpoint;
@@ -28,6 +30,7 @@ use tracing;
 use std::net::SocketAddr;
 use self::ipc::{IpcCommand, IpcServer};
 use self::conn_mgr::ConnectionManager;
+use self::iface_watcher::InterfaceWatcher;
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 struct StoredPeer {
@@ -318,6 +321,23 @@ impl Daemon {
             Arc::new(RwLock::new(load_peers()));
 
         let conn_mgr = Arc::new(ConnectionManager::new());
+
+        // Interface watcher: detect network changes
+        let iface_watcher = Arc::new(InterfaceWatcher::new());
+        iface_watcher.snapshot().await;
+        let dht_iface = dht_arc.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
+            loop {
+                interval.tick().await;
+                let (added, removed) = iface_watcher.check().await;
+                if !added.is_empty() || !removed.is_empty() {
+                    tracing::warn!("network interface change: +{}/-{}", added.len(), removed.len());
+                    // Emergency DHT STORE would go here
+                    let _ = dht_iface.find_relays().await;
+                }
+            }
+        });
 
         if !known_peers.read().await.is_empty() {
             tracing::info!("restored {} known peers", known_peers.read().await.len());

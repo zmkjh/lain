@@ -795,12 +795,14 @@ dependencies = [
 name = "lain-daemon"
 version = "0.1.0"
 dependencies = [
+ "if-addrs",
  "lain-core",
  "lain-dht",
  "lain-discovery",
  "lain-identity",
  "lain-nat",
  "lain-transport",
+ "libc",
  "rand 0.8.6",
  "serde",
  "serde_json",
