@@ -89,6 +89,7 @@ pub struct DhtHandle {
     #[allow(dead_code)]
     signing_key: Option<[u8; 32]>,
     pending_queries: Arc<RwLock<HashMap<[u8; 16], tokio::sync::oneshot::Sender<Option<PeerRecord>>>>>,
+    peer_ratelimit: Arc<RwLock<HashMap<PeerId, (u128, u32)>>>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -123,6 +124,7 @@ impl DhtHandle {
             socket: Arc::new(socket),
             signing_key: None,
             pending_queries: Arc::new(RwLock::new(HashMap::new())),
+            peer_ratelimit: Arc::new(RwLock::new(HashMap::new())),
         })
     }
 
@@ -349,6 +351,26 @@ impl DhtHandle {
         self.routing_table.read().await.size()
     }
 
+    /// Per-peer 限速：每秒最多 20 条消息
+    async fn check_rate_limit(&self, peer_id: &PeerId) -> bool {
+        let mut limits = self.peer_ratelimit.write().await;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
+        let entry = limits.entry(*peer_id).or_insert((now, 0));
+        if now - entry.0 > 1000 {
+            entry.0 = now;
+            entry.1 = 1;
+            true
+        } else if entry.1 >= 20 {
+            false
+        } else {
+            entry.1 += 1;
+            true
+        }
+    }
+
     /// 后台清理：每 10 分钟移除过期 peer_records
     pub fn spawn_cleanup(self: &Arc<Self>) {
         let this = self.clone();
@@ -364,6 +386,7 @@ impl DhtHandle {
                     tracing::debug!("DHT cleanup: removed {} expired", before - records.len());
                 }
                 this.pending_queries.write().await.clear();
+                this.peer_ratelimit.write().await.clear();
             }
         });
     }
@@ -381,6 +404,10 @@ impl DhtHandle {
 
         // Verify Ed25519 signature for request messages
         if !msg.is_response {
+            if !self.check_rate_limit(&msg.sender_id).await {
+                tracing::debug!("DHT rate limit: dropping from {}", msg.sender_id);
+                return Ok(());
+            }
             if let Some(ref sig) = msg.signature {
                 if sig.iter().any(|&b| b != 0) {
                     if data.len() < 64 { return Ok(()); } // too short to have a real signature
