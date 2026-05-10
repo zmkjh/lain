@@ -529,7 +529,6 @@ impl Daemon {
                             if let Some(conn) = connected.write().await.remove(&peer_id) {
                                 conn.close(0u32.into(), b"disconnected");
                             }
-                            // TODO: relay migration — if connection was relayed, find alternative relay
                         }
                         IpcCommand::SendToPeer { peer_id, data } => {
                             let conn = {
