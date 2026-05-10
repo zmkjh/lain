@@ -13,6 +13,7 @@ use lain_core::peer::PeerId;
 use lain_identity::Identity;
 use lain_nat::NatProbe;
 use lain_dht::DhtHandle;
+use lain_discovery::MdnsDiscovery;
 use thiserror::Error;
 use tokio::sync::{mpsc, RwLock};
 use std::sync::Arc;
@@ -118,7 +119,47 @@ impl Daemon {
 
         let _ = dht.store_self(&public_key, &endpoints, capabilities).await;
 
-        // 6. 生成 invite
+        // 6. mDNS LAN 发现
+        let dht_for_mdns = Arc::new(dht);
+        let local_port = dht_for_mdns.socket().local_addr()
+            .map(|a| a.port())
+            .unwrap_or(53617);
+
+        let _mdns = match MdnsDiscovery::register(peer_id, local_port) {
+            Ok(mdns) => {
+                tracing::info!("mDNS registered on port {local_port}");
+                let dht_ref = dht_for_mdns.clone();
+                match mdns.browse() {
+                    Ok(receiver) => {
+                        tokio::spawn(async move {
+                            loop {
+                                match receiver.recv_async().await {
+                                    Ok(event) => {
+                                        if let Some((discovered_id, addr, _port)) =
+                                            MdnsDiscovery::parse_peer_from_event(&event)
+                                        {
+                                            if discovered_id != peer_id {
+                                                tracing::debug!("mDNS: {discovered_id} at {addr}");
+                                                dht_ref.handle_incoming(&[], addr).await.ok();
+                                            }
+                                        }
+                                    }
+                                    Err(_) => break,
+                                }
+                            }
+                        });
+                    }
+                    Err(e) => tracing::warn!("mDNS browse: {e}"),
+                }
+                Some(mdns)
+            }
+            Err(e) => {
+                tracing::warn!("mDNS: {e}");
+                None
+            }
+        };
+
+        // 7. 生成 invite
         let _invite = lain_discovery::InviteCode::new(
             peer_id, public_key, capabilities, endpoints.clone(),
             &|data| self.identity.sign(data),
@@ -149,8 +190,8 @@ impl Daemon {
         tracing::info!("IPC ready at {:?}", uds_path);
 
         // 8. 启动 DHT + IPC 事件循环
-        let socket = dht.socket();
-        let dht_arc = Arc::new(dht);
+        let socket = dht_for_mdns.socket();
+        let dht_arc = dht_for_mdns; // Already Arc-wrapped above
         let dht_recv = dht_arc.clone();
 
         let mut buf = vec![0u8; 2048];

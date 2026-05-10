@@ -76,13 +76,17 @@ pub struct PeerRecord {
 }
 
 pub struct DhtHandle {
-    pub peer_id: PeerId,
-    pub public_key: [u8; 32],
+    #[allow(dead_code)]
+    peer_id: PeerId,
+    #[allow(dead_code)]
+    public_key: [u8; 32],
     config: DhtConfig,
     routing_table: Arc<RwLock<RoutingTable>>,
     peer_records: Arc<RwLock<HashMap<PeerId, PeerRecord>>>,
     event_tx: broadcast::Sender<CoreDhtEvent>,
     socket: Arc<UdpSocket>,
+    #[allow(dead_code)]
+    signing_key: Option<[u8; 32]>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -115,6 +119,7 @@ impl DhtHandle {
             peer_records,
             event_tx,
             socket: Arc::new(socket),
+            signing_key: None,
         })
     }
 

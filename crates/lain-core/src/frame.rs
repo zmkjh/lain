@@ -10,6 +10,8 @@ pub enum FrameType {
     Pong = 0x05,
     PathChange = 0x06,
     StreamResume = 0x07,
+    RelayConnect = 0x08,
+    RelayData = 0x09,
 }
 
 impl FrameType {
@@ -23,6 +25,8 @@ impl FrameType {
             0x05 => Some(Self::Pong),
             0x06 => Some(Self::PathChange),
             0x07 => Some(Self::StreamResume),
+            0x08 => Some(Self::RelayConnect),
+            0x09 => Some(Self::RelayData),
             _ => None,
         }
     }

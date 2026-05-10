@@ -3,7 +3,6 @@
 #![deny(clippy::panic)]
 
 use clap::{Parser, Subcommand};
-use lain_core::identity::IdentityProvider;
 use std::path::PathBuf;
 
 #[derive(Parser)]
@@ -12,83 +11,84 @@ struct Cli {
     #[command(subcommand)]
     command: Option<Command>,
 
-    #[arg(short, long, default_value = "lain.toml")]
-    config: PathBuf,
+    /// Path to IPC socket (default: ~/.lain/socket)
+    #[arg(short = 's', long, default_value = "")]
+    socket: String,
+}
+
+fn ipc_socket(path: &str) -> PathBuf {
+    if !path.is_empty() {
+        return PathBuf::from(path);
+    }
+    // Default: ~/.lain/socket
+    #[cfg(unix)]
+    { dirs_home().map(|d| d.join(".lain").join("socket")).unwrap_or_else(|| PathBuf::from("/tmp/lain.socket")) }
+    #[cfg(windows)]
+    { r"\\.\pipe\lain".into() }
+}
+
+#[cfg(unix)]
+fn dirs_home() -> Option<PathBuf> {
+    if let Ok(h) = std::env::var("LAIN_HOME") { return Some(PathBuf::from(h)); }
+    if let Ok(h) = std::env::var("HOME") { return Some(PathBuf::from(h)); }
+    None
 }
 
 #[derive(Subcommand)]
 enum Command {
-    Daemon,
-    Invite,
-    Status,
-    Connect {
-        invite: String,
-    },
+    /// Show own PeerID
     Whoami,
+    /// Generate invite code
+    Invite,
+    /// Connect to a peer via invite
+    Connect { invite: String },
+    /// Show daemon status
+    Status,
 }
 
 fn main() {
-    tracing_subscriber::fmt::init();
     let cli = Cli::parse();
+    let socket_path = ipc_socket(&cli.socket);
 
-    let rt = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
-
-    rt.block_on(async {
-        match cli.command.unwrap_or(Command::Daemon) {
-            Command::Daemon => {
-                tracing::info!("Lain daemon starting...");
-                let config = lain_daemon::config::DaemonConfig::load_or_default()
-                    .map_err(|e| {
-                        tracing::error!("Config error: {e}");
-                        std::process::exit(1);
-                    })
-                    .ok()
-                    .unwrap();
-
-                let daemon = lain_daemon::Daemon::new(config)
-                    .await
-                    .map_err(|e| {
-                        tracing::error!("Daemon init error: {e}");
-                        std::process::exit(1);
-                    })
-                    .ok()
-                    .unwrap();
-
-                if let Err(e) = daemon.run().await {
-                    tracing::error!("Daemon error: {e}");
-                }
-            }
-            Command::Invite => {
-                println!("Generating invite...");
-                let id = lain_identity::Identity::load_or_generate().ok().unwrap();
-                let invite = lain_discovery::InviteCode::new(
-                    id.peer_id(),
-                    *id.public_key(),
-                    lain_core::capabilities::Capabilities::new(),
-                    vec![],
-                    &|data| id.sign(data),
-                );
-                let s = invite.to_base62();
-                println!("Your invite: lain://{}", s);
-            }
-            Command::Status => {
-                println!("Lain daemon status: check daemon socket");
-            }
-            Command::Connect { invite } => {
-                println!("Connecting via invite: {invite}");
-                if let Ok(code) = lain_discovery::InviteCode::from_uri(&invite)
-                    .or_else(|_| lain_discovery::InviteCode::from_base62(&invite))
-                {
-                    println!("PeerID: {}", code.peer_id);
-                    println!("Endpoints: {} found", code.endpoints.len());
-                } else {
-                    tracing::error!("Invalid invite code");
-                }
-            }
-            Command::Whoami => {
-                let id = lain_identity::Identity::load_or_generate().ok().unwrap();
-                println!("PeerID: {}", id.peer_id());
-            }
+    match cli.command.unwrap_or(Command::Status) {
+        Command::Whoami => ipc_request(&socket_path, r#"{"cmd":"Whoami"}"#),
+        Command::Invite => ipc_request(&socket_path, r#"{"cmd":"GetInvite"}"#),
+        Command::Connect { invite } => {
+            let req = serde_json::json!({"cmd":"Connect","invite":invite}).to_string();
+            ipc_request(&socket_path, &req);
         }
-    });
+        Command::Status => ipc_request(&socket_path, r#"{"cmd":"ListPeers"}"#),
+    }
+}
+
+fn ipc_request(socket_path: &PathBuf, json: &str) {
+    #[cfg(unix)]
+    {
+        use std::io::{BufRead, BufReader, Write, Read};
+        match std::os::unix::net::UnixStream::connect(socket_path) {
+            Ok(mut stream) => {
+                let mut req = json.to_string() + "\n";
+                stream.write_all(req.as_bytes()).ok();
+                let mut reader = BufReader::new(&stream);
+                let mut response = String::new();
+                if reader.read_line(&mut response).is_ok() {
+                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&response) {
+                        println!("{}", serde_json::to_string_pretty(&v).unwrap_or(response));
+                    }
+                }
+                return;
+            }
+            Err(_) => {}
+        }
+    }
+
+    #[cfg(not(unix))]
+    {
+        // Try HTTP IPC on localhost
+        let _ = socket_path;
+        let _ = json;
+    }
+
+    // Fallback: daemon not running
+    println!("daemon not running");
 }

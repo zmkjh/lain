@@ -332,6 +332,21 @@ impl Transport {
             datagram: lain_core::transport::QuicDatagramSender,
         })
     }
+
+    /// 处理 relay 请求，连接到目标 peer 并启动数据转发
+    pub async fn handle_relay_request(
+        &self,
+        _requester_conn: quinn::Connection,
+        target_peer_id: PeerId,
+    ) -> Result<(), TransportError> {
+        tracing::info!("relay: forwarding to target {target_peer_id}");
+        // Full implementation requires:
+        // 1. Query DHT for target's endpoints
+        // 2. Connect to target via try_path
+        // 3. Pipe data between the two connections
+        // For now, plumbing is ready but data relay needs target endpoint info
+        Err(TransportError::Connect(format!("relay target {target_peer_id}: not yet connected")))
+    }
 }
 
 #[async_trait::async_trait]

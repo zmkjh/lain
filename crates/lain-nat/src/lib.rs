@@ -60,40 +60,35 @@ impl NatProbe {
             });
         }
 
-        let mut mapped_port: Option<u16> = None;
-        let mut mapped_ip: Option<std::net::IpAddr> = None;
-        let mut results = Vec::new();
+        // RFC 5780 simplified:
+        // 1. Basic Binding Request → (ip, port)
+        // 2. CHANGE-REQUEST Binding Request → (ip2, port2)
+        // 3. If port == port2 → Cone, else → Symmetric
 
+        let mut nat_type = NatType::Unknown;
+        let mut mapped_addr = None;
+
+        // Probe 1: Basic Binding Request
         for stun_addr in &self.stun_servers {
-            match self.probe_stun(socket, *stun_addr) {
-                Ok(addr) => {
-                    if mapped_ip.is_none() {
-                        mapped_ip = Some(addr.ip());
-                        mapped_port = Some(addr.port());
+            if let Ok(addr) = self.probe_stun(socket, *stun_addr, false) {
+                mapped_addr = Some(addr);
+                // Probe 2: CHANGE-REQUEST to the same server
+                if let Ok(addr2) = self.probe_stun(socket, *stun_addr, true) {
+                    if addr.port() == addr2.port() {
+                        nat_type = NatType::Cone;
+                    } else {
+                        // Different port: Symmetric. Determine ADF vs APDF
+                        nat_type = NatType::APDFSymmetric;
+                        // In production, further tests distinguish ADF vs APDF
+                        // by probing from a different source IP
                     }
-                    results.push(addr);
+                } else {
+                    // CHANGE-REQUEST rejected → likely Symmetric
+                    nat_type = NatType::APDFSymmetric;
                 }
-                Err(_e) => {
-                    tracing::debug!("STUN probe to {stun_addr} failed");
-                }
+                break; // Successfully probed first server
             }
         }
-
-        if results.is_empty() {
-            return Ok(NatProbeResult {
-                nat_type: NatType::Unknown,
-                ipv6_inbound: false,
-                mapped_addr: None,
-            });
-        }
-
-        let nat_type = if results.len() >= 2 && results[0].port() != results[1].port() {
-            NatType::APDFSymmetric
-        } else {
-            NatType::Cone
-        };
-
-        let mapped_addr = mapped_ip.map(|ip| SocketAddr::new(ip, mapped_port.unwrap_or(0)));
 
         Ok(NatProbeResult {
             nat_type,
@@ -106,8 +101,9 @@ impl NatProbe {
         &self,
         socket: &UdpSocket,
         stun_addr: SocketAddr,
+        change_request: bool,
     ) -> Result<SocketAddr, CoreError> {
-        let binding_request = Self::build_binding_request();
+        let binding_request = Self::build_binding_request(change_request);
 
         socket
             .send_to(&binding_request, stun_addr)
@@ -124,17 +120,30 @@ impl NatProbe {
         Ok(addr)
     }
 
-    fn build_binding_request() -> Vec<u8> {
-        let mut packet = vec![0u8; 20];
+    fn build_binding_request(change_request: bool) -> Vec<u8> {
+        let mut packet = if change_request {
+            // With CHANGE-REQUEST attribute (type 0x0003, length 4)
+            let mut p = vec![0u8; 28];
+            p[20] = 0x00; // CHANGE-REQUEST
+            p[21] = 0x03;
+            p[22] = 0x00; // length
+            p[23] = 0x04;
+            p[24] = 0x00; // change IP flag
+            p[25] = 0x00;
+            p[26] = 0x00;
+            p[27] = 0x04; // change port flag
+            p
+        } else {
+            vec![0u8; 20]
+        };
         packet[0] = 0x00; // Binding Request
         packet[1] = 0x01;
-        // Magic cookie
-        packet[4] = 0x21;
+        packet[4] = 0x21; // Magic cookie
         packet[5] = 0x12;
         packet[6] = 0xA4;
         packet[7] = 0x42;
-        // Transaction ID: random
         for i in 8..20 {
+            if i >= packet.len() { break; }
             packet[i] = rand::random::<u8>();
         }
         packet
@@ -251,7 +260,7 @@ mod tests {
 
     #[test]
     fn test_build_binding_request() {
-        let req = NatProbe::build_binding_request();
+        let req = NatProbe::build_binding_request(false);
         assert_eq!(req.len(), 20);
         assert_eq!(req[0], 0x00); // Binding Request
         assert_eq!(req[1], 0x01);
