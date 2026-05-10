@@ -175,6 +175,14 @@ async fn listen_local(
     loop {
         match listener.accept().await {
             Ok((stream, _)) => {
+                // Verify caller is same user (prevent other local processes from hijacking)
+                if let Ok(cred) = stream.peer_cred() {
+                    let my_uid = unsafe { libc::getuid() };
+                    if cred.uid() != 0 && cred.uid() != my_uid {
+                        tracing::warn!("IPC rejected: uid {} != {}", cred.uid(), my_uid);
+                        continue;
+                    }
+                }
                 let (r, w) = tokio::io::split(stream);
                 let tx = cmd_tx.clone();
                 let ev = ev_tx.clone();

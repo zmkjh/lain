@@ -222,8 +222,9 @@ impl Daemon {
         // 6. mDNS LAN 发现
         let dht_for_mdns = Arc::new(dht);
 
-        // Start background bucket refresh
+        // Start background bucket refresh + DHT cleanup
         dht_for_mdns.spawn_bucket_refresh();
+        dht_for_mdns.spawn_cleanup();
 
         // Spawn relay accept loop: handle incoming RelayConnect frames
         let transport_relay = transport.clone();
@@ -611,6 +612,10 @@ impl Daemon {
                 }
 
                 _ = heartbeat.tick() => {
+                    // Periodic save of peers.json (crash resilience)
+                    let peers = known_peers.read().await;
+                    save_peers(&peers, &self.identity);
+
                     // Dormant check: skip heartbeat if no active connections
                     let peer_count = connected.read().await.len();
                     if peer_count == 0 {

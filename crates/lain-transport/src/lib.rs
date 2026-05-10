@@ -366,9 +366,14 @@ impl Transport {
             .map_err(|e| TransportError::Connect(format!("stream0: {e}")))?;
 
         let mut buf = vec![0u8; 4096];
-        let n = recv.read(&mut buf).await
-            .map_err(|e| TransportError::Connect(format!("read ik1: {e}")))?
-            .ok_or_else(|| TransportError::Noise("no ik1".into()))?;
+        let n = tokio::time::timeout(
+            std::time::Duration::from_secs(15),
+            recv.read(&mut buf),
+        )
+        .await
+        .map_err(|_| TransportError::Noise("ik1 timeout".into()))?
+        .map_err(|e| TransportError::Connect(format!("read ik1: {e}")))?
+        .ok_or_else(|| TransportError::Noise("no ik1".into()))?;
 
         let header = parse_frame_header(&buf[..n])
             .map_err(|e| TransportError::Noise(format!("ik1 parse: {e}")))?;

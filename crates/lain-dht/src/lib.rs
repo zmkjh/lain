@@ -349,6 +349,25 @@ impl DhtHandle {
         self.routing_table.read().await.size()
     }
 
+    /// 后台清理：每 10 分钟移除过期 peer_records
+    pub fn spawn_cleanup(self: &Arc<Self>) {
+        let this = self.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(600));
+            loop {
+                tick.tick().await;
+                let now = std::time::Instant::now();
+                let mut records = this.peer_records.write().await;
+                let before = records.len();
+                records.retain(|_k, v| v.expires_at > now);
+                if before != records.len() {
+                    tracing::debug!("DHT cleanup: removed {} expired", before - records.len());
+                }
+                this.pending_queries.write().await.clear();
+            }
+        });
+    }
+
     /// 处理入站 DHT 消息，必要时通过 socket 回复
     pub async fn send_msg(&self, data: &[u8], addr: SocketAddr) {
         if let Err(e) = self.socket.send_to(data, addr).await {
