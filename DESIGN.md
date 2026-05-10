@@ -12,7 +12,7 @@ Lain 是一个零服务器、零配置的 P2P 网络基础设施，以 daemon �
 
 - **PeerID 是永久的**：等于 `SHA256(Ed25519 公钥)`。只要密钥文件不丢，PeerID 在设备生命周期内不变。变化的只是网络地址。
 - **全联通，无分区**：一个全局 DHT，所有 Lain 节点共用一个地址空间。节点通过 DHT 宣告在线、发现彼此。没有"网络"概念——不需要创建、加入、切换。
-- **Invite 码是 peer 介绍信**：携带对方的 PeerID、公钥、当前地址快照。拿到 invite 就能找到对方、建立加密连接。
+- **Invite 码是快捷方式**：提前打包 PeerID + 公钥 + 地址快照，省一次 DHT 查找。但不是前置条件——知道 PeerID 就能从 DHT 查到公钥和地址，直接发起连接。
 - **一对一连接，不是广播**：Lain 在两个设备之间建立加密字节流。如果要给多个 peer 发数据，就分别建立多条连接——每条都是独立的 Noise 端到端加密通道。
 - **零配置启动**：daemon 不带任何参数就能运行，所有参数有内置默认值。
 - **群组是应用层的事**：哪些 peer 之间通信、如何分组——Lain 不参与。基础设施只负责建通道。
@@ -129,7 +129,7 @@ PeerID 同时作为 Kademlia DHT 的 node key。密钥对持久化在 `~/.lain/i
 ### 4.2 Noise_IK 握手
 
 - **模式**: `Noise_IK_25519_ChaChaPoly_BLAKE2s`
-- **角色**: Initiator 必须预先知道 Responder 的公钥（通过 invite code 获取）
+- **角色**: Initiator 必须预先知道 Responder 的公钥（通过 DHT 查询或 invite code 获取）
 - **RTT**: 1-RTT
 - **位置**: 运行在 QUIC connection 之上。QUIC 提供传输加密（hop-by-hop），Noise 提供端到端身份认证（hop-to-hop）。Relay 节点无法解密 Noise 加密的 payload。
 
@@ -152,11 +152,13 @@ Initiator (PeerID 小)              Responder (PeerID 大)
 
 所有 Lain 节点共享一个全局 DHT。没有 network_secret、没有 NetworkID、没有"网络"概念。
 
-**如何发现 peer**：拿到对方的 invite 码（含 PeerID + Ed25519 公钥 + 地址快照）→ DHT `FIND_VALUE(peer_id)` 获取最新地址 → 发起 QUIC + Noise IK 连接。
+**DHT 是完整目录**：每个节点通过 STORE 宣告自己的 PeerID、Ed25519 公钥、当前 endpoints。任何人 `FIND_VALUE(peer_id)` 就能拿到连接所需的全部信息——公钥、IP、端口。公钥由 Ed25519 签名验证：PeerID = SHA256(公钥)，自然防伪造。
 
-**如何防止未授权连接**：Noise IK 要求发起方预先知道响应方公钥。没有对方的 invite（即没有对方的公钥），无法完成 Noise 握手。DHT 中可见 PeerID 和 IP，但不知道公钥就无法建立加密连接。
+**连接 peer 不需要 invite**：知道 PeerID → DHT 查到公钥和地址 → 直接发起 QUIC + Noise IK。
 
-**隐私考虑**：同一 PeerID 跨"群组"可见——这是 design choice，不是 bug。DHT 暴露的信息与 STUN server 相当（IP + 端口）。应用层可自行管理"哪些 peer 属于哪个群组"。
+**Invite 是快捷方式**：提前打包好的 PeerID + 公钥 + 地址快照。收到 invite 可以直接连而不用先查 DHT——只是更快，不是必需。invite 也是最便捷地获取对方 PeerID 的方式（第一次接触时，你总得从某个渠道知道对方的 PeerID）。
+
+**隐私考虑**：DHT 公开 PeerID、公钥、IP 和端口。PeerID 是公钥哈希，不直接关联真实身份。应用层自行管理"哪些 PeerID 属于我的联系人"。
 
 ---
 
@@ -193,14 +195,22 @@ Invite = {
 
 ### 5.3 使用流程
 
-1. A 生成 invite 码（包含自己的 PeerID、公钥、地址快照）
-2. A 通过 out-of-band 渠道分享给 B
-3. B 解析 → 获取 A 的 PeerID、公钥、能力声明、地址提示
-4. B 用 invite 中的地址尝试直连 → 失败则 DHT FIND_VALUE(A的PeerID) 获取新地址 → 还失败则 A 可能离线
-5. 双方完成 Noise_IK，建立对等连接
-6. 连接成功后，B 也通过 DHT STORE 宣告自己在线（A 之后可通过 DHT 找到 B）
+invite 是最便捷的方式，但不是唯一方式。
 
-Invite 码是**初始寻址提示**，不是永久地址。成功连过一次之后，双方 daemon 记住了 PeerID，后续重连自动走 DHT，不需要再次交换 invite。
+**通过 invite（推荐）**：
+1. A 生成 invite 码（含 PeerID、公钥、地址快照）
+2. A 通过 out-of-band 渠道分享给 B
+3. B 解析 → 获取 PeerID、公钥、地址
+4. B 用 invite 中的地址直接尝试 QUIC + Noise IK
+5. 失败则 DHT `FIND_VALUE(PeerID)` 获取新地址
+6. 双方完成 Noise IK，连接建立
+
+**通过 PeerID（无需 invite）**：
+1. B 从任意渠道得知 A 的 PeerID（如复制粘贴、应用内分享）
+2. B 执行 DHT `FIND_VALUE(PeerID)` → 获取 A 的公钥和最新地址
+3. B 发起 QUIC + Noise IK → 连接建立
+
+**重连**：成功连过一次之后，daemon 记住了 PeerID 和公钥。后续重连自动走 DHT，不需要 invite。
 
 ---
 
@@ -237,7 +247,7 @@ Layer 1: IPv6 直连
 
 Layer 2: IPv4 STUN 打洞
   ─ 条件: 双方均无 IPv6 inbound，且至少一方为 Cone NAT
-  ─ 双方通过 STUN 获取 IPv4 映射地址，通过 invite code 交换，同时发送 UDP probe
+  ─ 双方通过 STUN 获取 IPv4 映射地址，通过 DHT 或 invite 交换地址，同时发送 UDP probe
   ─ 覆盖: 在 Layer 1 未覆盖的 ~23% 中，再覆盖大部分（Cone NAT 在剩余中约占 70%）
   ─ 延迟: STUN 查询 (1-RTT) + 打洞 (1-RTT) + QUIC + Noise IK = 4-RTT
 
@@ -286,7 +296,7 @@ WebSocket 路径用于 UDP 被完全封锁的场景。在 Layer 3 (relay) 可用
 
 #### 角色决策
 
-通过 invite 阶段交换的能力声明决定谁监听、谁连接：
+通过 invite 阶段交换的能力声明（或 DHT 中的 capabilities 字段）决定谁监听、谁连接：
 
 ```
 self_can_listen = (nat_type == Cone) || ipv6_inbound_open
@@ -303,7 +313,7 @@ else → WS fallback 不可用，跳过
 Listener                              Connector
 ───────────────────────────────────────────────────
 bind TCP socket, random port
-发送 ws_endpoint 给对方 (via invite)
+发送 ws_endpoint 给对方 (via DHT 或 invite)
                                        TCP connect → ws_endpoint
                                        HTTP Upgrade: GET /lain
                                          Lain-PeerID: xxx
@@ -589,8 +599,9 @@ PING 响应:
   nodes: [ { node_id: [u8; 32], addr: Address }, ... ]   // k-closest
 
 STORE 请求:
-  key: [u8; 32]
-  ttl:  u32               // 秒
+  key: [u8; 32]           // = PeerID
+  ttl:  u32
+  pubkey: [u8; 32]        // Ed25519 公钥（与 PeerID 匹配，接收方可验证）
   value_len: u16
   value: [u8; value_len]  // 序列化的 endpoint 列表
 
@@ -605,8 +616,9 @@ FIND_VALUE 响应:
   has_value: u8           // 1=有值, 0=返回 k-closest
   (if has_value)
     ttl_remaining: u32
+    pubkey: [u8; 32]      // Ed25519 公钥
     value_len: u16
-    value: [u8; value_len]
+    value: [u8; value_len]  // endpoint 列表
   (if !has_value)
     node_count: u8
     nodes: [ { node_id: [u8; 32], addr: Address }, ... ]
@@ -868,10 +880,10 @@ RECONNECTING            (重连, 跳过邀请, 直接从 DHT 获取 endpoint)
 |--------|--------|--------|------|
 | `status` | {} | {peer_id, nat_type, peers_online, uptime_secs} | daemon 状态 |
 | `identity` | {} | {peer_id, public_key_hex} | 查看身份 |
-| `invite.generate` | {} | {invite_code} | 生成自己的 invite（身份介绍信） |
-| `invite.accept` | {invite_code} | {peer_id, status} | 添加对方 peer |
+| `invite.generate` | {} | {invite_code} | 生成自己的 invite（快捷方式） |
+| `invite.accept` | {invite_code} | {peer_id, status} | 通过 invite 添加 peer（可选，等价于 peer.connect 但跳过 DHT 查找） |
 | `peer.list` | {} | [{peer_id, status, latency_ms, path}] | 已知 peer 列表 |
-| `peer.connect` | {peer_id} | {state, attempt_id} → +fd | 建立一对一数据流 |
+| `peer.connect` | {peer_id} | {state, attempt_id} → +fd | 建立一对一数据流（自动 DHT 查找公钥和地址） |
 | `peer.disconnect` | {peer_id} | {status} | 断开 peer |
 | `metrics` | {} | {connections, bytes_sent, ...} | 获取指标 |
 | `shutdown` | {} | {status} | 优雅关闭 daemon |
@@ -1237,7 +1249,7 @@ Level 4 — 最小存活: 仅 Relay 路径（所有直连不可用）
 
 ### 14.1 信任假设
 
-- **访问控制**：知道对方公钥（通过 invite 获取）即可发起 Noise IK 连接。DHT 公开可查询。
+- **访问控制**：任何知道 PeerID 的节点可通过 DHT 获取公钥并发起 Noise IK 连接。Lain 不限制谁能连谁——接入控制是应用层的事。
 - **身份**：PeerID 与 Ed25519 公钥密码学绑定，无法伪造。
 - **DHT 节点**：零信任。任何节点可能恶意、投毒、或不响应。
 - **Relay 节点**：不可见明文（端到端 Noise 加密），但可观察元数据（谁和谁通信、流量大小、时间模式）。
@@ -1252,11 +1264,11 @@ Level 4 — 最小存活: 仅 Relay 路径（所有直连不可用）
 | **Eclipse 攻击** (隔离目标节点) | 中 | 多路径 bootstrap（invite seeds + peers.json + 持久化路由表）。定期从 seed 重新 FIND_NODE(self) 验证路由表一致性。 |
 | **重放攻击** (Invite) | 低 | Invite 含 timestamp，接收方拒绝超过 30 分钟的 invite。一次性使用。 |
 | **重放攻击** (DHT RPC) | 低 | message_id 为随机 16 字节，接收方 5 秒去重窗口。 |
-| **中间人** (首次握手) | 低 | Noise IK 要求预先知道对方公钥（通过 invite 带外传递）。公钥不变则后续连接自动验证。 |
+| **中间人** (首次握手) | 低 | Noise IK 要求预先知道对方公钥（通过 DHT 或 invite 获取）。公钥不变则后续连接自动验证。 |
 | **Relay 流量分析** | 低 | Relay 可见通信对、流量大小、时间模式。应对：padding 帧（可选），多 relay 分散流量。 |
 | **QUIC 降级攻击** | 低 | QUIC TLS 1.3 自身防降级。Lain 固定使用 QUIC v1，不协商更低版本。 |
 | **DoS (连接洪泛)** | 中 | 全局 max_connections=256。STUN server 请求限速。DHT RPC 每 bucket 队列上限。 |
-| **密钥泄露** | 高 | Ed25519 密钥文件 0600 权限。泄露后 PeerID 永久不可信——需生成新身份，重新通过 invite 建立所有 peer 关系。 |
+| **密钥泄露** | 高 | Ed25519 密钥文件 0600 权限。泄露后 PeerID 永久不可信——需生成新身份，重新分享 PeerID 给所有 peer。 |
 
 ### 14.3 数据分类与保护
 
@@ -1396,7 +1408,7 @@ Lain 的核心能力：**在两个设备之间建立加密字节流，不需要�
 
 ### 19.1 用户视角：全联通
 
-**场景**：笔记本、手机、NAS、同事的机器——所有设备在同一个全局 DHT 中，通过 invite 互相认识。
+**invite 是最快的方式，但不是唯一方式。**
 
 ```
 笔记本$ lain daemon
@@ -1406,31 +1418,17 @@ Lain 的核心能力：**在两个设备之间建立加密字节流，不需要�
   invite: lain://3KqWx7...          ← 发到家庭群
 
 手机$ lain invite accept lain://3KqWx7...
-  INFO  peer d7e4... connected      ← 一键直连
+  INFO  peer d7e4... connected      ← 一键直连（invite 有地址快照）
 
-NAS$ lain invite accept lain://3KqWx7...
-  INFO  peer a1c2... connected
-
-# 同事也发了他的 invite
-笔记本$ lain invite accept lain://7mZpL2...
-  INFO  peer x9b3... connected      ← 同事的 machine
+NAS$ lain peer connect a1c2...      ← 没有 invite，直接通过 PeerID 连
+  INFO  DHT lookup... connected     ← DHT 查到公钥和地址，自动连接
 
 笔记本$ lain peer list
   d7e4...  (手机)  direct_quic,  12ms
   a1c2...  (NAS)   relayed,      28ms
-  x9b3...  (同事)  direct_quic,  8ms
 ```
 
-关键：没有"网络"——所有 peer 在同一个列表里。应用层负责分组（比如剪贴板同步只连家人，代码协作只连同事）。手机和 NAS 没加过同事的 invite，所以看不到同事。同事没加过手机的 invite，所以看不到手机。
-
-应用连接 peer 时只指定 PeerID：
-
-```python
-rpc("peer.connect", {"peer_id": "a1c2..."})   # 连 NAS
-rpc("peer.connect", {"peer_id": "x9b3..."})   # 连同事
-```
-
-同一个 daemon，同一个 DHT，同一个 UDP 端口。没有分区。
+连接方式：有 invite 就 `invite accept`（跳 DHT 查找），只有 PeerID 就 `peer connect`（自动 DHT 查）。效果一样，只是速度不同。
 
 ---
 
@@ -1533,18 +1531,19 @@ $ lain daemon                                        $ lain daemon
   → 生成 identity, 启动 QUIC, 开启 IPC                   → 同上
 
 $ lain invite generate
-  → 生成自己的 invite，含公钥 + 地址快照
   → 输出 invite: lain://3KqWx7...
   → A 把 invite 发到微信群 / AirDrop 给 B
+  → （invite 包含 PeerID + 公钥 + 地址快照）
 
                                                      $ lain invite accept lain://3KqWx7...
                                                        → 解析 invite，获取 A 的 IPv6 地址
+                                                       → 跳过 DHT 查找（invite 已有地址）
                                                        → QUIC → Noise IK → 连接建立 ✓
-                                                       → DHT 已 bootstrap（通过 A）
 
-$ lain peer list
-  b3f1... (self)        direct_quic
-  d7e4... (B的机器)      direct_quic, 8ms, IPv6
+# 之后 B 只需要知道 A 的 PeerID 就能重连
+$ lain peer connect b3f1...                           $ lain peer connect d7e4...
+  → DHT 查到公钥 + 地址                                   → DHT 查到公钥 + 地址
+  → QUIC → Noise IK → 连接建立 ✓                          → 连接建立 ✓
 
 # 两个 app（各自用 IPC 连接 daemon）开始通信
 A的app ──IPC fd──→ lain daemon ──IPv6 QUIC──→ B的daemon ──IPC fd──→ B的app
