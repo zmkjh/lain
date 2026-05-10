@@ -109,8 +109,6 @@ pub struct Transport {
     peer_id: PeerId,
     #[allow(dead_code)]
     public_key: Ed25519PublicKey,
-    #[allow(dead_code)]
-    conn_semaphore: Arc<tokio::sync::Semaphore>,
 }
 
 impl Transport {
@@ -152,7 +150,6 @@ impl Transport {
         let runtime = quinn::default_runtime()
             .ok_or_else(|| TransportError::Io("no runtime".into()))?;
 
-        let max_conns = config.max_connections;
         let endpoint = quinn::Endpoint::new(
             quinn::EndpointConfig::default(),
             Some(server_cfg),
@@ -170,7 +167,6 @@ impl Transport {
             noise_secret,
             peer_id,
             public_key,
-            conn_semaphore: Arc::new(tokio::sync::Semaphore::new(max_conns)),
         })
     }
 

@@ -378,9 +378,12 @@ impl Daemon {
 
         let conn_mgr = Arc::new(ConnectionManager::new());
 
-        // Track active QUIC connections
-        let connected: Arc<RwLock<HashMap<PeerId, quinn::Connection>>> =
+        // Track active QUIC connections with semaphore permits for backpressure
+        let connected: Arc<RwLock<HashMap<PeerId, (quinn::Connection, tokio::sync::OwnedSemaphorePermit)>>> =
             Arc::new(RwLock::new(HashMap::new()));
+        let conn_sem = Arc::new(tokio::sync::Semaphore::new(
+            self.config.transport.max_connections,
+        ));
 
         // Interface watcher: detect network changes and trigger emergency actions
         let iface_watcher = Arc::new(InterfaceWatcher::new());
@@ -411,7 +414,7 @@ impl Daemon {
 
                     // Send PATH_CHANGE to all connected peers
                     let cons = connected_iface.read().await;
-                    for (peer_id, conn) in cons.iter() {
+                    for (peer_id, (conn, _)) in cons.iter() {
                         let msg = lain_core::frame::encode_frame(
                             1, lain_core::frame::FrameType::PathChange,
                             &[],
@@ -459,14 +462,23 @@ impl Daemon {
                                 let t = transport.clone();
                                 let ipc_ev = _ipc_ev_tx.clone();
                                 let connected_ref = connected.clone();
+                                let conn_sem2 = conn_sem.clone();
                                 let pid = inv.peer_id;
                                 let pubkey = inv.ed25519_pk;
                                 let eps = inv.endpoints.clone();
                                 tokio::spawn(async move {
                                     match t.connect_raw(&pubkey, &eps).await {
                                         Ok(conn) => {
+                                            // Acquire connection slot
+                                            let permit = match conn_sem2.clone().acquire_owned().await {
+                                                Ok(p) => p,
+                                                Err(_) => {
+                                                    tracing::warn!("connection limit reached");
+                                                    return;
+                                                }
+                                            };
                                             tracing::info!("connected to {pid}");
-                                            connected_ref.write().await.insert(pid, conn.clone());
+                                            connected_ref.write().await.insert(pid, (conn.clone(), permit));
 
                                             // Notify IPC subscribers
                                             let _ = ipc_ev.send(IpcResponse::Event {
@@ -526,14 +538,14 @@ impl Daemon {
                             tracing::info!("IPC: disconnect {peer_id}");
                             known_peers.write().await.remove(&peer_id);
                             conn_mgr.remove_peer(&peer_id).await;
-                            if let Some(conn) = connected.write().await.remove(&peer_id) {
+                            if let Some((conn, _permit)) = connected.write().await.remove(&peer_id) {
                                 conn.close(0u32.into(), b"disconnected");
                             }
                         }
                         IpcCommand::SendToPeer { peer_id, data } => {
                             let conn = {
                                 let cons = connected.read().await;
-                                cons.get(&peer_id).cloned()
+                                cons.get(&peer_id).map(|(c, _)| c.clone())
                             };
                             match conn {
                                 Some(conn) => {
