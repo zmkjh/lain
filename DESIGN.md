@@ -14,7 +14,7 @@ Lain 是一个零服务器、零配置的 P2P 网络基础设施，以 daemon �
 - **网络是可重连资源的集合**：节点通过定期广播证明自己是活跃资源；长期不广播则自然淘汰。
 - **Invite 码是初始寻址提示**：携带生成时刻的地址快照，接收方优先去 DHT 查找最新地址。
 - **网络没有创建者**：一个网络只是一个共享的 secret。谁生成 invite 谁就是第一个知道这个 secret 的人——没有任何特权、不拥有网络、不充当服务器。所有人地位相同。
-- **零配置启动**：daemon 不带任何参数就能运行，所有参数有内置默认值。
+- **一对一连接，不是广播**：lain 在两个设备之间建立加密字节流。如果要给多个设备发数据，就分别建立多条连接——每条都是独立的加密通道。没有"全网广播"原语。
 
 ---
 
@@ -1510,7 +1510,9 @@ rpc("peer.connect", {"network_id": "9c1d...", "peer_id": "x9b3..."})
 
 ### 19.2 开发者视角：IPC 写入应用
 
-**场景**：用 Python 写一个简单的剪贴板同步工具。
+**Lain 是纯 P2P（一对一）。** 每个 `peer.connect` 建立的是两个特定设备之间的加密 QUIC 流——不是广播、不是群发、不是消息总线。如果要给多个 peer 发数据，就分别 connect 每个。
+
+**场景**：写一个简单的剪贴板同步工具。
 
 ```python
 import socket, json, os
@@ -1519,7 +1521,6 @@ import socket, json, os
 sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
 sock.connect(os.path.expanduser("~/.lain/socket"))
 
-# 2. 加入网络（只需一次）
 def rpc(method, params={}):
     msg = json.dumps({"id": 1, "method": method, "params": params}) + "\n"
     sock.sendall(msg.encode())
@@ -1527,20 +1528,27 @@ def rpc(method, params={}):
 
 rpc("invite.accept", {"invite_code": "3KqWx7..."})
 
-# 3. 连接 peer，获取裸字节流 fd
-result = rpc("peer.connect", {"network_id": "f8a2...", "peer_id": "d7e4..."})
-# daemon 通过 SCM_RIGHTS 传回 fd
+# 2. 获取网络中的所有 peer
+peers = rpc("network.peers", {"network_id": "f8a2..."})
+# → [{"peer_id":"d7e4...","status":"direct"}, {"peer_id":"a1c2...","status":"relayed"}]
 
-# 4. 在新 fd 上直接读写——就是普通的字节流
-peer_fd = received_fd  # 从 SCM_RIGHTS 获取
-peer_fd.sendall(b"clipboard: hello world")
-data = peer_fd.recv(4096)
-print(f"收到: {data}")
+# 3. 逐一到每个 peer 建立连接，获取独立的字节流 fd
+connections = {}
+for p in peers["result"]:
+    result = rpc("peer.connect", {"network_id": "f8a2...", "peer_id": p["peer_id"]})
+    fd = received_fd  # daemon 通过 SCM_RIGHTS 传回
+    connections[p["peer_id"]] = fd
+
+# 4. 每个 fd 是独立的一对一加密通道
+for peer_id, fd in connections.items():
+    fd.sendall(b"clipboard: hello from b3f1...")
+    data = fd.recv(4096)
+    print(f"{peer_id}: {data}")
 ```
 
-应用协议完全自由——lain 不关心你发的是什么。
+`sendall(b"clipboard: hello")` 走的是 `笔记本 ──QUIC/Noise──→ 手机` 这条加密通道，NAS 收不到。发给 NAS 的是另一条独立的加密通道。lain 不提供广播——如果你需要群发，在应用层自己遍历所有连接即可。
 
-**Rust 版本更简洁**（使用 `lain-core` crate）：
+**Rust 版本**（使用 `lain-core` crate）：
 
 ```rust
 use lain_core::ipc::Client;
@@ -1548,12 +1556,16 @@ use lain_core::ipc::Client;
 let mut client = Client::connect_default().await?;
 client.accept_invite("3KqWx7...").await?;
 
-let stream = client.connect("f8a2...", "d7e4...").await?;
-stream.write_all(b"clipboard: hello world").await?;
-
-let mut buf = [0u8; 4096];
-let n = stream.read(&mut buf).await?;
-println!("收到: {}", String::from_utf8_lossy(&buf[..n]));
+// 获取所有 peer，逐一建立一对一连接
+let peers = client.list_peers("f8a2...").await?;
+for peer in peers {
+    let mut stream = client.connect("f8a2...", &peer.peer_id).await?;
+    stream.write_all(b"clipboard: hello").await?;
+    let mut buf = [0u8; 4096];
+    let n = stream.read(&mut buf).await?;
+    println!("{}: {}", peer.peer_id, String::from_utf8_lossy(&buf[..n]));
+}
+// stream 被 drop 时自动发送 CLOSE 帧，fd 关闭
 ```
 
 ---
