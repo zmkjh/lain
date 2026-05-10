@@ -355,16 +355,18 @@ pub fn parse_nodes_from_payload(payload: &[u8]) -> Option<Vec<(PeerId, SocketAdd
     Some(nodes)
 }
 
-/// Parse a PeerRecord from FIND_VALUE response payload
+/// Parse a PeerRecord from FIND_VALUE response payload (after has_value byte)
 pub fn parse_record_from_payload(payload: &[u8]) -> Option<PeerRecord> {
-    if payload.len() < 68 {
-        return None;
+    if payload.len() < 38 {
+        return None; // min: ttl(4) + pubkey(32) + ep_len(2)
     }
     let ttl_remaining = u32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]);
     let mut pubkey = [0u8; 32];
     pubkey.copy_from_slice(&payload[4..36]);
     let ep_len = u16::from_be_bytes([payload[36], payload[37]]) as usize;
-    let _ep_data = &payload[38..38 + ep_len.min(payload.len() - 38)];
+    let _ep_len = ep_len;
+    // For now, endpoints are reconstructed from the STORE payload elsewhere
+    // Just parse the metadata fields
 
     Some(PeerRecord {
         pubkey,

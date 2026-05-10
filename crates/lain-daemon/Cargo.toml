@@ -25,3 +25,7 @@ tracing-subscriber.workspace = true
 rand.workspace = true
 if-addrs.workspace = true
 libc.workspace = true
+
+[dev-dependencies]
+futures = "0.3"
+rustls = "0.23"
