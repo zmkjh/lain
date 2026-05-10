@@ -13,7 +13,6 @@ use lain_core::endpoint::Endpoint;
 use lain_core::peer::PeerId;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use ed25519_dalek::Signer;
 use tokio::net::UdpSocket;
 use tokio::sync::{broadcast, RwLock};
 use tracing;
@@ -134,16 +133,6 @@ impl DhtHandle {
     }
 
     /// 内部签名方法：有密钥则签名，无密钥则返回零占位
-    #[allow(dead_code)]
-    fn sign_data(&self, data: &[u8]) -> [u8; 64] {
-        if let Some(ref seed) = self.signing_key {
-            let signing_key = ed25519_dalek::SigningKey::from_bytes(seed);
-            signing_key.sign(data).to_bytes()
-        } else {
-            [0u8; 64]
-        }
-    }
-
     pub fn socket(&self) -> Arc<UdpSocket> {
         self.socket.clone()
     }
@@ -156,13 +145,13 @@ impl DhtHandle {
             attempted += 1;
             tracing::info!("bootstrapping via {seed}");
             let msg_id = rand::random::<u128>().to_be_bytes();
-            let ping = msg_codec::encode_ping_request(self.peer_id, msg_id);
+            let ping = self.encode_ping(msg_id);
             if let Err(e) = self.socket.send_to(&ping, *seed).await {
                 last_err = e.to_string();
                 continue;
             }
             let msg_id = rand::random::<u128>().to_be_bytes();
-            let find_node = msg_codec::encode_find_node_request(self.peer_id, msg_id, self.peer_id);
+            let find_node = self.encode_find_node(msg_id, self.peer_id);
             if let Err(e) = self.socket.send_to(&find_node, *seed).await {
                 last_err = e.to_string();
                 continue;
@@ -170,6 +159,22 @@ impl DhtHandle {
             return Ok(());
         }
         Err(DhtError::BootstrapFailed { attempts: attempted, last_error: last_err })
+    }
+
+    fn encode_ping(&self, message_id: [u8; 16]) -> Vec<u8> {
+        msg_codec::encode_ping_request_signed(self.peer_id, message_id, self.signing_key.as_ref())
+    }
+
+    fn encode_find_node(&self, message_id: [u8; 16], target_id: PeerId) -> Vec<u8> {
+        msg_codec::encode_find_node_request_signed(self.peer_id, message_id, target_id, self.signing_key.as_ref())
+    }
+
+    fn encode_store(&self, key: &[u8; 32], ttl: u32, pubkey: &[u8; 32], endpoints: &[Endpoint]) -> Vec<u8> {
+        msg_codec::encode_store_request_signed(self.peer_id, key, ttl, pubkey, endpoints, self.signing_key.as_ref())
+    }
+
+    fn encode_find_value(&self, message_id: [u8; 16], key: &[u8; 32]) -> Vec<u8> {
+        msg_codec::encode_find_value_request_signed(self.peer_id, message_id, key, self.signing_key.as_ref())
     }
 
     /// STORE 自身到最近的 k 个节点
@@ -183,8 +188,7 @@ impl DhtHandle {
             let rt = self.routing_table.read().await;
             rt.closest_nodes(&self.peer_id, self.config.k)
         };
-        let msg = msg_codec::encode_store_request(
-            self.peer_id,
+        let msg = self.encode_store(
             &self.peer_id.0,
             self.config.ttl_seconds,
             pubkey,
@@ -224,7 +228,7 @@ impl DhtHandle {
         };
         for node in &closest {
             let msg_id = rand::random::<u128>().to_be_bytes();
-            let req = msg_codec::encode_find_value_request(self.peer_id, msg_id, &peer_id.0);
+            let req = self.encode_find_value(msg_id, &peer_id.0);
             self.send_msg(&req, node.address).await;
         }
         // Response comes via handle_incoming

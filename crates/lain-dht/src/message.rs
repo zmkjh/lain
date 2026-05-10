@@ -3,14 +3,73 @@ use lain_core::dht::{DhtMessage, DhtMsgType};
 use lain_core::endpoint::Endpoint;
 use lain_core::peer::PeerId;
 use lain_core::PROTOCOL_VERSION;
+use ed25519_dalek::Signer;
 use std::net::SocketAddr;
 
 use crate::routing::BucketEntry;
 use crate::PeerRecord;
 
-/// Build a PING request message
+/// Build a PING request message (unsigned)
 pub fn encode_ping_request(sender_id: PeerId, message_id: [u8; 16]) -> Vec<u8> {
     encode_message(sender_id, message_id, DhtMsgType::Ping, false, &[], None)
+}
+
+/// Build a signed PING request message
+pub fn encode_ping_request_signed(
+    sender_id: PeerId,
+    message_id: [u8; 16],
+    seed: Option<&[u8; 32]>,
+) -> Vec<u8> {
+    encode_message(sender_id, message_id, DhtMsgType::Ping, false, &[], seed)
+}
+
+/// Build a signed FIND_NODE request message
+pub fn encode_find_node_request_signed(
+    sender_id: PeerId,
+    message_id: [u8; 16],
+    target_id: PeerId,
+    seed: Option<&[u8; 32]>,
+) -> Vec<u8> {
+    encode_message(sender_id, message_id, DhtMsgType::FindNode, false, &target_id.0, seed)
+}
+
+/// Build a signed STORE request message
+pub fn encode_store_request_signed(
+    sender_id: PeerId,
+    key: &[u8; 32],
+    ttl: u32,
+    pubkey: &[u8; 32],
+    endpoints: &[Endpoint],
+    seed: Option<&[u8; 32]>,
+) -> Vec<u8> {
+    let mut payload = Vec::new();
+    payload.extend_from_slice(key);
+    payload.extend_from_slice(&ttl.to_be_bytes());
+    payload.extend_from_slice(pubkey);
+    let mut endpoints_data = Vec::new();
+    for ep in endpoints {
+        encode_endpoint(&mut endpoints_data, ep);
+    }
+    let val_len = endpoints_data.len() as u16;
+    payload.extend_from_slice(&val_len.to_be_bytes());
+    payload.extend_from_slice(&endpoints_data);
+    encode_message(sender_id, rand_msg_id(), DhtMsgType::Store, false, &payload, seed)
+}
+
+/// Build a signed FIND_VALUE request message
+pub fn encode_find_value_request_signed(
+    sender_id: PeerId,
+    message_id: [u8; 16],
+    key: &[u8; 32],
+    seed: Option<&[u8; 32]>,
+) -> Vec<u8> {
+    encode_message(sender_id, message_id, DhtMsgType::FindValue, false, key, seed)
+}
+
+/// Sign message data with an Ed25519 signing key seed, returns signature
+pub fn sign_with_seed(seed: &[u8; 32], data: &[u8]) -> [u8; 64] {
+    let key = ed25519_dalek::SigningKey::from_bytes(seed);
+    key.sign(data).to_bytes()
 }
 
 /// Build a PING response with k-closest nodes
@@ -94,7 +153,7 @@ fn encode_message(
     msg_type: DhtMsgType,
     is_response: bool,
     payload: &[u8],
-    signer: Option<&dyn Fn(&[u8]) -> [u8; 64]>,
+    sign_seed: Option<&[u8; 32]>,
 ) -> Vec<u8> {
     let mut msg = Vec::with_capacity(83 + payload.len() + 64);
     msg.push(PROTOCOL_VERSION);
@@ -109,10 +168,10 @@ fn encode_message(
     msg.push((payload_len & 0xFF) as u8);
     msg.extend_from_slice(payload);
 
-    let sig = if let Some(signer_fn) = signer {
-        signer_fn(&msg) // Sign everything before the signature field
+    let sig = if let Some(seed) = sign_seed {
+        sign_with_seed(seed, &msg)
     } else {
-        [0u8; 64] // Placeholder for unsigned messages
+        [0u8; 64]
     };
     msg.extend_from_slice(&sig);
 

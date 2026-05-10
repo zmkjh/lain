@@ -54,13 +54,17 @@ impl Identity {
     }
 
     /// 导出用于 Noise IK 的 X25519 密钥对
-    /// Ed25519 签名密钥 → X25519 密钥交换密钥 (Montgomery form)
     pub fn noise_keypair(&self) -> ([u8; 32], [u8; 32]) {
         let scalar = self.signing_key.to_scalar();
         let mut secret = [0u8; 32];
         secret.copy_from_slice(&scalar.to_bytes());
         let public = self.verifying_key.to_montgomery().to_bytes();
         (secret, public)
+    }
+
+    /// 导出 Ed25519 签名种子（用于 DHT RPC 签名）
+    pub fn signing_seed(&self) -> [u8; 32] {
+        self.signing_key.to_bytes()
     }
 
     pub fn load_or_generate() -> Result<Self, IdentityError> {

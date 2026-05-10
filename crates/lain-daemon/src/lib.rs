@@ -146,8 +146,11 @@ impl Daemon {
         let heartbeat_secs = dht_config.heartbeat_interval_secs;
         let bootstrap_nodes = dht_config.bootstrap_nodes.clone();
 
-        let dht = DhtHandle::new(peer_id, public_key, dht_config)
+        let mut dht = DhtHandle::new(peer_id, public_key, dht_config)
             .map_err(|e| DaemonError::Dht(e.to_string()))?;
+
+        // Wire DHT RPC signing with identity key
+        dht.set_signer(self.identity.signing_seed());
 
         // 4. Bootstrap
         if !bootstrap_nodes.is_empty() {

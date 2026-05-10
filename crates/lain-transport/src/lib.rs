@@ -3,6 +3,7 @@
 #![deny(clippy::panic)]
 
 use lain_core::endpoint::{Endpoint, EndpointKind};
+use lain_core::frame::{self, FrameType};
 use lain_core::identity::Ed25519PublicKey;
 use lain_core::peer::PeerId;
 use lain_core::transport::{Connection as CoreConn, IncomingConnection, PathType, TransportLayer};
@@ -282,6 +283,19 @@ impl Transport {
         let _session = noise.into_transport()
             .map_err(|e| TransportError::Noise(format!("transport: {e}")))?;
 
+        // Receive HEADERS on stream 1, send response
+        let conn2 = conn.clone();
+        tokio::spawn(async move {
+            if let Ok((mut hd_send, mut hd_recv)) = conn2.accept_bi().await {
+                let mut buf = vec![0u8; 1024];
+                if let Ok(Some(_n)) = hd_recv.read(&mut buf).await {
+                    let resp = frame::encode_frame(1, FrameType::Headers, b"{}");
+                    hd_send.write_all(&resp).await.ok();
+                    hd_send.finish().ok();
+                }
+            }
+        });
+
         // Verify PeerID = SHA256(remote_pubkey)
         let mut hasher = sha2::Sha256::new();
         hasher.update(&remote_pk);
@@ -391,6 +405,15 @@ impl Transport {
 
         let session = noise.into_transport()
             .map_err(|e| TransportError::Noise(format!("transport: {e}")))?;
+
+        // Send HEADERS frame on stream 1 (control channel)
+        let headers = frame::encode_frame(1, FrameType::Headers, b"{}");
+        let (mut ctrl_send, _ctrl_recv) = conn
+            .open_bi()
+            .await
+            .map_err(|e| TransportError::Connect(format!("ctrl stream: {e}")))?;
+        ctrl_send.write_all(&headers).await.ok();
+        ctrl_send.finish().ok();
 
         self.connections.lock().await.insert(*peer_id, PeerConnection {
             _quic: conn.clone(),
