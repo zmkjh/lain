@@ -88,6 +88,7 @@ pub struct DhtHandle {
     socket: Arc<UdpSocket>,
     #[allow(dead_code)]
     signing_key: Option<[u8; 32]>,
+    pending_queries: Arc<RwLock<HashMap<[u8; 16], tokio::sync::oneshot::Sender<Option<PeerRecord>>>>>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -121,6 +122,7 @@ impl DhtHandle {
             event_tx,
             socket: Arc::new(socket),
             signing_key: None,
+            pending_queries: Arc::new(RwLock::new(HashMap::new())),
         })
     }
 
@@ -138,7 +140,7 @@ impl DhtHandle {
         self.socket.clone()
     }
 
-    /// Bootstrap 到已知节点
+    /// Bootstrap 到已知节点并递归填充路由表
     pub async fn bootstrap(&self, seeds: &[SocketAddr]) -> Result<(), DhtError> {
         let mut attempted: u8 = 0;
         let mut last_err = String::new();
@@ -157,9 +159,49 @@ impl DhtHandle {
                 last_err = e.to_string();
                 continue;
             }
+            // Recursively fill routing table: FIND_NODE(self.id) from each newly discovered node
+            // Let in-flight responses populate the table; just need one successful contact
             return Ok(());
         }
         Err(DhtError::BootstrapFailed { attempts: attempted, last_error: last_err })
+    }
+
+    /// Bootstrap 后递归填满路由表（后台运行）
+    pub fn spawn_bucket_refresh(self: &Arc<Self>) {
+        let this = self.clone();
+        tokio::spawn(async move {
+            // Give initial responses time to arrive
+            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+            // Iterate over all buckets and refresh each
+            for bucket_idx in 0..lain_core::DHT_BUCKET_COUNT {
+                // Generate a random ID in this bucket's range
+                let target = this.random_id_in_bucket(bucket_idx);
+                let msg_id = rand::random::<u128>().to_be_bytes();
+                let req = this.encode_find_node(msg_id, target);
+                let closest = {
+                    let rt = this.routing_table.read().await;
+                    rt.closest_nodes(&target, 3)
+                };
+                for node in &closest {
+                    this.send_msg(&req, node.address).await;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+            tracing::info!("bootstrap bucket refresh complete, {} nodes in routing table",
+                this.routing_table.read().await.size());
+        });
+    }
+
+    /// Generate a random PeerID in the given bucket's XOR range
+    fn random_id_in_bucket(&self, bucket_idx: usize) -> PeerId {
+        let mut id = self.peer_id.0;
+        if bucket_idx < 256 {
+            let byte_idx = 31 - bucket_idx / 8;
+            let bit_idx = bucket_idx % 8;
+            // Flip the bit at bucket_idx to create a target in that bucket
+            id[byte_idx] ^= 1u8 << bit_idx;
+        }
+        PeerId(id)
     }
 
     fn encode_ping(&self, message_id: [u8; 16]) -> Vec<u8> {
@@ -222,19 +264,32 @@ impl DhtHandle {
                 }
             }
         }
-        // Iterative lookup to alpha closest nodes
+
+        // Create oneshot channel for the response
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let msg_id = rand::random::<u128>().to_be_bytes();
+
+        // Register pending query
+        self.pending_queries.write().await.insert(msg_id, tx);
+
+        // Send FIND_VALUE to alpha closest nodes
         let closest = {
             let rt = self.routing_table.read().await;
             rt.closest_nodes(peer_id, self.config.alpha)
         };
         for node in &closest {
-            let msg_id = rand::random::<u128>().to_be_bytes();
             let req = self.encode_find_value(msg_id, &peer_id.0);
             self.send_msg(&req, node.address).await;
         }
-        // Response comes via handle_incoming
-        let records = self.peer_records.read().await;
-        Ok(records.get(peer_id).cloned().filter(|r| r.expires_at > std::time::Instant::now()))
+
+        // Wait for response with timeout
+        match tokio::time::timeout(std::time::Duration::from_secs(5), rx).await {
+            Ok(Ok(record)) => Ok(record),
+            _ => {
+                self.pending_queries.write().await.remove(&msg_id);
+                Ok(None)
+            }
+        }
     }
 
     /// 序列化路由表到文件
@@ -475,10 +530,20 @@ impl DhtHandle {
                 }
             }
             DhtMsgType::FindValue => {
-                // Parse response: either value or k-closest
+                // Forward to pending query if we have one
+                if let Some(tx) = self.pending_queries.write().await.remove(&msg.message_id) {
+                    let payload = &msg.payload;
+                    let record = if !payload.is_empty() && payload[0] == 1 {
+                        msg_codec::parse_record_from_payload(&payload[1..])
+                    } else {
+                        None
+                    };
+                    let _ = tx.send(record);
+                }
+
+                // Also update routing table from k-closest nodes
                 let payload = &msg.payload;
                 if !payload.is_empty() && payload[0] == 1 {
-                    // Has value: parse PeerRecord
                     if let Some(record) = msg_codec::parse_record_from_payload(&payload[1..]) {
                         let peer_id = PeerId(msg.sender_id.0);
                         let _ = self.event_tx.send(CoreDhtEvent::PeerDiscovered(
@@ -487,7 +552,6 @@ impl DhtHandle {
                         ));
                     }
                 } else {
-                    // k-closest nodes
                     if let Some(nodes) = msg_codec::parse_nodes_from_payload(
                         if payload.len() > 1 { &payload[1..] } else { &[] }
                     ) {

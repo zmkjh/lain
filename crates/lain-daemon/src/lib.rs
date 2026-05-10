@@ -181,7 +181,7 @@ impl Daemon {
             bootstrap_nodes: self.config.dht.bootstrap_nodes.clone(),
         };
 
-        let heartbeat_secs = dht_config.heartbeat_interval_secs;
+        let _heartbeat_secs = dht_config.heartbeat_interval_secs;
         let bootstrap_nodes = dht_config.bootstrap_nodes.clone();
 
         let mut dht = DhtHandle::new(peer_id, public_key, dht_config)
@@ -212,8 +212,15 @@ impl Daemon {
             tracing::warn!("initial DHT STORE failed: {e}");
         }
 
+        // Adaptive heartbeat: symmetric NAT needs faster STORE to keep mapping alive
+        let adaptive_heartbeat = if nat_result.nat_type.is_symmetric() { 30u64 } else { 120u64 };
+        tracing::info!("DHT heartbeat: {}s (NAT: {:?})", adaptive_heartbeat, nat_result.nat_type);
+
         // 6. mDNS LAN 发现
         let dht_for_mdns = Arc::new(dht);
+
+        // Start background bucket refresh
+        dht_for_mdns.spawn_bucket_refresh();
 
         // Spawn relay accept loop: handle incoming RelayConnect frames
         let transport_relay = transport.clone();
@@ -369,7 +376,7 @@ impl Daemon {
 
         let mut buf = vec![0u8; 2048];
         let mut heartbeat = tokio::time::interval(
-            std::time::Duration::from_secs(heartbeat_secs),
+            std::time::Duration::from_secs(adaptive_heartbeat),
         );
 
         // Track known peers
@@ -479,6 +486,9 @@ impl Daemon {
                                             };
                                             tracing::info!("connected to {pid}");
                                             connected_ref.write().await.insert(pid, (conn.clone(), permit));
+
+                                            // Start QUIC keepalive PING every 15s
+                                            lain_transport::Transport::spawn_keepalive(conn.clone(), 15);
 
                                             // Notify IPC subscribers
                                             let _ = ipc_ev.send(IpcResponse::Event {

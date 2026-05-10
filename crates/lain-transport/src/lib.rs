@@ -561,10 +561,12 @@ impl Transport {
         let a2 = a.clone();
         let b2 = b.clone();
 
-        // Forward incoming streams from A to B
+        // Forward incoming streams from A to B (30s timeout on accept for dead relay detection)
         let a_to_b = tokio::spawn(async move {
-            while let Ok(stream) = a.accept_bi().await {
-                let (_send, mut recv) = (stream.0, stream.1);
+            loop {
+                match tokio::time::timeout(std::time::Duration::from_secs(30), a.accept_bi()).await {
+                    Ok(Ok(stream)) => {
+                        let (_send, mut recv) = (stream.0, stream.1);
                 let b3 = b.clone();
                 tokio::spawn(async move {
                     if let Ok((mut b_send, _b_recv)) = b3.open_bi().await {
@@ -582,11 +584,17 @@ impl Transport {
                     }
                 });
             }
+                    Ok(Err(_)) => break,     // QUIC error, relay dead
+                    Err(_) => break,          // Timeout, relay dead
+                }
+            }
         });
 
-        // Forward incoming streams from B to A
+        // Forward incoming streams from B to A (30s timeout)
         let b_to_a = tokio::spawn(async move {
-            while let Ok(stream) = b2.accept_bi().await {
+            loop {
+                match tokio::time::timeout(std::time::Duration::from_secs(30), b2.accept_bi()).await {
+                    Ok(Ok(stream)) => {
                 let (_send, mut recv) = (stream.0, stream.1);
                 let a3 = a2.clone();
                 tokio::spawn(async move {
@@ -603,6 +611,10 @@ impl Transport {
                         let _ = a_send.finish();
                     }
                 });
+            }
+                    Ok(Err(_)) => break,
+                    Err(_) => break,
+                }
             }
         });
 
