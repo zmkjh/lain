@@ -15,6 +15,7 @@ pub mod capabilities;
 pub mod dht;
 pub mod nat;
 pub mod transport;
+pub mod frame;
 
 // 协议常量
 pub const PROTOCOL_VERSION: u8 = 1;

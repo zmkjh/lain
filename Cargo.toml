@@ -33,7 +33,9 @@ ed25519-dalek = { version = "2", features = ["rand_core"] }
 sha2 = "0.10"
 rand = "0.8"
 snow = "0.9"
-quinn = "0.11"
+quinn = { version = "0.11", features = ["rustls"] }
+rustls = { version = "0.23", features = ["ring"] }
+rcgen = "0.13"
 clap = { version = "4", features = ["derive"] }
 toml = "0.8"
 tracing-subscriber = "0.3"
