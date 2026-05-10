@@ -159,7 +159,7 @@ Initiator (PeerID 小)              Responder (PeerID 大)
 优先级:  mDNS (局域网) → Invite Code (广域网) → DHT lookup → Overlay relay
 ```
 
-- **mDNS**: LAN 内广播 `_lain._udp.local`，TXT record 含 PeerID + 端口
+- **mDNS**: LAN 内通过非特权端口（默认 53617，可配置）广播 `_lain._udp.local`，TXT record 含 PeerID + 实际 QUIC 端口。使用非标准 mDNS 端口避免与系统 mDNS 服务（avahi/Bonjour/mDNSResponder，占用 5353）冲突。
 - **Invite Code**: 用户通过 out-of-band 渠道交换（复制粘贴、QR、`lain://` 链接）
 - **DHT lookup**: 解析 invite 后去 DHT `FIND_VALUE(peer_id)` 获取最新广播的地址（比 invite 中的快照更新鲜）
 
@@ -234,29 +234,31 @@ Step 1: IPv6 直连
   ─ 条件: 至少一方有 IPv6 inbound
   ─ 发起方主动向对方 IPv6 地址发起 QUIC connection
 
-Step 2: UDP STUN 打洞 + Birthday Attack (并行)
+Step 2: UDP STUN 打洞
   ─ 双方通过 STUN 获取映射地址
-  ─ 基本打洞: 同时发送 UDP probe
-  ─ 成功条件: 至少一方是 Cone NAT
-  ─ 若基本打洞失败，并行执行 Birthday Attack
+  ─ 同时发送 UDP probe，对方地址通过 invite code 交换（一次性信令）
+  ─ 成功条件: 至少一方是 Cone NAT（覆盖率 ~95%，见 coverage-analysis.md）
+  ─ 探测包为裸 UDP 帧，成功后升级到 QUIC
 
-  Birthday Attack 子步骤:
-  ─ 渐进式打开额外端口: 1 → 16 → 64 → 256
-  ─ K×K 探测矩阵（K 为当前等级端口数）
-  ─ 信令通道: 端口列表通过 invite 通道初次交换；后续等级放大所需的新端口列表通过 STUN server 间接通道传递（双方持续向 STUN 发送端口通告，STUN 作为临时信令中转），或通过已有的 relay 连接传递（若 Step 0 relay 已建立）
-  ─ 所有探测包为裸 UDP 帧（不使用 QUIC），探测成功后端口对用于后续 QUIC 连接建立
+Step 3: Birthday Attack (relay 辅助)
+  ─ 前提: 已有 relay 连接可用作信令通道
+  ─ 渐进式打开额外端口: 1 → 16 → 64 → 256（桌面）/ 1 → 8 → 32 → 128（移动端）
+  ─ K×K 探测矩阵，端口列表通过 relay 通道实时交换
+  ─ 所有探测包为裸 UDP 帧，成功后升级到 QUIC
+  ─ 无 relay 时: 仅使用 invite code 中的初始端口集合做单轮尝试
 
-Step 3: TCP Simultaneous Open
+Step 4: TCP Simultaneous Open (relay 辅助)
   ─ 双方同时向对方发起 TCP connect
-  ─ 5 秒时间窗口（可用 relay 做精确时钟同步）
+  ─ 5 秒时间窗口（通过 relay 做精确时钟同步）
   ─ 利用 SO_REUSEADDR 和 SYN 碰撞
+  ─ 无 relay 时: 双方在本机时钟 ±3s 窗口内尝试，成功率降低
 
-Step 4: WebSocket over TCP 443
+Step 5: WebSocket over TCP 443
   ─ 需一方可监听 TCP 入站 + 另一方出站 TCP 443
   ─ HTTP Upgrade → WebSocket → Noise_IK → Lain Frames
   ─ 适用场景: 企业防火墙封 UDP 只放 TCP 443
 
-Step 5: Overlay Relay
+Step 6: Overlay Relay
   ─ 通过中继发现机制找到中间 relay 节点（见 §7）
   ─ 噪声端到端加密，relay 不可见明文
 
@@ -265,7 +267,7 @@ Step 5: Overlay Relay
   ─ 跳过公网地址直连尝试，优先使用 invite 中的 LAN endpoint 或 mDNS 发现的局域网地址直连
   ─ LAN 不可达时回退到 relay
 
-穿透策略执行模型：不严格串行。Step 1-5 按优先级启动，上层步骤的尝试与下层步骤并行进行。首个成功的连接被采用，其余尝试取消。整个流程受 traversal_timeout (30s) 全局约束。
+穿透策略执行模型：不严格串行。Step 1-6 按优先级启动，上层步骤的尝试可与下层步骤并行进行。Step 3-4 依赖 relay 信令通道——daemon 启动后即预连 relay 候选（角色二：临时数据桥），使穿透阶段有信令可用。首个成功的连接被采用，其余尝试取消。整个流程受 traversal_timeout (30s) 全局约束。
 ```
 
 ### 6.3 硬边界
@@ -357,9 +359,11 @@ relay_capable = (nat_type == Cone) || ipv6_inbound_open
 1. A 取自己的候选池与 B 的候选池（通过 DHT 查询 B 的 STORE record 获取 B 的已知 relay 列表）
 2. 求交集 → 优先选双方都能直连的 relay（一跳 relay）
 3. 交集为空 → A 从自己候选池中选一个 R，要求 R 能连到 B（R 通过 DHT FIND_VALUE 验证 B 可达）
-4. 上述均失败 → 全局 RELAY_NEEDED 广播
+4. 上述均失败 → 执行迭代式 `FIND_VALUE(RelayCapabilityMarker)`（α=3），扩大搜索范围。Kademlia FIND_VALUE 的自然行为会遍历 XOR 空间中最接近该 key 的节点，逐步收集 relay 候选。若仍为空，周期重试（退避 30s→60s→120s）。
 
 选路度量（同分时）：延迟优先（RTT 最小）→ 带宽估计优先 → PeerID 排序决定。
+
+注：RELAY_NEEDED (msg_type=0x04) 是一个显式的"请求 relay 列表"RPC，用于直连已知 relay 候选节点确认其 relay 意愿和当前负载。它不依赖广播——它发送给已知 relay 节点或通过 FIND_VALUE 新发现的候选。
 
 #### 拓扑连接
 
@@ -376,7 +380,7 @@ A ──[A↔R QUIC]──> R ──[R↔B QUIC]──> B
 1. 检测到该 relay 的 QUIC 连接断开
 2. 从候选池中选出下一个可用 relay，优先级: 一跳 relay > 两跳 relay
 3. 所有 relay-dependent stream 自动迁移到新 relay
-4. 候选池为空 → 触发阶段二主动查询 → 仍为空则 DHT 广播 RELAY_NEEDED 查询
+4. 候选池为空 → 触发阶段二主动查询（迭代 FIND_VALUE(RelayCapabilityMarker)）→ 仍为空则周期重试（退避 30s→60s→120s）
 
 网络中有 ≥1 个 relay 候选存活，relay 路径就不中断。
 
@@ -435,7 +439,11 @@ JOINED
   │   └─ 收到新 invite 或应用触发 ──→ BOOTSTRAPPING
   │
   └─ DHT bootstrap 失败 ──→ DEGRADED (仅已连接的直连 peer 可用)
+      └─ 收到新 invite → 用新 peer 重新 bootstrap → BOOTSTRAPPING → JOINED
+      └─ 没有任何已知 peer + invite 过期 → 等待用户提供新 invite
 ```
+
+注：BOOTSTRAPPING 超时（120s）后转入 DEGRADED。路径：无任何节点已知（peers.json 空 + routes.bin 空 + 无 invite）→ 直接进入 DEGRADED。首个创建网络的节点在此状态等待其他节点通过 invite 加入。
 
 ### 8.4 防时钟漂移
 
@@ -693,9 +701,10 @@ Noise 握手完成后，所有数据通过以下帧格式传输。帧嵌入 QUIC
 | 0x04 | PING | (空) | 应用层心跳 |
 | 0x05 | PONG | ping_payload (echo) | 应用层心跳响应 |
 | 0x06 | PATH_CHANGE | endpoint_list (同 STORE value 格式) | 通知对方自己的地址变更 |
+| 0x07 | STREAM_RESUME | [(stream_id: varint, last_seq: u64), ...] | 断线重连后恢复 stream 状态，发送方为发起重连的一方 |
 
 **Stream ID 分配：**
-- Stream 0: 保留给 Noise IK 握手
+- Stream 0: 保留给 Noise IK 握手 + 重连后 STREAM_RESUME
 - Stream 1: 控制通道（HEADERS, PATH_CHANGE, PING/PONG, CLOSE）
 - Stream 2+: 应用数据流（由应用通过 IPC API 创建）
 
@@ -732,17 +741,26 @@ QUIC 通过 Connection ID 标识连接（非四元组），支持透明路径迁
 
 ### 10.3 帧格式
 
-HTTP/3 风格：
+完整线格式见 §9.7.4。此处仅做概述：
 
 ```
-Stream ID (varint) | Frame Type (varint) | Frame Length (varint) | Payload
-
-Frame Types:
-  0x00 = HEADERS  [key_count: u16] [(key_len, key, val_len, val)...]
-  0x01 = DATA     [raw bytes]
-  0x02 = CLOSE    [error_code: u32]
-  0x03 = PING     [empty]
+magic(3) | Stream ID (varint) | Frame Type (varint) | Frame Length (varint) | Payload
 ```
+
+帧类型速查：
+
+| 值 | 名称 | 说明 |
+|----|------|------|
+| 0x00 | HEADERS | 首帧必发，应用层元数据 |
+| 0x01 | DATA | 可靠应用数据 |
+| 0x02 | DATA_DGRAM | 不可靠数据报（仅 QUIC） |
+| 0x03 | CLOSE | 优雅关闭 stream |
+| 0x04 | PING | 应用层心跳 |
+| 0x05 | PONG | 心跳响应 |
+| 0x06 | PATH_CHANGE | 地址变更通知 |
+| 0x07 | STREAM_RESUME | 重连后 stream 恢复 |
+
+Stream 0 保留给 Noise IK 握手 + 重连 STREAM_RESUME，Stream 1 为控制通道，Stream 2+ 为应用数据流。
 
 ### 10.4 流控
 
@@ -785,6 +803,7 @@ A (PeerID 小 = Initiator)                           B (PeerID 大 = Responder)
   A ──IK msg 1 (e, es, s, ss)──→ B (A 已知 B 公钥)
   A ←──IK msg 2 (e, ee, se)──── B
   A ──IK payload────────────────→ B (Noise 握手完成，端到端加密建立)
+  (握手超时: 15s，超时视为连接失败，关闭 QUIC connection)
 
 [Phase 4: 连接确认]
   A ──HEADERS { version, capabilities }──→ B  (stream 1)
@@ -838,8 +857,9 @@ RECONNECTING            (重连, 跳过邀请, 直接从 DHT 获取 endpoint)
 1. 检测断线（QUIC idle timeout / 显式 CLOSE）
 2. 通过 DHT FIND_VALUE 获取 peer 最新 endpoint（peer 可能已经换了 IP）
 3. 重新执行穿透（跳过已确定的不可行路径，如对 S_APDF 跳过 STUN 打洞）
-4. 成功 → 恢复所有 stream（应用层需自行处理 stream 恢复逻辑）
-5. 失败 → 指数退避重试，最大间隔 5 分钟。peer EXPIRED 则放弃。
+4. 成功 → 对端发送 STREAM_RESUME 帧（stream 0），格式为 `[(stream_id: varint, last_seq: u64), ...]`。接收方比对已收到的数据，缺失部分由发起方重传。应用层 fd 保持不变，恢复对应用透明。
+5. 失败 → 指数退避重试，最大间隔 5 分钟。peer EXPIRED 则放弃，向上层应用发送 STREAM_LOST 通知。
+6. 重启后重连：daemon 从 peers.json 恢复已知 peer 列表，从 routes.bin 恢复 DHT 路由表，优先连接这些 peer 以快速重新加入网络。
 
 ### 并发连接限制
 
@@ -1093,21 +1113,34 @@ INFO  NAT probed: Cone, ipv6=available
 ```
 STUN:  stun.miwifi.com, stun.qq.com, stun.cloudflare.com, stun.l.google.com (按序)
 QUIC:  idle_timeout=30s, keep_alive=15s, max_udp_payload=1232 bytes
-       (keep_alive 在移动网络下自动调整为 60s，连接建立后按路径 RTT 自适应)
+       (移动网络下 idle_timeout 自动调整为 120s, keep_alive 为 60s)
 DHT:   k=20, alpha=3, ttl=300s, heartbeat=150s, republish=3600s
        max_active_networks=32 (活跃网络数上限，超出部分自动标记 dormant)
 连接:  connect_timeout=10s, traversal_timeout=30s, max_connections=256
        max_streams_per_conn=128, max_relay_streams=32
 穿透:  birthday_levels=[1,16,64,256], tso_window=5s
+       (移动端 birthday_levels=[1,8,32,128])
 ```
 
 ### 12.4 端口分配
 
 | 端口 | 用途 |
 |------|------|
-| UDP 随机 | QUIC 主端口（STUN + DHT RPC + 所有 QUIC 连接复用） |
-| UDP :5353 | mDNS 公告/查询 |
+| UDP 随机 | QUIC 主端口（STUN + DHT RPC + 所有 QUIC 连接复用，见 §12.4.1） |
+| UDP :53617 或随机 | mDNS 公告/查询（避免与系统 mDNS 端口 5353 冲突，LAN 发现通过 mDNS TXT record 携带实际端口号） |
 | UDP 临时 | Birthday Attack 端口（动态开/关） |
+
+#### 12.4.1 UDP 端口解复用
+
+单个 UDP socket 承载三种协议，按首字节分发：
+
+| 首字节 | 协议 | 分发规则 |
+|--------|------|---------|
+| 0x00-0x03 | STUN | 首 2 bit = 00，紧接着 magic cookie `0x2112A442` 验证 |
+| 0x01 | DHT RPC | version byte = 1，紧接着 message_id 随机性验证 |
+| 0xC0-0xFF | QUIC long-header | 首 2 bit = 11（Initial/Handshake），或 0x40-0x7F（short-header，按 CID 匹配已注册 connection） |
+
+QUIC short-header 包的首字节为 `01xxxxxx`（与 DHT version=1 冲突）。区分方式：收到 0x01 开头的包时，先尝试按已注册 QUIC Connection ID 匹配，无匹配则按 DHT RPC 解析。QUIC 握手完成后所有包均可按 CID 匹配，不存在歧义。
 | TCP 临时 | TSO / WS fallback listener |
 | UDS 路径 | IPC native |
 | TCP 127.0.0.1 随机 | IPC HTTP/WS |
@@ -1121,6 +1154,73 @@ DHT:   k=20, alpha=3, ttl=300s, heartbeat=150s, republish=3600s
 ### 12.6 指标
 
 通过 `GET /metrics` 暴露 Prometheus 格式：连接数（按路径类型）、延迟直方图、DHT 路由表大小、节点 LIVE/STALE 分布、字节流量、NAT 类型。
+
+### 12.7 移动端资源优化
+
+移动设备（iOS/Android）的资源约束（电池、蜂窝数据、CPU、内存）与桌面端显著不同。以下策略使 daemon 在移动端可持续运行而不显著影响续航和数据套餐。
+
+#### 12.7.1 电池优化
+
+| 策略 | 桌面默认 | 移动默认 | 说明 |
+|------|---------|---------|------|
+| QUIC keep-alive | 15s | 60s | 减少无线电唤醒频率。idle_timeout 同步调整为 120s |
+| DHT 心跳间隔 | 150s | 300s | 减少 STORE 发送。TTL 同步调整为 600s |
+| bucket 刷新间隔 | 3600s | 7200s | 减少周期性 PING |
+| republish 间隔 | 3600s | 7200s | 减少冗余 STORE |
+| 批量 STORE | 关闭 | 开启 | 多个 key 的 STORE 合并到单个 UDP 包 |
+| mDNS 广播 | 启用 | 关屏后关闭 | 屏幕关闭时暂停 LAN 发现，开屏恢复 |
+| 连接建立限速 | 8 并发 | 3 并发 | 减少穿透阶段的并行无线电活动 |
+
+**电源状态感知**：检测设备是否充电 → 充电时恢复桌面频率，拔电时采用移动频率。检测屏幕是否开启 → 关屏时降低所有定时器频率 50%。
+
+#### 12.7.2 蜂窝数据优化
+
+**流量预算**（单活跃网络，移动模式，24 小时）：
+
+| 组件 | 频率 | 单次流量 | 日流量 |
+|------|------|---------|--------|
+| DHT 心跳 STORE | 300s | ~5KB (20 nodes × 250B) | ~1.4 MB |
+| bucket 刷新 PING | 7200s | ~2KB | ~7 KB |
+| 路由表 republish | 7200s | ~5KB | ~17 KB |
+| QUIC keep-alive | 60s/conn | ~50B | ~72 KB/conn |
+| STUN refresh | 600s | ~200B | ~29 KB |
+| **合计（5 连接，无 relay）** | — | — | **~1.8 MB/day** |
+| **合计（5 连接，1 relay）** | — | — | **~3.5 MB/day** |
+
+**流量优化措施**：
+- DHT 消息合并：同一 heartbeat 周期内的多个 STORE 合并为一个 UDP datagram（路径 MTU 允许），减少包头开销
+- 增量 STORE：仅当 endpoint 变更时发送完整 STORE，未变更时发送仅含 ttl 续期的轻量 PING 级消息
+- Relay 流量计数：对 relay 路径做字节计数，通知用户月度 relay 流量消耗
+- 蜂窝网络下默认禁用未请求的 relay 数据转发（仅为自己主动建立的连接使用 relay）
+
+#### 12.7.3 CPU 优化
+
+| 优化点 | 说明 |
+|--------|------|
+| DHT 签名批处理 | 同一 heartbeat 周期的多个 STORE 的签名在 tokio blocking pool 中并行，不阻塞 async runtime |
+| 对称加密硬件加速 | ChaChaPoly 利用 ARM NEON / AES-NI 指令集（Rust `chacha20poly1305` crate 已支持） |
+| 零拷贝转发 | Relay 节点：QUIC stream → QUIC stream 转发不经用户态 buffer 拷贝（使用 QUIC 的 `send_datagram` 或 stream pipe） |
+| 路由表懒加载 | 仅访问的 k-bucket 做活跃维护，未使用的 bucket 保持序列化状态 |
+| Birthday Attack 限流 | 移动端 birthday_levels 降为 [1,8,32,128]，减少 75% 探测包，且仅在 relay 信令可用时启动 |
+
+#### 12.7.4 内存优化
+
+| 组件 | 桌面上限 | 移动上限 | 说明 |
+|------|---------|---------|------|
+| max_connections | 256 | 64 | 减少 QUIC TLS 状态和 stream buffer |
+| max_streams_per_conn | 128 | 32 | 减少 per-stream 缓冲区 |
+| 接收 buffer 总量 | 8 MB | 2 MB | QUIC connection-level flow control 窗口 |
+| DHT k-bucket 容量 | k=20 | k=8 | 减少路由表内存（~200KB → ~80KB per network） |
+| relay candidate pool | 无上限 | 最多 16 个 | 减少 QUIC 连接数 |
+| max_active_networks | 32 | 8 | 减少并发 DHT 实例 |
+
+#### 12.7.5 连接策略
+
+**WiFi 优先**：蜂窝网络下仅维持已建立的关键连接和 DHT 基本维护，延迟非紧急的连接重建到 WiFi 可用时。
+
+**连接暂停与恢复**：应用进入后台 → daemon 收到 OS 通知 → 降低所有定时器频率（×3）→ 保持 DHT STORE（证明存活）→ 暂停 mDNS → 进入前台 → 恢复全部定时器 → 紧急 UPDATE DHT → 重建断开的连接。
+
+**后台保活**：Android 前台服务通知（必需）、iOS Background Task / VoIP push（如可用）。在 OS 强制杀死 daemon 后，下次启动从 routes.bin + peers.json 快速恢复。
 
 ---
 
@@ -1203,6 +1303,7 @@ Level 5 — 最小存活: 仅 relay 路径
 ### 15.1 硬边界
 
 - **S_APDF × S_APDF 且双方无 IPv6**：数学上无法直连，需 relay 或用户配置 IPv6
+- **S_APDF × S_ADF 且双方无 IPv6**：同上（APDF 过滤端不可达），IPv6 或 relay 兜底
 - **两端都在严格防火墙后（UDP 封 + TCP 入站封 + 无 IPv6）**：任何路径均不通
 
 ### 15.2 已知 tradeoff

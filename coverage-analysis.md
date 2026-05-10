@@ -75,11 +75,11 @@ We consider the following allowed techniques:
 
 2. **TCP Simultaneous Open (TSO) with wide time window**: Both peers send TCP SYN packets to each other simultaneously. The SYNs establish stateful NAT entries that allow the TCP three-way handshake to complete bidirectionally. A "wide" time window (seconds rather than milliseconds) is used to avoid timing sensitivity.
 
-3. **Birthday Attack with invite-mediated information exchange**: Peers open K sockets each (K typically 256-1024), discover their mapped ports via STUN, and exchange the full list. Each peer then sends probes from all K sockets to all K addresses of the other peer, achieving success probability via the birthday paradox.
+3. **Birthday Attack with relay-mediated coordination**: Peers open K sockets each (K typically 16-256), discover their mapped ports via STUN, and exchange the full port list via a pre-established relay connection (which serves only as a signaling channel). Each peer then sends probes from all K sockets to all K addresses of the other peer. Without relay coordination, the Birthday Attack is limited to a single-round attempt using the port set included in the initial invite code.
 
 4. **IPv6 direct connection**: One peer acts as client (initiator) and the other as server (listener), using globally routable IPv6 addresses. Stateful firewalls, when present, are modeled as ADF (IP-only filtering), enabling connectivity as long as at least one peer's network allows inbound IPv6.
 
-**Explicitly excluded** are: TURN relays, multi-hop overlay forwarding, DHT supernodes with fixed public IPv4 addresses, and any dedicated infrastructure servers beyond external STUN endpoints.
+**Explicitly excluded** are: TURN relays, multi-hop overlay forwarding, DHT supernodes with fixed public IPv4 addresses, and any dedicated infrastructure servers beyond external STUN endpoints. Note: relay-mediated Birthday Attack coordination (using a peer-to-peer relay node within the overlay network, not a dedicated server) is included as it constitutes a signaling-only use of an existing P2P connection rather than infrastructure dependency.
 
 ### 2.3 Assumptions and Scope Boundaries
 
