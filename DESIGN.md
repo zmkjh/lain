@@ -1424,17 +1424,171 @@ lain/
 
 ---
 
-## 19. 使用场景
+## 19. 典型用法
 
 Lain 的核心能力：**在两个设备之间建立加密字节流，不需要任何服务器。**
 
-| 场景 | 用法 |
-|------|------|
-| 个人设备组网 | 手机、笔记本加入同一网络，剪贴板同步、文件共享 |
-| 小团队内网 | 内部聊天、代码仓库、文档同步，零服务器 |
-| 远程访问 | 从公司电脑访问家中 NAS（直连或 relay） |
-| 局域网协作 | mDNS 自动发现，延迟 <1ms |
-| 去中心化应用 | 开发者用 lain 做网络层，不需要买云服务器 |
-| IoT / 边缘 | 树莓派、传感器组网，无需公网 IP |
-
 上层应用通过 IPC 获取裸字节流 fd，协议完全自定义——lain 不参与应用层逻辑。
+
+---
+
+### 19.1 用户视角：三台设备组网
+
+**场景**：你有一台笔记本、一部手机、一台 NAS，想在家和外出时互相访问。
+
+```
+笔记本$ lain daemon
+  INFO  identity loaded, peer_id=b3f1...
+  INFO  QUIC on 0.0.0.0:41231
+  INFO  NAT: Cone, IPv6: inbound open
+  INFO  IPC ready on ~/.lain/socket + 127.0.0.1:9177
+
+笔记本$ lain network create my-net
+  invite: lain://3KqWx7...  ← 把这个发给其他设备
+```
+
+手机和 NAS 收到 invite 链接后：
+
+```
+手机$ lain daemon                    # 只需一次，之后开机自启
+手机$ lain network join lain://3KqWx7...
+  INFO  joined network my-net (f8a2...), 2 peers online
+
+NAS$   lain daemon
+NAS$   lain network join lain://3KqWx7...
+  INFO  joined network my-net (f8a2...), 3 peers online
+```
+
+现在三台设备已互联。笔记本上查看：
+
+```
+笔记本$ lain network peers my-net
+  b3f1...  (self)    direct_quic,  <1ms
+  d7e4...  (phone)   direct_quic,  12ms   ← 手机在同一 WiFi
+  a1c2...  (nas)     relayed,      28ms   ← NAS 在家，通过 relay
+```
+
+手机离开家、切到蜂窝网络后连接自动迁移——用户无感知。NAS 的 relay 路径在后台持续探测直连，一旦可行就切换。
+
+---
+
+### 19.2 开发者视角：IPC 写入应用
+
+**场景**：用 Python 写一个简单的剪贴板同步工具。
+
+```python
+import socket, json, os
+
+# 1. 连接 daemon
+sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+sock.connect(os.path.expanduser("~/.lain/socket"))
+
+# 2. 加入网络（只需一次）
+def rpc(method, params={}):
+    msg = json.dumps({"id": 1, "method": method, "params": params}) + "\n"
+    sock.sendall(msg.encode())
+    return json.loads(sock.recv(4096).decode())
+
+rpc("network.join", {"invite_code": "3KqWx7..."})
+
+# 3. 连接 peer，获取裸字节流 fd
+result = rpc("peer.connect", {"network_id": "f8a2...", "peer_id": "d7e4..."})
+# daemon 通过 SCM_RIGHTS 传回 fd
+
+# 4. 在新 fd 上直接读写——就是普通的字节流
+peer_fd = received_fd  # 从 SCM_RIGHTS 获取
+peer_fd.sendall(b"clipboard: hello world")
+data = peer_fd.recv(4096)
+print(f"收到: {data}")
+```
+
+应用协议完全自由——lain 不关心你发的是什么。
+
+**Rust 版本更简洁**（使用 `lain-core` crate）：
+
+```rust
+use lain_core::ipc::Client;
+
+let mut client = Client::connect_default().await?;
+client.join_network("3KqWx7...").await?;
+
+let stream = client.connect("f8a2...", "d7e4...").await?;
+stream.write_all(b"clipboard: hello world").await?;
+
+let mut buf = [0u8; 4096];
+let n = stream.read(&mut buf).await?;
+println!("收到: {}", String::from_utf8_lossy(&buf[..n]));
+```
+
+---
+
+### 19.3 浏览器视角
+
+浏览器通过 HTTP/WebSocket 与 daemon 通信：
+
+```javascript
+// 加入网络
+const resp = await fetch('http://127.0.0.1:9177/network/join', {
+  method: 'POST',
+  body: JSON.stringify({ invite_code: '3KqWx7...' })
+});
+const { network_id } = await resp.json();
+
+// 连接 peer
+const { ws_port } = await fetch(
+  `http://127.0.0.1:9177/networks/${network_id}/connect`,
+  { method: 'POST', body: JSON.stringify({ peer_id: 'd7e4...' }) }
+).then(r => r.json());
+
+// WebSocket 直连 daemon 数据面
+const ws = new WebSocket(`ws://127.0.0.1:${ws_port}/stream/${network_id}/d7e4...`);
+ws.binaryType = 'arraybuffer';
+ws.onopen  = () => ws.send(new TextEncoder().encode('clipboard: hello'));
+ws.onmessage = (e) => console.log('收到:', new TextDecoder().decode(e.data));
+```
+
+---
+
+### 19.4 完整时序（两个开发者互连）
+
+```
+A 的机器                                              B 的机器
+─────────────────────────────────────────────────────────────
+
+$ lain daemon                                        $ lain daemon
+  → 生成 identity, 启动 QUIC, 开启 IPC                   → 同上
+
+$ lain network create team-chat
+  → 生成 network_secret
+  → 输出 invite: lain://3KqWx7...
+  → A 把 invite 发到微信群 / AirDrop 给 B
+
+                                                     $ lain network join lain://3KqWx7...
+                                                       → 解析 invite，获取 A 的 IPv6 地址
+                                                       → QUIC → Noise IK → 连接建立 ✓
+                                                       → DHT 已 bootstrap（通过 A）
+
+$ lain network peers team-chat
+  b3f1... (self)       direct_quic
+  d7e4... (B的机器)     direct_quic, 8ms, IPv6
+
+# 两个 app（各自用 IPC 连接 daemon）开始通信
+A的app ──IPC fd──→ lain daemon ──IPv6 QUIC──→ B的daemon ──IPC fd──→ B的app
+  │                                                                       │
+  └──────────── 端到端 Noise_IK 加密，零服务器 ────────────────────────────┘
+```
+
+---
+
+### 19.5 典型连接路径分布
+
+在实际使用中，按概率降序：
+
+| 路径 | 典型场景 | 占比 |
+|------|---------|------|
+| **IPv6 直连** | 双方至少一方有 IPv6 inbound（当前 ~84%，逐年上升）| 绝大多数 |
+| **STUN 打洞** | 双方均无 IPv6，但至少一方 Cone NAT | 少数 |
+| **P2P Relay** | 硬边界 NAT 对，或 UDP 被封锁 | 极少数 |
+| **LAN 直连 (mDNS)** | 同一 WiFi / 局域网内 | 局域网场景自动优先 |
+
+用户和开发者不需要关心最终走的是哪条路径——daemon 透明选择。
