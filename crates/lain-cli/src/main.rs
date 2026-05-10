@@ -35,7 +35,7 @@ enum Command {
     Invite,
     Connect { invite: String },
     Send { peer_id: String, file: String },
-    Listen,
+    Monitor,
     Status,
 }
 
@@ -57,7 +57,7 @@ fn main() {
         }
         Command::Connect { invite } => connect_feedback(&socket_path, &invite),
         Command::Send { peer_id, file } => send_file(&socket_path, &peer_id, &file),
-        Command::Listen => listen_loop(&socket_path),
+        Command::Monitor => monitor_loop(&socket_path),
         Command::Status => {
             if let Some(v) = ipc_req(&socket_path, r#"{"cmd":"ListPeers"}"#) {
                 print_status(&v);
@@ -157,7 +157,7 @@ fn send_file(socket_path: &PathBuf, peer_id: &str, file: &str) {
 }
 
 #[cfg_attr(not(unix), allow(unused_variables))]
-fn listen_loop(socket_path: &PathBuf) {
+fn monitor_loop(socket_path: &PathBuf) {
     #[cfg(unix)]
     {
         let mut stream = match std::os::unix::net::UnixStream::connect(socket_path) {
@@ -165,7 +165,7 @@ fn listen_loop(socket_path: &PathBuf) {
             Err(e) => { eprintln!("cannot connect to daemon: {e}"); return; }
         };
         stream.write_all(b"{\"cmd\":\"Subscribe\"}\n").ok();
-        println!("listening... (Ctrl+C to stop)");
+        println!("monitoring events... (Ctrl+C to stop)");
         let mut reader = BufReader::new(&stream);
         let mut line = String::new();
         loop {
