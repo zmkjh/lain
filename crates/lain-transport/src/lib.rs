@@ -103,7 +103,9 @@ pub struct Transport {
     endpoint: quinn::Endpoint,
     connections: Arc<Mutex<HashMap<PeerId, PeerConnection>>>,
     noise_secret: [u8; 32],
+    #[allow(dead_code)]
     peer_id: PeerId,
+    #[allow(dead_code)]
     public_key: Ed25519PublicKey,
 }
 
@@ -232,7 +234,7 @@ impl Transport {
         endpoints: &[Endpoint],
     ) -> Result<(CoreConn, PathType), TransportError> {
         // Build client config that skips cert verification
-        let mut client_crypto = rustls::ClientConfig::builder_with_protocol_versions(&[
+        let client_crypto = rustls::ClientConfig::builder_with_protocol_versions(&[
             &rustls::version::TLS13,
         ])
         .dangerous()

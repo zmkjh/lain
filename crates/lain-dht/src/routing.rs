@@ -16,6 +16,7 @@ pub struct KBucket {
     k: usize,
 }
 
+#[allow(dead_code)]
 impl KBucket {
     pub fn new(k: usize) -> Self {
         Self {
@@ -85,9 +86,11 @@ impl KBucket {
 pub struct RoutingTable {
     local_id: PeerId,
     buckets: Vec<KBucket>,
+    #[allow(dead_code)]
     k: usize,
 }
 
+#[allow(dead_code)]
 impl RoutingTable {
     pub fn new(local_id: PeerId, k: usize) -> Self {
         let mut buckets = Vec::with_capacity(lain_core::DHT_BUCKET_COUNT);

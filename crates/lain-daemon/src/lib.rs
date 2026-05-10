@@ -115,10 +115,11 @@ impl Daemon {
         let _ = dht.store_self(&public_key, &endpoints, capabilities).await;
 
         // 6. 生成 invite
-        let invite = lain_discovery::InviteCode::new(
+        let _invite = lain_discovery::InviteCode::new(
             peer_id, public_key, capabilities, endpoints.clone(),
             &|data| self.identity.sign(data),
         );
+        tracing::info!("Invite: lain://{}", _invite.to_base62());
 
         // 7. 启动 DHT 接收循环
         let socket = dht.socket();
