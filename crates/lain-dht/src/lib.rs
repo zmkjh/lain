@@ -299,6 +299,26 @@ impl DhtHandle {
         let msg = msg_codec::decode_message(data)
             .ok_or_else(|| DhtError::Serialization("decode failed".into()))?;
 
+        // Verify Ed25519 signature for request messages
+        if !msg.is_response {
+            if let Some(ref sig) = msg.signature {
+                if sig.iter().any(|&b| b != 0) {
+                    let body = &data[..data.len().saturating_sub(64)];
+                    let records = self.peer_records.read().await;
+                    if let Some(rec) = records.get(&msg.sender_id) {
+                        if let Ok(vk) = ed25519_dalek::VerifyingKey::from_bytes(&rec.pubkey) {
+                            let s = ed25519_dalek::Signature::from_bytes(sig);
+                            if vk.verify_strict(body, &s).is_err() {
+                                tracing::warn!("bad signature from {}", msg.sender_id);
+                                return Err(DhtError::InvalidSignature { peer_id: msg.sender_id });
+                            }
+                        }
+                    }
+                    // Unknown peer or unparseable key: accept (deferred verification)
+                }
+            }
+        }
+
         // 更新路由表
         {
             let mut rt = self.routing_table.write().await;

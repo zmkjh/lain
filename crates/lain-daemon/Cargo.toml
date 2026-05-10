@@ -14,6 +14,7 @@ lain-discovery = { path = "../lain-discovery" }
 quinn.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["net", "sync", "time", "signal"] }
+hex.workspace = true
 tracing.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true

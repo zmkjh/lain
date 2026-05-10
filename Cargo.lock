@@ -795,6 +795,7 @@ dependencies = [
 name = "lain-daemon"
 version = "0.1.0"
 dependencies = [
+ "hex",
  "if-addrs",
  "lain-core",
  "lain-dht",

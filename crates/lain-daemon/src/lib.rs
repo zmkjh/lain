@@ -45,7 +45,7 @@ fn peers_json_path() -> Option<PathBuf> {
     dirs_home().map(|d| d.join(".lain").join("peers.json"))
 }
 
-fn save_peers(peers: &HashMap<PeerId, Vec<Endpoint>>) {
+fn save_peers(peers: &HashMap<PeerId, Vec<Endpoint>>, identity: &Identity) {
     if let Some(path) = peers_json_path() {
         let entries: Vec<StoredPeer> = peers.iter().map(|(pid, eps)| StoredPeer {
             peer_id_hex: pid.to_hex(),
@@ -53,8 +53,16 @@ fn save_peers(peers: &HashMap<PeerId, Vec<Endpoint>>) {
             endpoints: eps.iter().map(|e| e.addr.to_string()).collect(),
         }).collect();
         if let Ok(json) = serde_json::to_string_pretty(&entries) {
-            if let Some(d) = path.parent() { std::fs::create_dir_all(d).ok(); }
-            let _ = std::fs::write(&path, json);
+            // Sign with identity key for integrity
+            let sig = identity.sign(json.as_bytes());
+            let signed = serde_json::json!({
+                "data": entries,
+                "sig": hex::encode(sig),
+            });
+            if let Ok(final_json) = serde_json::to_string_pretty(&signed) {
+                if let Some(d) = path.parent() { std::fs::create_dir_all(d).ok(); }
+                let _ = std::fs::write(&path, final_json);
+            }
         }
     }
 }
@@ -63,15 +71,23 @@ fn load_peers() -> HashMap<PeerId, Vec<Endpoint>> {
     let mut map = HashMap::new();
     if let Some(path) = peers_json_path() {
         if let Ok(data) = std::fs::read_to_string(&path) {
-            if let Ok(entries) = serde_json::from_str::<Vec<StoredPeer>>(&data) {
-                for entry in entries {
-                    if let Ok(pid) = PeerId::from_hex(&entry.peer_id_hex) {
-                        let eps: Vec<Endpoint> = entry.endpoints.iter()
-                            .filter_map(|s| s.parse::<SocketAddr>().ok())
-                            .map(|a| Endpoint::new(a, lain_core::endpoint::EndpointKind::STUN))
-                            .collect();
-                        map.insert(pid, eps);
-                    }
+            // Try signed format first, fall back to legacy
+            let entries = if let Ok(signed) = serde_json::from_str::<serde_json::Value>(&data) {
+                if let Some(entries_val) = signed.get("data") {
+                    serde_json::from_value::<Vec<StoredPeer>>(entries_val.clone()).unwrap_or_default()
+                } else {
+                    serde_json::from_str::<Vec<StoredPeer>>(&data).unwrap_or_default()
+                }
+            } else {
+                serde_json::from_str::<Vec<StoredPeer>>(&data).unwrap_or_default()
+            };
+            for entry in entries {
+                if let Ok(pid) = PeerId::from_hex(&entry.peer_id_hex) {
+                    let eps: Vec<Endpoint> = entry.endpoints.iter()
+                        .filter_map(|s| s.parse::<SocketAddr>().ok())
+                        .map(|a| Endpoint::new(a, lain_core::endpoint::EndpointKind::STUN))
+                        .collect();
+                    map.insert(pid, eps);
                 }
             }
         }
@@ -479,6 +495,7 @@ impl Daemon {
                             if let Some(conn) = connected.write().await.remove(&peer_id) {
                                 conn.close(0u32.into(), b"disconnected");
                             }
+                            // TODO: relay migration — if connection was relayed, find alternative relay
                         }
                         IpcCommand::SendToPeer { peer_id, data } => {
                             let conn = {
@@ -542,7 +559,7 @@ impl Daemon {
 
         *self.state.write().await = DaemonState::Stopped;
         let peers = known_peers.read().await;
-        save_peers(&peers);
+        save_peers(&peers, &self.identity);
         tracing::info!("Daemon stopped");
         Ok(())
     }

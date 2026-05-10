@@ -256,8 +256,25 @@ impl Transport {
         Ok(conn)
     }
 
+    /// NAT Rebinding: QUIC Connection ID 自动处理路径迁移。
+    /// 保活 PING 减少 NAT 映射过期。
+    pub fn spawn_keepalive(conn: quinn::Connection, interval_secs: u64) {
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(
+                std::time::Duration::from_secs(interval_secs),
+            );
+            loop {
+                interval.tick().await;
+                if let Ok((mut send, _)) = conn.open_bi().await {
+                    let msg = frame::encode_frame(1, FrameType::Ping, &[]);
+                    if send.write_all(&msg).await.is_err() { break; }
+                    let _ = send.finish();
+                }
+            }
+        });
+    }
+
     /// 接受原始 QUIC 连接（包含 Noise IK + HEADERS）
-    /// 用于 UDP 被封锁时通过 HTTP Upgrade 建立连接
     pub async fn start_ws_listener(&self, bind_addr: SocketAddr) -> Result<u16, TransportError> {
         let listener = tokio::net::TcpListener::bind(bind_addr)
             .await
