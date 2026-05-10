@@ -448,7 +448,7 @@ impl Daemon {
 
                 Some(cmd) = ipc_cmd_rx.recv() => {
                     match cmd {
-                        IpcCommand::ConnectPeer { invite, .. } => {
+                        IpcCommand::ConnectPeer { invite, peer_id: _unverified_id } => {
                             tracing::info!("IPC: connect via {invite}");
                             let code = invite
                                 .strip_prefix("lain://")

@@ -304,6 +304,7 @@ impl DhtHandle {
         if !msg.is_response {
             if let Some(ref sig) = msg.signature {
                 if sig.iter().any(|&b| b != 0) {
+                    if data.len() < 64 { return Ok(()); } // too short to have a real signature
                     let body = &data[..data.len().saturating_sub(64)];
                     let records = self.peer_records.read().await;
                     if let Some(rec) = records.get(&msg.sender_id) {
