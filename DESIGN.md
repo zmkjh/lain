@@ -1456,43 +1456,55 @@ Lain 的核心能力：**在两个设备之间建立加密字节流，不需要�
 
 ---
 
-### 19.1 用户视角：三台设备组网
+### 19.1 用户视角：多网络并存
 
-**场景**：你有一台笔记本、一部手机、一台 NAS，想在家和外出时互相访问。
+**场景**：笔记本、手机、NAS 组成"家庭"网络；笔记本还能加入同事的"团队"网络。两个网络互不干扰。
 
 ```
 笔记本$ lain daemon
-  INFO  identity loaded, peer_id=b3f1...
-  INFO  QUIC on 0.0.0.0:41231
-  INFO  NAT: Cone, IPv6: inbound open
-  INFO  IPC ready on ~/.lain/socket + 127.0.0.1:9177
+  INFO  identity=b3f1..., IPv6 inbound open, NAT Cone
 
+# ── 家庭网络 ──
 笔记本$ lain invite generate
-  invite: lain://3KqWx7...  ← 把这个发给其他设备
-```
+  invite: lain://3KqWx7...          ← 发到家庭群
 
-手机和 NAS 收到 invite 链接后：
-
-```
-手机$ lain daemon                    # 只需一次，之后开机自启
 手机$ lain invite accept lain://3KqWx7...
-  INFO  joined network f8a2..., 2 peers online
+  INFO  network f8a2...  2 peers    ← 手机 + 笔记本
 
-NAS$   lain daemon
-NAS$   lain invite accept lain://3KqWx7...
-  INFO  joined network f8a2..., 3 peers online
+NAS$ lain invite accept lain://3KqWx7...
+  INFO  network f8a2...  3 peers    ← NAS + 手机 + 笔记本
+
+# ── 团队网络（另一群人的 secret）──
+笔记本$ lain invite accept lain://7mZpL2...
+  INFO  network 9c1d...  4 peers    ← 同事的 invite
+
+笔记本$ lain network list
+  f8a2...  (家庭)  3 peers  joined
+  9c1d...  (团队)  4 peers  joined
+
+笔记本$ lain network peers f8a2...
+  d7e4...  (手机)  direct_quic,  12ms
+  a1c2...  (NAS)   relayed,      28ms
+
+笔记本$ lain network peers 9c1d...
+  x9b3...  (同事A) direct_quic,  8ms
+  y2k7...  (同事B) direct_quic,  15ms
+  z4m1...  (同事C) relayed,      35ms
 ```
 
-现在三台设备已互联。笔记本上查看：
+关键：手机和 NAS 看不到团队网络——他们没有那个 secret。同事看不到家庭网络——他们没有家庭网络的 secret。笔记本的两个网络完全隔离，daemon 内部各跑各的 DHT 路由表。
 
-```
-笔记本$ lain network peers my-net
-  b3f1...  (self)    direct_quic,  <1ms
-  d7e4...  (phone)   direct_quic,  12ms   ← 手机在同一 WiFi
-  a1c2...  (nas)     relayed,      28ms   ← NAS 在家，通过 relay
+应用通过 IPC 连接时指定 `network_id`：
+
+```python
+# 发文件给 NAS，走家庭网络
+rpc("peer.connect", {"network_id": "f8a2...", "peer_id": "a1c2..."})
+
+# 发消息给同事，走团队网络
+rpc("peer.connect", {"network_id": "9c1d...", "peer_id": "x9b3..."})
 ```
 
-手机离开家、切到蜂窝网络后连接自动迁移——用户无感知。NAS 的 relay 路径在后台持续探测直连，一旦可行就切换。
+同一个 daemon 进程，同一个 UDP 端口，靠 NetworkID 区分流量。
 
 ---
 
