@@ -344,6 +344,11 @@ impl DhtHandle {
             .collect())
     }
 
+    /// 获取当前路由表大小（用于判断是否需要 bootstrap）
+    pub async fn routing_table_size(&self) -> usize {
+        self.routing_table.read().await.size()
+    }
+
     /// 处理入站 DHT 消息，必要时通过 socket 回复
     pub async fn send_msg(&self, data: &[u8], addr: SocketAddr) {
         if let Err(e) = self.socket.send_to(data, addr).await {

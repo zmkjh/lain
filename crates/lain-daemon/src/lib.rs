@@ -19,6 +19,7 @@ use lain_nat::NatProbe;
 use lain_dht::DhtHandle;
 use lain_discovery::MdnsDiscovery;
 use lain_transport::{Transport, TransportConfig};
+use sha2::Digest;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use thiserror::Error;
@@ -193,8 +194,10 @@ impl Daemon {
         // 4. Bootstrap
         if !bootstrap_nodes.is_empty() {
             if let Err(e) = dht.bootstrap(&bootstrap_nodes).await {
-                tracing::warn!("initial bootstrap failed: {e}");
+                tracing::warn!("initial bootstrap failed: {}, trying mDNS fallback", e);
             }
+        } else {
+            tracing::info!("no bootstrap nodes configured, relying on mDNS LAN discovery");
         }
 
         // 5. STORE self
@@ -319,8 +322,16 @@ impl Daemon {
                                             if discovered_id != peer_id {
                                                 tracing::debug!("mDNS: {discovered_id} at {addr}");
                                                 let msg_id = rand::random::<u128>().to_be_bytes();
-                                let ping = lain_dht::message::encode_ping_request(peer_id, msg_id);
-                                dht_ref.send_msg(&ping, addr).await;
+                                                let ping = lain_dht::message::encode_ping_request(peer_id, msg_id);
+                                                dht_ref.send_msg(&ping, addr).await;
+                                                // Also use as bootstrap if routing table is sparse
+                                                if dht_ref.routing_table_size().await < 10 {
+                                                    let msg_id = rand::random::<u128>().to_be_bytes();
+                                                    let fn_req = lain_dht::message::encode_find_node_request(
+                                                        peer_id, msg_id, peer_id,
+                                                    );
+                                                    dht_ref.send_msg(&fn_req, addr).await;
+                                                }
                                             }
                                         }
                                     }
@@ -459,8 +470,17 @@ impl Daemon {
                             tracing::info!("IPC: connect via {invite}");
                             let code = invite
                                 .strip_prefix("lain://")
-                                .and_then(|c| lain_discovery::InviteCode::from_base62(c).ok());
+                                .and_then(|c| lain_discovery::InviteCode::from_base62(c).ok())
+                                .filter(|inv| {
+                                    let expected = PeerId(sha2::Sha256::digest(&inv.ed25519_pk).into());
+                                    expected == inv.peer_id
+                                });
                             if let Some(inv) = code {
+                                // Check if already connected
+                                if connected.read().await.contains_key(&inv.peer_id) {
+                                    tracing::info!("already connected to {}", inv.peer_id);
+                                    continue;
+                                }
                                 let mut peers = known_peers.write().await;
                                 peers.insert(inv.peer_id, inv.endpoints.clone());
                                 conn_mgr.add_peer(inv.peer_id).await;

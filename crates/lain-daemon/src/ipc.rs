@@ -268,6 +268,18 @@ async fn handle_http_client<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     writer.write_all(http.as_bytes()).await.ok();
 }
 
+fn send_or_warn(tx: &mpsc::Sender<IpcCommand>, cmd: IpcCommand, label: &str) {
+    match tx.try_send(cmd) {
+        Ok(()) => {}
+        Err(mpsc::error::TrySendError::Full(_)) => {
+            tracing::warn!("IPC {label} dropped (channel full)");
+        }
+        Err(mpsc::error::TrySendError::Closed(_)) => {
+            tracing::debug!("IPC {label} channel closed");
+        }
+    }
+}
+
 // ── Request dispatch ──
 
 async fn dispatch(
@@ -282,21 +294,21 @@ async fn dispatch(
 
     match req {
         IpcRequest::Connect { invite, .. } => {
-            let _ = cmd_tx.send(IpcCommand::ConnectPeer { peer_id: None, invite: invite.clone() }).await;
+            send_or_warn(cmd_tx, IpcCommand::ConnectPeer { peer_id: None, invite: invite.clone() }, "connect");
             IpcResponse::Ok { message: Some(format!("connecting: {invite}")), data: None }
         }
         IpcRequest::Disconnect { peer_id } => {
             if let Ok(pid) = PeerId::from_hex(&peer_id) {
-                let _ = cmd_tx.send(IpcCommand::DisconnectPeer { peer_id: pid }).await;
+                send_or_warn(cmd_tx, IpcCommand::DisconnectPeer { peer_id: pid }, "disconnect");
             }
             IpcResponse::Ok { message: Some("disconnecting".into()), data: None }
         }
         IpcRequest::Accept { connection_id } => {
-            let _ = cmd_tx.send(IpcCommand::AcceptConnection { connection_id }).await;
+            send_or_warn(cmd_tx, IpcCommand::AcceptConnection { connection_id }, "accept");
             IpcResponse::Ok { message: Some("accepted".into()), data: None }
         }
         IpcRequest::Reject { connection_id } => {
-            let _ = cmd_tx.send(IpcCommand::RejectConnection { connection_id }).await;
+            send_or_warn(cmd_tx, IpcCommand::RejectConnection { connection_id }, "reject");
             IpcResponse::Ok { message: Some("rejected".into()), data: None }
         }
         IpcRequest::ListPeers => {
@@ -312,12 +324,12 @@ async fn dispatch(
             IpcResponse::Ok { message: Some("subscribed".into()), data: None }
         }
         IpcRequest::Shutdown => {
-            let _ = cmd_tx.send(IpcCommand::Shutdown).await;
+            send_or_warn(cmd_tx, IpcCommand::Shutdown, "shutdown");
             IpcResponse::Ok { message: Some("shutting down".into()), data: None }
         }
         IpcRequest::Send { peer_id, data } => {
             if let Ok(pid) = PeerId::from_hex(&peer_id) {
-                let _ = cmd_tx.send(IpcCommand::SendToPeer { peer_id: pid, data }).await;
+                send_or_warn(cmd_tx, IpcCommand::SendToPeer { peer_id: pid, data }, "send");
             }
             IpcResponse::Ok { message: Some("sent".into()), data: None }
         }
