@@ -10,7 +10,7 @@ use crate::PeerRecord;
 
 /// Build a PING request message
 pub fn encode_ping_request(sender_id: PeerId, message_id: [u8; 16]) -> Vec<u8> {
-    encode_message(sender_id, message_id, DhtMsgType::Ping, false, &[])
+    encode_message(sender_id, message_id, DhtMsgType::Ping, false, &[], None)
 }
 
 /// Build a PING response with k-closest nodes
@@ -26,7 +26,7 @@ pub fn encode_ping_response(
         payload.extend_from_slice(&entry.node_id.0);
         encode_address(&mut payload, &entry.address);
     }
-    encode_message(sender_id, message_id, DhtMsgType::Ping, true, &payload)
+    encode_message(sender_id, message_id, DhtMsgType::Ping, true, &payload, None)
 }
 
 /// Build a STORE request
@@ -50,7 +50,7 @@ pub fn encode_store_request(
     payload.extend_from_slice(&val_len.to_be_bytes());
     payload.extend_from_slice(&endpoints_data);
 
-    encode_message(sender_id, rand_msg_id(), DhtMsgType::Store, false, &payload)
+    encode_message(sender_id, rand_msg_id(), DhtMsgType::Store, false, &payload, None)
 }
 
 /// Build a FIND_VALUE request
@@ -59,7 +59,7 @@ pub fn encode_find_value_request(
     message_id: [u8; 16],
     key: &[u8; 32],
 ) -> Vec<u8> {
-    encode_message(sender_id, message_id, DhtMsgType::FindValue, false, key)
+    encode_message(sender_id, message_id, DhtMsgType::FindValue, false, key, None)
 }
 
 /// Build a FIND_NODE request
@@ -68,7 +68,7 @@ pub fn encode_find_node_request(
     message_id: [u8; 16],
     target_id: PeerId,
 ) -> Vec<u8> {
-    encode_message(sender_id, message_id, DhtMsgType::FindNode, false, &target_id.0)
+    encode_message(sender_id, message_id, DhtMsgType::FindNode, false, &target_id.0, None)
 }
 
 /// Build a FIND_NODE response
@@ -84,7 +84,7 @@ pub fn encode_find_node_response(
         payload.extend_from_slice(&entry.node_id.0);
         encode_address(&mut payload, &entry.address);
     }
-    encode_message(sender_id, message_id, DhtMsgType::FindNode, true, &payload)
+    encode_message(sender_id, message_id, DhtMsgType::FindNode, true, &payload, None)
 }
 
 /// Encode a DHT message to wire format
@@ -94,8 +94,9 @@ fn encode_message(
     msg_type: DhtMsgType,
     is_response: bool,
     payload: &[u8],
+    signer: Option<&dyn Fn(&[u8]) -> [u8; 64]>,
 ) -> Vec<u8> {
-    let mut msg = Vec::with_capacity(83 + payload.len());
+    let mut msg = Vec::with_capacity(83 + payload.len() + 64);
     msg.push(PROTOCOL_VERSION);
     msg.extend_from_slice(&message_id);
     let type_byte = msg_type as u8 | if is_response { 0x80 } else { 0 };
@@ -106,11 +107,13 @@ fn encode_message(
     msg.push(((payload_len >> 16) & 0xFF) as u8);
     msg.push(((payload_len >> 8) & 0xFF) as u8);
     msg.push((payload_len & 0xFF) as u8);
-
     msg.extend_from_slice(payload);
 
-    // Placeholder signature (64 bytes of zero)
-    let sig = [0u8; 64];
+    let sig = if let Some(signer_fn) = signer {
+        signer_fn(&msg) // Sign everything before the signature field
+    } else {
+        [0u8; 64] // Placeholder for unsigned messages
+    };
     msg.extend_from_slice(&sig);
 
     msg
@@ -202,7 +205,7 @@ fn rand_msg_id() -> [u8; 16] {
 pub fn encode_store_ack(sender_id: PeerId, message_id: [u8; 16]) -> Vec<u8> {
     let mut payload = Vec::new();
     payload.push(0u8); // status = ok
-    encode_message(sender_id, message_id, DhtMsgType::Store, true, &payload)
+    encode_message(sender_id, message_id, DhtMsgType::Store, true, &payload, None)
 }
 
 /// FIND_VALUE response with record found
@@ -222,7 +225,7 @@ pub fn encode_find_value_response_with_record(
     let ep_len = ep_data.len() as u16;
     payload.extend_from_slice(&ep_len.to_be_bytes());
     payload.extend_from_slice(&ep_data);
-    encode_message(sender_id, message_id, DhtMsgType::FindValue, true, &payload)
+    encode_message(sender_id, message_id, DhtMsgType::FindValue, true, &payload, None)
 }
 
 /// FIND_VALUE response not found (return k-closest)
@@ -239,7 +242,7 @@ pub fn encode_find_value_response_not_found(
         payload.extend_from_slice(&entry.node_id.0);
         encode_address(&mut payload, &entry.address);
     }
-    encode_message(sender_id, message_id, DhtMsgType::FindValue, true, &payload)
+    encode_message(sender_id, message_id, DhtMsgType::FindValue, true, &payload, None)
 }
 
 /// ADDR_REFLECT response
@@ -250,7 +253,7 @@ pub fn encode_addr_reflect_response(
 ) -> Vec<u8> {
     let mut payload = Vec::new();
     encode_address(&mut payload, observed_addr);
-    encode_message(sender_id, message_id, DhtMsgType::AddrReflect, true, &payload)
+    encode_message(sender_id, message_id, DhtMsgType::AddrReflect, true, &payload, None)
 }
 
 /// RELAY_NEEDED response
@@ -266,7 +269,7 @@ pub fn encode_relay_needed_response(
         payload.extend_from_slice(&entry.node_id.0);
         encode_address(&mut payload, &entry.address);
     }
-    encode_message(sender_id, message_id, DhtMsgType::RelayNeeded, true, &payload)
+    encode_message(sender_id, message_id, DhtMsgType::RelayNeeded, true, &payload, None)
 }
 
 /// Parse node list from payload (common pattern in PING/FIND_NODE responses)

@@ -18,3 +18,5 @@ quinn.workspace = true
 rustls.workspace = true
 rcgen.workspace = true
 sha2.workspace = true
+tokio-tungstenite.workspace = true
+sha1_smol.workspace = true

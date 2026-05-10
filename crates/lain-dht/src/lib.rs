@@ -13,6 +13,7 @@ use lain_core::endpoint::Endpoint;
 use lain_core::peer::PeerId;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+use ed25519_dalek::Signer;
 use tokio::net::UdpSocket;
 use tokio::sync::{broadcast, RwLock};
 use tracing;
@@ -125,6 +126,22 @@ impl DhtHandle {
 
     pub fn subscribe_events(&self) -> broadcast::Receiver<CoreDhtEvent> {
         self.event_tx.subscribe()
+    }
+
+    /// 设置 Ed25519 签名密钥（32 字节 seed）
+    pub fn set_signer(&mut self, secret: [u8; 32]) {
+        self.signing_key = Some(secret);
+    }
+
+    /// 内部签名方法：有密钥则签名，无密钥则返回零占位
+    #[allow(dead_code)]
+    fn sign_data(&self, data: &[u8]) -> [u8; 64] {
+        if let Some(ref seed) = self.signing_key {
+            let signing_key = ed25519_dalek::SigningKey::from_bytes(seed);
+            signing_key.sign(data).to_bytes()
+        } else {
+            [0u8; 64]
+        }
     }
 
     pub fn socket(&self) -> Arc<UdpSocket> {

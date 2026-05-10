@@ -14,6 +14,7 @@ use lain_identity::Identity;
 use lain_nat::NatProbe;
 use lain_dht::DhtHandle;
 use lain_discovery::MdnsDiscovery;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use thiserror::Error;
 use tokio::sync::{mpsc, RwLock};
@@ -21,7 +22,55 @@ use std::sync::Arc;
 use std::path::PathBuf;
 use tracing;
 
+use std::net::SocketAddr;
 use self::ipc::{IpcCommand, IpcServer};
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+struct StoredPeer {
+    peer_id_hex: String,
+    pubkey_hex: String,
+    endpoints: Vec<String>,
+}
+
+fn peers_json_path() -> Option<PathBuf> {
+    dirs_home().map(|d| d.join(".lain").join("peers.json"))
+}
+
+fn save_peers(peers: &HashMap<PeerId, Vec<Endpoint>>) {
+    if let Some(path) = peers_json_path() {
+        let entries: Vec<StoredPeer> = peers.iter().map(|(pid, eps)| StoredPeer {
+            peer_id_hex: pid.to_hex(),
+            pubkey_hex: String::new(),
+            endpoints: eps.iter().map(|e| e.addr.to_string()).collect(),
+        }).collect();
+        if let Ok(json) = serde_json::to_string_pretty(&entries) {
+            if let Some(d) = path.parent() { std::fs::create_dir_all(d).ok(); }
+            let _ = std::fs::write(&path, json);
+            tracing::info!("saved {} peers to {}", entries.len(), path.display());
+        }
+    }
+}
+
+fn load_peers() -> HashMap<PeerId, Vec<Endpoint>> {
+    let mut map = HashMap::new();
+    if let Some(path) = peers_json_path() {
+        if let Ok(data) = std::fs::read_to_string(&path) {
+            if let Ok(entries) = serde_json::from_str::<Vec<StoredPeer>>(&data) {
+                for entry in entries {
+                    if let Ok(pid) = PeerId::from_hex(&entry.peer_id_hex) {
+                        let eps: Vec<Endpoint> = entry.endpoints.iter()
+                            .filter_map(|s| s.parse::<SocketAddr>().ok())
+                            .map(|a| Endpoint::new(a, lain_core::endpoint::EndpointKind::STUN))
+                            .collect();
+                        map.insert(pid, eps);
+                    }
+                }
+                tracing::info!("loaded {} peers from {}", map.len(), path.display());
+            }
+        }
+    }
+    map
+}
 
 pub use config::DaemonConfig;
 
@@ -204,7 +253,11 @@ impl Daemon {
 
         // Track known peers
         let known_peers: Arc<RwLock<HashMap<PeerId, Vec<Endpoint>>>> =
-            Arc::new(RwLock::new(HashMap::new()));
+            Arc::new(RwLock::new(load_peers()));
+
+        if !known_peers.read().await.is_empty() {
+            tracing::info!("restored {} known peers", known_peers.read().await.len());
+        }
 
         loop {
             tokio::select! {
@@ -290,6 +343,9 @@ impl Daemon {
         }
 
         *self.state.write().await = DaemonState::Stopped;
+        let peers = known_peers.read().await;
+        save_peers(&peers);
+        tracing::info!("Daemon stopped");
         Ok(())
     }
 
