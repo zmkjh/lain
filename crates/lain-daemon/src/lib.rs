@@ -14,6 +14,7 @@ use lain_identity::Identity;
 use lain_nat::NatProbe;
 use lain_dht::DhtHandle;
 use lain_discovery::MdnsDiscovery;
+use std::collections::HashMap;
 use thiserror::Error;
 use tokio::sync::{mpsc, RwLock};
 use std::sync::Arc;
@@ -140,7 +141,9 @@ impl Daemon {
                                         {
                                             if discovered_id != peer_id {
                                                 tracing::debug!("mDNS: {discovered_id} at {addr}");
-                                                dht_ref.handle_incoming(&[], addr).await.ok();
+                                                let msg_id = rand::random::<u128>().to_be_bytes();
+                                let ping = lain_dht::message::encode_ping_request(peer_id, msg_id);
+                                dht_ref.send_msg(&ping, addr).await;
                                             }
                                         }
                                     }
@@ -199,6 +202,10 @@ impl Daemon {
             std::time::Duration::from_secs(heartbeat_secs),
         );
 
+        // Track known peers
+        let known_peers: Arc<RwLock<HashMap<PeerId, Vec<Endpoint>>>> =
+            Arc::new(RwLock::new(HashMap::new()));
+
         loop {
             tokio::select! {
                 recv = socket.recv_from(&mut buf) => {
@@ -216,15 +223,54 @@ impl Daemon {
                     match cmd {
                         IpcCommand::ConnectPeer { invite, .. } => {
                             tracing::info!("IPC: connect via {invite}");
+                            // Parse invite to get PeerID and endpoints
+                            let code = invite
+                                .strip_prefix("lain://")
+                                .and_then(|c| lain_discovery::InviteCode::from_base62(c).ok());
+                            if let Some(inv) = code {
+                                let mut peers = known_peers.write().await;
+                                peers.insert(inv.peer_id, inv.endpoints.clone());
+                                tracing::info!("added peer {} ({} endpoints)",
+                                    inv.peer_id, inv.endpoints.len());
+                                // Initiate DHT lookup
+                                let dht = dht_arc.clone();
+                                let pid = inv.peer_id;
+                                tokio::spawn(async move {
+                                    if let Err(e) = dht.find_peer(&pid).await {
+                                        tracing::debug!("DHT find_peer({pid}): {e}");
+                                    }
+                                });
+                            } else {
+                                tracing::warn!("invalid invite: {invite}");
+                            }
                         }
                         IpcCommand::DisconnectPeer { peer_id } => {
                             tracing::info!("IPC: disconnect {peer_id}");
+                            known_peers.write().await.remove(&peer_id);
+                        }
+                        IpcCommand::SendToPeer { peer_id, data } => {
+                            tracing::info!("IPC: send {}b to {peer_id}", data.len());
+                            let peers = known_peers.read().await;
+                            if let Some(endpoints) = peers.get(&peer_id) {
+                                // Try each endpoint
+                                for ep in endpoints {
+                                    let msg = lain_core::frame::encode_frame(
+                                        2, lain_core::frame::FrameType::Data, &data,
+                                    );
+                                    let _ = socket.send_to(&msg, ep.addr).await;
+                                }
+                            }
+                        }
+                        IpcCommand::AcceptConnection { connection_id } => {
+                            tracing::info!("IPC: accept connection {connection_id}");
+                        }
+                        IpcCommand::RejectConnection { connection_id } => {
+                            tracing::info!("IPC: reject connection {connection_id}");
                         }
                         IpcCommand::Shutdown => {
                             tracing::info!("IPC: shutdown requested");
                             break;
                         }
-                        _ => {}
                     }
                 }
 

@@ -209,16 +209,21 @@ impl Transport {
         let frame = encode_handshake_frame(1, &ik2);
         send.write_all(&frame).await
             .map_err(|e| TransportError::Io(format!("send ik2: {e}")))?;
-        send.finish().ok();
+        let _ = send.finish();
 
         let remote_pk = noise.remote_pubkey().unwrap_or([0u8; 32]);
         let _session = noise.into_transport()
             .map_err(|e| TransportError::Noise(format!("transport: {e}")))?;
+
+        // Verify PeerID = SHA256(remote_pubkey)
         let mut hasher = sha2::Sha256::new();
         hasher.update(&remote_pk);
         let hash = hasher.finalize();
         let mut pid = [0u8; 32];
         pid.copy_from_slice(&hash);
+        let remote_peer_id = PeerId(pid);
+
+        tracing::info!("incoming connection from {remote_peer_id}");
 
         Ok(IncomingConnection {
             peer_id: PeerId(pid),

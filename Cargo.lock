@@ -772,6 +772,7 @@ dependencies = [
  "lain-identity",
  "lain-nat",
  "lain-transport",
+ "rand 0.8.6",
  "serde",
  "serde_json",
  "thiserror 2.0.18",

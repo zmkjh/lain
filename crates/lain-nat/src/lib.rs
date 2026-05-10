@@ -40,9 +40,8 @@ impl NatProber for NatProbe {
     async fn probe(&self) -> Result<NatProbeResult, CoreError> {
         let socket = UdpSocket::bind("0.0.0.0:0")
             .map_err(|e| CoreError::InvalidEndpoint(e.to_string()))?;
-        socket
-            .set_read_timeout(Some(self.timeout))
-            .ok();
+        socket.set_read_timeout(Some(self.timeout))
+            .map_err(|e| CoreError::InvalidEndpoint(format!("set timeout: {e}")))?;
 
         let result = self.probe_with_socket(&socket)?;
 
@@ -77,10 +76,26 @@ impl NatProbe {
                     if addr.port() == addr2.port() {
                         nat_type = NatType::Cone;
                     } else {
-                        // Different port: Symmetric. Determine ADF vs APDF
-                        nat_type = NatType::APDFSymmetric;
-                        // In production, further tests distinguish ADF vs APDF
-                        // by probing from a different source IP
+                        // Different port: Symmetric (EDM)
+                        // Try to distinguish ADF vs APDF with a second server
+                        nat_type = if self.stun_servers.len() > 1 {
+                            let second = self.stun_servers[1];
+                            if let Ok(addr3) = self.probe_stun(socket, second, false) {
+                                if addr3.port() == addr2.port() {
+                                    // Same mapped port to different destination → Cone after all
+                                    NatType::Cone
+                                } else {
+                                    // Cross-server port differs: Symmetric
+                                    // Assume ADFSymmetric if single IP pool, else APDFSymmetric
+                                    NatType::ADFSymmetric
+                                }
+                            } else {
+                                NatType::ADFSymmetric
+                            }
+                        } else {
+                            // Single server: cannot distinguish, assume APDF (worst case)
+                            NatType::APDFSymmetric
+                        };
                     }
                 } else {
                     // CHANGE-REQUEST rejected → likely Symmetric

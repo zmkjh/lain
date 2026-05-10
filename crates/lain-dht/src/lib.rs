@@ -17,7 +17,7 @@ use tokio::net::UdpSocket;
 use tokio::sync::{broadcast, RwLock};
 use tracing;
 
-mod message;
+pub mod message;
 mod routing;
 
 use self::routing::{BucketEntry, RoutingTable};
@@ -174,7 +174,7 @@ impl DhtHandle {
             endpoints,
         );
         for node in &closest {
-            let _ = self.socket.send_to(&msg, node.address).await;
+            self.send_msg(&msg, node.address).await;
         }
         // Save locally
         let record = PeerRecord {
@@ -208,7 +208,7 @@ impl DhtHandle {
         for node in &closest {
             let msg_id = rand::random::<u128>().to_be_bytes();
             let req = msg_codec::encode_find_value_request(self.peer_id, msg_id, &peer_id.0);
-            let _ = self.socket.send_to(&req, node.address).await;
+            self.send_msg(&req, node.address).await;
         }
         // Response comes via handle_incoming
         let records = self.peer_records.read().await;
@@ -268,6 +268,12 @@ impl DhtHandle {
     }
 
     /// 处理入站 DHT 消息，必要时通过 socket 回复
+    pub async fn send_msg(&self, data: &[u8], addr: SocketAddr) {
+        if let Err(e) = self.socket.send_to(data, addr).await {
+            tracing::debug!("DHT send to {addr}: {e}");
+        }
+    }
+
     pub async fn handle_incoming(&self, data: &[u8], src: SocketAddr) -> Result<(), DhtError> {
         let msg = msg_codec::decode_message(data)
             .ok_or_else(|| DhtError::Serialization("decode failed".into()))?;
@@ -296,7 +302,7 @@ impl DhtHandle {
                     rt.closest_nodes(&msg.sender_id, self.config.k)
                 };
                 let resp = msg_codec::encode_ping_response(self.peer_id, msg.message_id, &closest);
-                let _ = self.socket.send_to(&resp, src).await;
+                self.send_msg(&resp, src).await;
             }
             DhtMsgType::FindNode => {
                 if msg.payload.len() >= 32 {
@@ -306,7 +312,7 @@ impl DhtHandle {
                         rt.closest_nodes(&target, self.config.k)
                     };
                     let resp = msg_codec::encode_find_node_response(self.peer_id, msg.message_id, &closest);
-                    let _ = self.socket.send_to(&resp, src).await;
+                    self.send_msg(&resp, src).await;
                 }
             }
             DhtMsgType::Store => {
@@ -337,7 +343,7 @@ impl DhtHandle {
                 }
                 // ACK
                 let resp = msg_codec::encode_store_ack(self.peer_id, msg.message_id);
-                let _ = self.socket.send_to(&resp, src).await;
+                self.send_msg(&resp, src).await;
             }
             DhtMsgType::FindValue => {
                 if msg.payload.len() >= 32 {
@@ -351,7 +357,7 @@ impl DhtHandle {
                             let resp = msg_codec::encode_find_value_response_with_record(
                                 self.peer_id, msg.message_id, &rec,
                             );
-                            let _ = self.socket.send_to(&resp, src).await;
+                            self.send_msg(&resp, src).await;
                             return Ok(());
                         }
                     }
@@ -363,14 +369,14 @@ impl DhtHandle {
                     let resp = msg_codec::encode_find_value_response_not_found(
                         self.peer_id, msg.message_id, &closest,
                     );
-                    let _ = self.socket.send_to(&resp, src).await;
+                    self.send_msg(&resp, src).await;
                 }
             }
             DhtMsgType::AddrReflect => {
                 let resp = msg_codec::encode_addr_reflect_response(
                     self.peer_id, msg.message_id, &src,
                 );
-                let _ = self.socket.send_to(&resp, src).await;
+                self.send_msg(&resp, src).await;
             }
             DhtMsgType::RelayNeeded => {
                 let relays = {
@@ -383,7 +389,7 @@ impl DhtHandle {
                 let resp = msg_codec::encode_relay_needed_response(
                     self.peer_id, msg.message_id, &relays,
                 );
-                let _ = self.socket.send_to(&resp, src).await;
+                self.send_msg(&resp, src).await;
             }
             DhtMsgType::Error => {}
         }
