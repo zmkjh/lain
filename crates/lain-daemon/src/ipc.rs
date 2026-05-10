@@ -1,0 +1,351 @@
+#![deny(clippy::unwrap_used)]
+#![deny(clippy::expect_used)]
+#![deny(clippy::panic)]
+
+use lain_core::peer::PeerId;
+use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
+use thiserror::Error;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, AsyncRead, AsyncWrite};
+use tokio::sync::{broadcast, mpsc};
+use tracing;
+
+#[derive(Error, Debug)]
+pub enum IpcError {
+    #[error("listener error: {0}")]
+    Listener(String),
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(tag = "cmd")]
+pub enum IpcRequest {
+    Connect { peer_id: Option<String>, invite: String },
+    Disconnect { peer_id: String },
+    Accept { connection_id: u64 },
+    Reject { connection_id: u64 },
+    ListPeers,
+    GetInvite,
+    Whoami,
+    Subscribe,
+    Shutdown,
+    Send { peer_id: String, data: Vec<u8> },
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(tag = "type")]
+pub enum IpcResponse {
+    Ok {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        message: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        data: Option<serde_json::Value>,
+    },
+    Error { code: String, message: String },
+    Event {
+        event: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        peer_id: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        data: Option<serde_json::Value>,
+    },
+}
+
+pub enum IpcCommand {
+    ConnectPeer { peer_id: Option<PeerId>, invite: String },
+    DisconnectPeer { peer_id: PeerId },
+    AcceptConnection { connection_id: u64 },
+    RejectConnection { connection_id: u64 },
+    Shutdown,
+    SendToPeer { peer_id: PeerId, data: Vec<u8> },
+}
+
+pub struct IpcConfig {
+    pub uds_path: Option<PathBuf>,
+    pub http_addr: Option<std::net::SocketAddr>,
+}
+
+impl Default for IpcConfig {
+    fn default() -> Self { Self { uds_path: None, http_addr: None } }
+}
+
+pub struct IpcServer {
+    config: IpcConfig,
+    cmd_tx: mpsc::Sender<IpcCommand>,
+    event_tx: broadcast::Sender<IpcResponse>,
+    next_conn_id: u64,
+}
+
+impl IpcServer {
+    pub fn new(config: IpcConfig, cmd_tx: mpsc::Sender<IpcCommand>) -> Self {
+        let (event_tx, _) = broadcast::channel(256);
+        Self { config, cmd_tx, event_tx, next_conn_id: 1 }
+    }
+
+    pub fn event_sender(&self) -> broadcast::Sender<IpcResponse> {
+        self.event_tx.clone()
+    }
+
+    pub fn notify_incoming(&mut self, peer_id: PeerId) -> u64 {
+        let conn_id = self.next_conn_id;
+        self.next_conn_id = self.next_conn_id.wrapping_add(1);
+        self.event_tx.send(IpcResponse::Event {
+            event: "incoming_connection".into(),
+            peer_id: Some(peer_id.to_string()),
+            data: Some(serde_json::json!({"connection_id": conn_id})),
+        }).ok();
+        conn_id
+    }
+
+    pub async fn run(self) -> Result<(), IpcError> {
+        let mut tasks = Vec::new();
+
+        // Local IPC listener
+        if let Some(ref path) = self.config.uds_path {
+            let _ = std::fs::remove_file(path);
+            if let Some(p) = path.parent() { std::fs::create_dir_all(p).ok(); }
+            let listener = bind_local(path)
+                .map_err(|e| IpcError::Listener(e))?;
+            tracing::info!("IPC local on {:?}", path);
+
+            let tx = self.cmd_tx.clone();
+            let ev = self.event_tx.clone();
+            tasks.push(tokio::spawn(listen_local(listener, tx, ev)));
+        }
+
+        // HTTP server
+        if let Some(http_addr) = self.config.http_addr {
+            let listener = tokio::net::TcpListener::bind(http_addr).await
+                .map_err(|e| IpcError::Listener(format!("HTTP: {e}")))?;
+            tracing::info!("IPC HTTP on {http_addr}");
+            let tx = self.cmd_tx.clone();
+            let ev = self.event_tx.clone();
+            tasks.push(tokio::spawn(serve_http(listener, tx, ev)));
+        }
+
+        for t in tasks { let _ = t.await; }
+        Ok(())
+    }
+}
+
+// ── Platform-specific local listener ──
+
+#[cfg(unix)]
+fn bind_local(path: &std::path::Path) -> Result<tokio::net::UnixListener, String> {
+    tokio::net::UnixListener::bind(path).map_err(|e| format!("UDS bind: {e}"))
+}
+
+#[cfg(windows)]
+fn bind_local(_path: &std::path::Path) -> Result<std::path::PathBuf, String> {
+    Ok(std::path::PathBuf::from(r"\\.\pipe\lain"))
+}
+
+#[cfg(windows)]
+async fn listen_local(
+    pipe_path: std::path::PathBuf,
+    cmd_tx: mpsc::Sender<IpcCommand>,
+    ev_tx: broadcast::Sender<IpcResponse>,
+) {
+    use tokio::net::windows::named_pipe::ServerOptions;
+    let pipe_name = pipe_path.to_string_lossy().to_string();
+
+    loop {
+        let server = match ServerOptions::new().create(&pipe_name) {
+            Ok(s) => s,
+            Err(e) => { tracing::error!("NamedPipe create: {e}"); break; }
+        };
+
+        match server.connect().await {
+            Ok(()) => {
+                let (r, w) = tokio::io::split(server);
+                let tx = cmd_tx.clone();
+                let ev = ev_tx.clone();
+                tokio::spawn(handle_client(r, w, tx, ev));
+            }
+            Err(e) => { tracing::error!("NamedPipe connect: {e}"); break; }
+        }
+    }
+}
+
+#[cfg(unix)]
+async fn listen_local(
+    listener: tokio::net::UnixListener,
+    cmd_tx: mpsc::Sender<IpcCommand>,
+    ev_tx: broadcast::Sender<IpcResponse>,
+) {
+    loop {
+        match listener.accept().await {
+            Ok((stream, _)) => {
+                let (r, w) = tokio::io::split(stream);
+                let tx = cmd_tx.clone();
+                let ev = ev_tx.clone();
+                tokio::spawn(handle_client(r, w, tx, ev));
+            }
+            Err(e) => { tracing::error!("UDS accept: {e}"); break; }
+        }
+    }
+}
+
+// ── HTTP Server ──
+
+async fn serve_http(
+    listener: tokio::net::TcpListener,
+    cmd_tx: mpsc::Sender<IpcCommand>,
+    ev_tx: broadcast::Sender<IpcResponse>,
+) {
+    loop {
+        match listener.accept().await {
+            Ok((stream, _)) => {
+                let (r, w) = tokio::io::split(stream);
+                let tx = cmd_tx.clone();
+                let ev = ev_tx.clone();
+                tokio::spawn(handle_http_client(r, w, tx, ev));
+            }
+            Err(e) => { tracing::error!("HTTP accept: {e}"); break; }
+        }
+    }
+}
+
+// ── Client handlers ──
+
+async fn handle_client<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
+    reader: R,
+    mut writer: W,
+    cmd_tx: mpsc::Sender<IpcCommand>,
+    ev_tx: broadcast::Sender<IpcResponse>,
+) {
+    let mut buf = BufReader::new(reader);
+    let mut line = String::new();
+    loop {
+        line.clear();
+        match buf.read_line(&mut line).await {
+            Ok(0) => break,
+            Ok(_) => {
+                let resp = dispatch(&line, &cmd_tx, &ev_tx).await;
+                let mut json = serde_json::to_string(&resp).unwrap_or_default();
+                json.push('\n');
+                writer.write_all(json.as_bytes()).await.ok();
+            }
+            Err(_) => break,
+        }
+    }
+}
+
+async fn handle_http_client<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
+    reader: R,
+    mut writer: W,
+    cmd_tx: mpsc::Sender<IpcCommand>,
+    ev_tx: broadcast::Sender<IpcResponse>,
+) {
+    let mut buf = BufReader::new(reader);
+    let mut line = String::new();
+
+    line.clear();
+    if buf.read_line(&mut line).await.is_err() { return; }
+    let mut content_length = 0usize;
+    loop {
+        line.clear();
+        if buf.read_line(&mut line).await.is_err() { return; }
+        let t = line.trim().to_lowercase();
+        if t.is_empty() { break; }
+        if let Some(l) = t.strip_prefix("content-length:") {
+            content_length = l.trim().parse().unwrap_or(0);
+        }
+    }
+
+    let mut body = vec![0u8; content_length.min(65536)];
+    if content_length > 0 {
+        use tokio::io::AsyncReadExt;
+        if buf.read_exact(&mut body).await.is_err() { return; }
+    }
+
+    let req_str = String::from_utf8_lossy(&body);
+    let resp = dispatch(&req_str, &cmd_tx, &ev_tx).await;
+    let json = serde_json::to_string(&resp).unwrap_or_default();
+    let http = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+        json.len(), json
+    );
+    writer.write_all(http.as_bytes()).await.ok();
+}
+
+// ── Request dispatch ──
+
+async fn dispatch(
+    line: &str,
+    cmd_tx: &mpsc::Sender<IpcCommand>,
+    _ev_tx: &broadcast::Sender<IpcResponse>,
+) -> IpcResponse {
+    let req: IpcRequest = match serde_json::from_str(line.trim()) {
+        Ok(r) => r,
+        Err(e) => return IpcResponse::Error { code: "PARSE".into(), message: e.to_string() },
+    };
+
+    match req {
+        IpcRequest::Connect { invite, .. } => {
+            let _ = cmd_tx.send(IpcCommand::ConnectPeer { peer_id: None, invite: invite.clone() }).await;
+            IpcResponse::Ok { message: Some(format!("connecting: {invite}")), data: None }
+        }
+        IpcRequest::Disconnect { peer_id } => {
+            if let Ok(pid) = PeerId::from_hex(&peer_id) {
+                let _ = cmd_tx.send(IpcCommand::DisconnectPeer { peer_id: pid }).await;
+            }
+            IpcResponse::Ok { message: Some("disconnecting".into()), data: None }
+        }
+        IpcRequest::Accept { connection_id } => {
+            let _ = cmd_tx.send(IpcCommand::AcceptConnection { connection_id }).await;
+            IpcResponse::Ok { message: Some("accepted".into()), data: None }
+        }
+        IpcRequest::Reject { connection_id } => {
+            let _ = cmd_tx.send(IpcCommand::RejectConnection { connection_id }).await;
+            IpcResponse::Ok { message: Some("rejected".into()), data: None }
+        }
+        IpcRequest::ListPeers => {
+            IpcResponse::Ok { message: None, data: Some(serde_json::json!({"peers": []})) }
+        }
+        IpcRequest::GetInvite => {
+            IpcResponse::Ok { message: None, data: Some(serde_json::json!({"invite": "pending"})) }
+        }
+        IpcRequest::Whoami => {
+            IpcResponse::Ok { message: Some("unknown".into()), data: None }
+        }
+        IpcRequest::Subscribe => {
+            IpcResponse::Ok { message: Some("subscribed".into()), data: None }
+        }
+        IpcRequest::Shutdown => {
+            let _ = cmd_tx.send(IpcCommand::Shutdown).await;
+            IpcResponse::Ok { message: Some("shutting down".into()), data: None }
+        }
+        IpcRequest::Send { peer_id, data } => {
+            if let Ok(pid) = PeerId::from_hex(&peer_id) {
+                let _ = cmd_tx.send(IpcCommand::SendToPeer { peer_id: pid, data }).await;
+            }
+            IpcResponse::Ok { message: Some("sent".into()), data: None }
+        }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_serialize_connect() {
+        let r = IpcRequest::Connect { peer_id: None, invite: "lain://abc".into() };
+        let j = serde_json::to_string(&r).unwrap();
+        assert!(j.contains("abc"));
+    }
+
+    #[test]
+    fn test_deserialize_connect() {
+        let r: IpcRequest = serde_json::from_str(r#"{"cmd":"Connect","invite":"lain://x"}"#).unwrap();
+        match r { IpcRequest::Connect { invite, .. } => assert_eq!(invite, "lain://x"), _ => panic!() }
+    }
+
+    #[test]
+    fn test_response_ok() {
+        let r = IpcResponse::Ok { message: Some("ok".into()), data: None };
+        let j = serde_json::to_string(&r).unwrap();
+        assert!(j.contains("ok"));
+    }
+}

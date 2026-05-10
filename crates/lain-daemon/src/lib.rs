@@ -3,6 +3,7 @@
 #![deny(clippy::panic)]
 
 pub mod config;
+pub mod ipc;
 
 use lain_core::capabilities::Capabilities;
 use lain_core::endpoint::Endpoint;
@@ -13,9 +14,12 @@ use lain_identity::Identity;
 use lain_nat::NatProbe;
 use lain_dht::DhtHandle;
 use thiserror::Error;
-use tokio::sync::RwLock;
+use tokio::sync::{mpsc, RwLock};
 use std::sync::Arc;
+use std::path::PathBuf;
 use tracing;
+
+use self::ipc::{IpcCommand, IpcServer};
 
 pub use config::DaemonConfig;
 
@@ -121,7 +125,30 @@ impl Daemon {
         );
         tracing::info!("Invite: lain://{}", _invite.to_base62());
 
-        // 7. 启动 DHT 接收循环
+        // 7. 启动 IPC
+        let uds_path = self.config.ipc.uds_path.as_deref()
+            .map(PathBuf::from)
+            .or_else(|| dirs_home().map(|d| d.join(".lain").join("socket")));
+
+        tracing::info!("IPC ready at {:?}", uds_path);
+
+        let (ipc_cmd_tx, mut ipc_cmd_rx) = mpsc::channel::<IpcCommand>(256);
+        let ipc_server = IpcServer::new(ipc::IpcConfig {
+            uds_path: uds_path.clone(),
+            http_addr: self.config.ipc.http_addr,
+        }, ipc_cmd_tx);
+
+        let _ipc_ev_tx = ipc_server.event_sender();
+
+        tokio::spawn(async move {
+            if let Err(e) = ipc_server.run().await {
+                tracing::error!("IPC: {e}");
+            }
+        });
+
+        tracing::info!("IPC ready at {:?}", uds_path);
+
+        // 8. 启动 DHT + IPC 事件循环
         let socket = dht.socket();
         let dht_arc = Arc::new(dht);
         let dht_recv = dht_arc.clone();
@@ -137,12 +164,26 @@ impl Daemon {
                     match recv {
                         Ok((len, src)) => {
                             if let Err(e) = dht_recv.handle_incoming(&buf[..len], src).await {
-                                tracing::debug!("DHT recv error from {src}: {e}");
+                                tracing::debug!("DHT recv from {src}: {e}");
                             }
                         }
-                        Err(e) => {
-                            tracing::error!("UDP recv error: {e}");
+                        Err(e) => tracing::error!("UDP: {e}"),
+                    }
+                }
+
+                Some(cmd) = ipc_cmd_rx.recv() => {
+                    match cmd {
+                        IpcCommand::ConnectPeer { invite, .. } => {
+                            tracing::info!("IPC: connect via {invite}");
                         }
+                        IpcCommand::DisconnectPeer { peer_id } => {
+                            tracing::info!("IPC: disconnect {peer_id}");
+                        }
+                        IpcCommand::Shutdown => {
+                            tracing::info!("IPC: shutdown requested");
+                            break;
+                        }
+                        _ => {}
                     }
                 }
 
@@ -150,12 +191,12 @@ impl Daemon {
                     if let Err(e) = dht_arc.store_self(
                         &public_key, &endpoints, capabilities,
                     ).await {
-                        tracing::debug!("DHT heartbeat failed: {e}");
+                        tracing::debug!("DHT heartbeat: {e}");
                     }
                 }
 
                 _ = tokio::signal::ctrl_c() => {
-                    tracing::info!("Shutting down...");
+                    tracing::info!("SIGTERM, draining...");
                     break;
                 }
             }
@@ -168,4 +209,13 @@ impl Daemon {
     pub async fn state(&self) -> DaemonState {
         self.state.read().await.clone()
     }
+}
+
+fn dirs_home() -> Option<PathBuf> {
+    if let Ok(h) = std::env::var("LAIN_HOME") { return Some(PathBuf::from(h)); }
+    #[cfg(target_os = "windows")]
+    { if let Ok(p) = std::env::var("USERPROFILE") { return Some(PathBuf::from(p)); } }
+    #[cfg(not(target_os = "windows"))]
+    { if let Ok(h) = std::env::var("HOME") { return Some(PathBuf::from(h)); } }
+    None
 }

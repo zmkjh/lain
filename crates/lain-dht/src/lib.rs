@@ -7,9 +7,11 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use lain_core::capabilities::Capabilities;
-use lain_core::dht::{DhtMsgType, DhtEvent as CoreDhtEvent, NodeInfo};
+use lain_core::dht::{DhtMsgType, NodeInfo};
+use lain_core::dht::DhtEvent as CoreDhtEvent;
 use lain_core::endpoint::Endpoint;
 use lain_core::peer::PeerId;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::net::UdpSocket;
 use tokio::sync::{broadcast, RwLock};
@@ -81,6 +83,12 @@ pub struct DhtHandle {
     peer_records: Arc<RwLock<HashMap<PeerId, PeerRecord>>>,
     event_tx: broadcast::Sender<CoreDhtEvent>,
     socket: Arc<UdpSocket>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct RoutesEntry {
+    node_id_hex: String,
+    addr: String,
 }
 
 impl DhtHandle {
@@ -200,6 +208,49 @@ impl DhtHandle {
         // Response comes via handle_incoming
         let records = self.peer_records.read().await;
         Ok(records.get(peer_id).cloned().filter(|r| r.expires_at > std::time::Instant::now()))
+    }
+
+    /// 序列化路由表到文件
+    pub async fn save_routes(&self, path: &std::path::Path) -> Result<(), DhtError> {
+        let rt = self.routing_table.read().await;
+        let nodes: Vec<RoutesEntry> = rt.all_nodes().into_iter().map(|n| RoutesEntry {
+            node_id_hex: n.node_id.to_hex(),
+            addr: n.address.to_string(),
+        }).collect();
+        let data = serde_json::to_vec(&nodes)
+            .map_err(|e| DhtError::Serialization(e.to_string()))?;
+        std::fs::write(path, data)
+            .map_err(|e| DhtError::Network(e.to_string()))?;
+        tracing::info!("saved {} routes to {}", nodes.len(), path.display());
+        Ok(())
+    }
+
+    /// 从文件加载路由表
+    pub async fn load_routes(&self, path: &std::path::Path) -> Result<usize, DhtError> {
+        if !path.exists() {
+            return Ok(0);
+        }
+        let data = std::fs::read(path)
+            .map_err(|e| DhtError::Network(e.to_string()))?;
+        let entries: Vec<RoutesEntry> = serde_json::from_slice(&data)
+            .map_err(|e| DhtError::Serialization(e.to_string()))?;
+        let mut count = 0usize;
+        let mut rt = self.routing_table.write().await;
+        for entry in entries {
+            if let (Ok(peer_id), Ok(addr)) = (
+                PeerId::from_hex(&entry.node_id_hex),
+                entry.addr.parse::<SocketAddr>(),
+            ) {
+                rt.insert_or_update(BucketEntry {
+                    node_id: peer_id,
+                    address: addr,
+                    last_seen: std::time::Instant::now(),
+                });
+                count += 1;
+            }
+        }
+        tracing::info!("loaded {count} routes from {}", path.display());
+        Ok(count)
     }
 
     /// 查找 relay 候选
