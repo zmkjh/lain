@@ -232,16 +232,50 @@ impl Daemon {
                                     if let Some((_sid, ft, _len, hdr_len)) = frame::decode_frame_header(&buf[..n]) {
                                         if ft == FrameType::RelayConnect {
                                             let payload = &buf[hdr_len..hdr_len + (_len as usize).min(n - hdr_len)];
-                                            if payload.len() >= 32 {
-                                                let mut pid = [0u8; 32];
-                                                pid.copy_from_slice(&payload[..32]);
-                                                let target = PeerId(pid);
-                                                tracing::info!("relay: forward to {target}");
+                                            if payload.len() >= 64 {
+                                                let mut requester_bytes = [0u8; 32];
+                                                requester_bytes.copy_from_slice(&payload[..32]);
+                                                let requester = PeerId(requester_bytes);
+                                                let mut target_bytes = [0u8; 32];
+                                                target_bytes.copy_from_slice(&payload[32..64]);
+                                                let target = PeerId(target_bytes);
+                                                tracing::info!("relay: {requester} -> {target}");
                                                 if let Ok(Some(record)) = d.find_peer(&target).await {
-                                                    // TODO: relay migration — when pipe ends, reconnect via different relay
-                                                    let _ = t.handle_relay_request(
+                                                    let result = t.handle_relay_request(
                                                         c.clone(), target, record.pubkey, &record.endpoints,
                                                     ).await;
+                                                    // Relay pipe ended — attempt migration
+                                                    if result.is_err() {
+                                                        tracing::warn!("relay {requester}->{target} pipe broken, migrating");
+                                                        // Find alternative relay
+                                                        if let Ok(relays) = d.find_relays().await {
+                                                            for new_relay in relays {
+                                                                if new_relay.node_id == requester || new_relay.node_id == target {
+                                                                    continue;
+                                                                }
+                                                                // Re-establish: connect to new relay and forward
+                                                                if let Ok(Some(new_rec)) = d.find_peer(&new_relay.node_id).await {
+                                                                    if let Ok(new_conn) = t.connect_raw(
+                                                                        &new_rec.pubkey, &new_rec.endpoints,
+                                                                    ).await {
+                                                                        // Send RelayConnect to the new relay
+                                                                        let mut rl = Vec::with_capacity(64);
+                                                                        rl.extend_from_slice(&requester.0);
+                                                                        rl.extend_from_slice(&target.0);
+                                                                        let rl_frame = lain_core::frame::encode_frame(
+                                                                            1, lain_core::frame::FrameType::RelayConnect, &rl,
+                                                                        );
+                                                                        if let Ok((mut s, _)) = new_conn.open_bi().await {
+                                                                            let _ = s.write_all(&rl_frame).await;
+                                                                            let _ = s.finish();
+                                                                            tracing::info!("relay: re-established {requester}->{target} via {}", new_relay.node_id);
+                                                                            break;
+                                                                        }
+                                                                    }
+                                                                }
+                                                            }
+                                                        }
+                                                    }
                                                 }
                                             }
                                         }
