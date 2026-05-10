@@ -2,7 +2,9 @@
 
 Lain 是一个零服务器、零配置的 P2P 网络基础设施，以 daemon 形式在终端设备上运行。
 
-**理论基础**：见 `coverage-analysis.md` —— 在中国三大 ISP 异构 NAT 环境下，IPv6 + IPv4 STUN 打洞的组合覆盖率可达 97.8%。
+**核心理念**：让没有固定 IP 的设备也能像服务器一样被访问。PeerID 就是你的域名，DHT 就是 DNS，三层穿透就是端口映射——任何人知道你的 PeerID，就能在全球任何网络环境下找到你、连接你。
+
+**理论基础**：见 `coverage-analysis.md` —— 在中国三大 ISP 异构 NAT 环境下，IPv6 + IPv4 STUN 打洞 + P2P Relay 的组合覆盖率可达 ~100%。
 
 ---
 
