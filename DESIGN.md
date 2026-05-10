@@ -29,8 +29,7 @@ Lain 是一个零服务器、零配置的 P2P 网络基础设施，以 daemon �
 | 握手 | Noise_IK (1-RTT)，高于 QUIC 层，端到端加密 |
 | DHT | 基础 Kademlia，全局单一路由表 |
 | NAT 穿透 | IPv6 直连 → STUN 打洞 → P2P Relay（三层模型） |
-| 发现 | Invite（peer 身份介绍） |
-| 发现 | Invite（peer 身份介绍） |
+| 发现 | DHT 全局目录 + Invite（bootstrap / 快捷拨号） |
 
 ---
 
@@ -50,15 +49,15 @@ Lain 是一个零服务器、零配置的 P2P 网络基础设施，以 daemon �
 │                                                                 │
 │  ┌──────────────┐  ┌──────────────┐  ┌────────────────────┐    │
 │  │ NAT Traversal│  │  Stream Mux  │  │     IPC API        │    │
-│  │ STUN / IPv6  │  │ QUIC streams │  │ UDS (native 应用)  │    │
-│  │ Birthday     │  │ QUIC datagram│  │ HTTP/WS (浏览器)   │    │
-│  │ TSO / WS     │  │ Flow control │  │ 管控分离 + fd传递  │    │
+│  │ IPv6 → STUN  │  │ QUIC streams │  │ UDS (native 应用)  │    │
+│  │ → P2P Relay  │  │ QUIC datagram│  │ HTTP/WS (浏览器)   │    │
+│  │ (三层模型)    │  │ Flow control │  │ fd 传递 + 管控分离  │    │
 │  └──────────────┘  └──────────────┘  └────────────────────┘    │
 │                                                                 │
 │  ┌──────────────────────────────────────────────────────────┐   │
-│  │                    Kademlia DHT                           │   │
-│  │  Heartbeat STORE (150s) + Emergency UPDATE + Lazy FIND   │   │
-│  │  节点状态: LIVE → STALE → EXPIRED (基于相对 TTL)          │   │
+│  │                    Kademlia DHT (全局)                     │   │
+│  │  STORE (PeerID + pubkey + endpoints) + FIND_VALUE(P2P目录) │   │
+│  │  Heartbeat (150s) +  节点状态: LIVE → STALE → EXPIRED     │   │
 │  └──────────────────────────────────────────────────────────┘   │
 └─────────────────────────────────────────────────────────────────┘
 ```
