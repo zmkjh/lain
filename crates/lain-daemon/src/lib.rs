@@ -196,10 +196,8 @@ impl Daemon {
             let mut addrs = Vec::new();
             for host in &self.config.stun_servers {
                 match tokio::net::lookup_host(host).await {
-                    Ok(mut iter) => {
-                        if let Some(addr) = iter.next() {
-                            addrs.push(addr);
-                        }
+                    Ok(iter) => {
+                        for addr in iter { addrs.push(addr); }
                     }
                     Err(e) => tracing::debug!("STUN lookup {host}: {e}"),
                 }
