@@ -161,21 +161,43 @@ fn main() {
 }
 
 fn run_daemon(foreground: bool) {
+    if !foreground {
+        // Spawn as a separate process so the terminal is not blocked
+        let exe = std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("lain"));
+        match std::process::Command::new(&exe)
+            .arg("-f").arg("daemon")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn() {
+            Ok(_child) => {
+                // Let the daemon start first, then print info from IPC
+                std::thread::sleep(std::time::Duration::from_secs(2));
+                let socket_path = ipc_socket("");
+                match ipc_req(&socket_path, r#"{"cmd":"Whoami"}"#) {
+                    Some(v) => {
+                        let pid = v.get("message").and_then(|m| m.as_str()).unwrap_or("?");
+                        println!("Lain daemon started");
+                        println!("PeerID: {pid}");
+                        println!("Logs: ~/.lain/daemon.log");
+                    }
+                    None => eprintln!("daemon failed to start"),
+                }
+            }
+            Err(e) => eprintln!("cannot start daemon: {e}"),
+        }
+        return;
+    }
+
     let rt = tokio::runtime::Runtime::new().expect("tokio");
     rt.block_on(async {
         let config = lain_daemon::config::DaemonConfig::load_or_default().unwrap_or_default();
         match lain_daemon::Daemon::new(config).await {
             Ok(daemon) => {
                 let pid = daemon.peer_id();
-                // Always print PeerID to stdout
-                if !foreground {
-                    println!("Lain daemon started");
-                    println!("PeerID: {pid}");
-                    println!("Logs: ~/.lain/daemon.log");
-                }
                 if let Err(e) = daemon.run().await {
                     eprintln!("daemon error: {e}");
                 }
+                let _ = pid; // used in foreground mode for logging
             }
             Err(e) => eprintln!("daemon init failed: {e}"),
         }
