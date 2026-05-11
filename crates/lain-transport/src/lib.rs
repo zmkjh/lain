@@ -275,6 +275,7 @@ impl Transport {
     /// Returns raw TCP stream after Noise IK handshake.
     pub async fn ts_connect(
         &self,
+        _peer_id: &PeerId,
         noise_pubkey: &Ed25519PublicKey,
         tso_endpoints: &[SocketAddr],
     ) -> Result<(tokio::net::TcpStream, lain_noise::NoiseSession, SocketAddr), TransportError> {
@@ -284,51 +285,78 @@ impl Transport {
 
         // Race connect and accept simultaneously. Both sides must try at
         // the same time so TCP SYNs cross APDF filters. Whichever path
-        // wins first is used; both sides act as initiator for Noise IK.
+        // wins first is used.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(102);
-        let mut stream: Option<TcpStream> = None;
+        let mut stream: Option<(TcpStream, bool)> = None; // (stream, is_connect)
 
         'tso: loop {
             if std::time::Instant::now() >= deadline { break; }
-            // Try connecting to all endpoints
             for ep in tso_endpoints {
                 match tokio::time::timeout(
                     std::time::Duration::from_millis(200), TcpStream::connect(*ep)
                 ).await {
-                    Ok(Ok(s)) => { stream = Some(s); break 'tso; }
+                    Ok(Ok(s)) => { stream = Some((s, true)); break 'tso; }
                     _ => {}
                 }
             }
-            // Try accepting
             match tokio::time::timeout(
                 std::time::Duration::from_millis(200), listener.accept()
             ).await {
-                Ok(Ok((s, _))) => { stream = Some(s); break 'tso; }
+                Ok(Ok((s, _))) => { stream = Some((s, false)); break 'tso; }
                 _ => {}
             }
             tokio::time::sleep(std::time::Duration::from_millis(300)).await;
         }
 
-        let mut stream = stream
+        let (mut stream, _we_connected) = stream
             .ok_or_else(|| TransportError::Connect("TSO timeout".into()))?;
 
         tracing::info!("TSO established");
-        // Both sides act as initiator — Noise IK handles role assignment
-        let mut noise = NoiseHandshake::new_initiator(&self.noise_secret, noise_pubkey)
-            .map_err(|e| TransportError::Noise(format!("TSO init: {e}")))?;
-        let ik1 = noise.write_message(&[])
-            .map_err(|e| TransportError::Noise(format!("TSO ik1: {e}")))?;
+        // Exchange PeerIDs to determine Noise IK role (lower PeerID = initiator)
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        stream.write_all(&encode_handshake_frame(0, &ik1)).await
-            .map_err(|e| TransportError::Io(format!("TSO send: {e}")))?;
-        let mut buf = vec![0u8; 4096];
-        let n = stream.read(&mut buf).await
-            .map_err(|e| TransportError::Io(format!("TSO recv: {e}")))?;
-        let header = parse_frame_header(&buf[..n])
-            .map_err(|e| TransportError::Noise(format!("TSO parse: {e}")))?;
-        let payload = &buf[8..8 + header.payload_len.min(n - 8)];
-        noise.read_message(payload)
-            .map_err(|e| TransportError::Noise(format!("TSO ik2: {e}")))?;
+        stream.write_all(&self.peer_id.0).await
+            .map_err(|e| TransportError::Io(format!("TSO send id: {e}")))?;
+        let mut their_id_bytes = vec![0u8; 32];
+        stream.read_exact(&mut their_id_bytes).await
+            .map_err(|e| TransportError::Io(format!("TSO recv id: {e}")))?;
+        let their_id = PeerId(their_id_bytes.try_into().unwrap_or([0u8; 32]));
+        let we_are_initiator = self.peer_id.0 < their_id.0;
+
+        let mut noise = if we_are_initiator {
+            NoiseHandshake::new_initiator(&self.noise_secret, noise_pubkey)
+                .map_err(|e| TransportError::Noise(format!("TSO init: {e}")))?
+        } else {
+            NoiseHandshake::new_responder(&self.noise_secret)
+                .map_err(|e| TransportError::Noise(format!("TSO resp: {e}")))?
+        };
+
+        if we_are_initiator {
+            let ik1 = noise.write_message(&[])
+                .map_err(|e| TransportError::Noise(format!("TSO ik1: {e}")))?;
+            stream.write_all(&encode_handshake_frame(0, &ik1)).await
+                .map_err(|e| TransportError::Io(format!("TSO send ik1: {e}")))?;
+            let mut buf = vec![0u8; 4096];
+            let n = stream.read(&mut buf).await
+                .map_err(|e| TransportError::Io(format!("TSO recv ik2: {e}")))?;
+            let header = parse_frame_header(&buf[..n])
+                .map_err(|e| TransportError::Noise(format!("TSO parse: {e}")))?;
+            let payload = &buf[8..8 + header.payload_len.min(n - 8)];
+            noise.read_message(payload)
+                .map_err(|e| TransportError::Noise(format!("TSO ik2: {e}")))?;
+        } else {
+            let mut buf = vec![0u8; 4096];
+            let n = stream.read(&mut buf).await
+                .map_err(|e| TransportError::Io(format!("TSO recv ik1: {e}")))?;
+            let header = parse_frame_header(&buf[..n])
+                .map_err(|e| TransportError::Noise(format!("TSO parse: {e}")))?;
+            let payload = &buf[8..8 + header.payload_len.min(n - 8)];
+            noise.read_message(payload)
+                .map_err(|e| TransportError::Noise(format!("TSO ik1 read: {e}")))?;
+            let ik2 = noise.write_message(&[])
+                .map_err(|e| TransportError::Noise(format!("TSO ik2: {e}")))?;
+            stream.write_all(&encode_handshake_frame(0, &ik2)).await
+                .map_err(|e| TransportError::Io(format!("TSO send ik2: {e}")))?;
+        }
         let session = noise.into_transport()
             .map_err(|e| TransportError::Noise(format!("TSO transport: {e}")))?;
         Ok((stream, session, "0.0.0.0:0".parse().unwrap()))

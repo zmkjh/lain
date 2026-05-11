@@ -775,7 +775,7 @@ impl Daemon {
                                                 .filter(|ep| ep.kind == lain_core::endpoint::EndpointKind::TSO)
                                                 .map(|ep| ep.addr).collect();
                                             if !tso_eps.is_empty() {
-                                                match t.ts_connect(&noise_pk, &tso_eps).await {
+                                                match t.ts_connect(&pid, &noise_pk, &tso_eps).await {
                                                     Ok((_stream, _session, _peer)) => {
                                                         let _ = ipc_ev.send(IpcResponse::Event {
                                                             event: "peer_connected".into(),
@@ -828,7 +828,7 @@ impl Daemon {
                                     .map(|e| e.addr)
                                     .collect();
                                 tokio::spawn(async move {
-                                    match t.ts_connect(&noise_pk, &tso_eps).await {
+                                    match t.ts_connect(&pid, &noise_pk, &tso_eps).await {
                                         Ok((_stream, _session, peer)) => {
                                             let _ = ipc_ev.send(IpcResponse::Event {
                                                 event: "peer_connected".into(),
@@ -908,7 +908,7 @@ impl Daemon {
                                                     // TSO fallback
                                                     let tso_eps: Vec<_> = eps.iter().filter(|ep| ep.kind == lain_core::endpoint::EndpointKind::TSO).map(|ep| ep.addr).collect();
                                                     if !tso_eps.is_empty() {
-                                                        match t.ts_connect(&npk, &tso_eps).await {
+                                                        match t.ts_connect(&pid, &npk, &tso_eps).await {
                                                             Ok((_stream, _session, _peer)) => {
                                                                 let _ = ipc_ev.send(IpcResponse::Event {
                                                                     event: "peer_connected".into(),
