@@ -102,8 +102,9 @@ fn default_idle() -> u64 { 30 }
 fn default_keepalive() -> u64 { 15 }
 fn default_stun_servers() -> Vec<String> {
     vec![
+        "stun.miwifi.com:3478".to_string(),
+        "stun.qq.com:3478".to_string(),
         "stun.l.google.com:19302".to_string(),
-        "stun1.l.google.com:19302".to_string(),
     ]
 }
 
