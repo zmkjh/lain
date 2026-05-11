@@ -126,8 +126,8 @@ pub struct Daemon {
 impl Daemon {
     pub async fn new(config: DaemonConfig) -> Result<Self, DaemonError> {
         // Check for existing daemon via IPC socket
-        if let Some(socket_path) = ipc_socket_path(&config) {
-            if ipc_socket_alive(&socket_path) {
+        if let Some(ref socket_path) = ipc_socket_path(&config) {
+            if ipc_socket_alive(socket_path) {
                 return Err(DaemonError::Config("daemon already running".into()));
             }
         }
@@ -845,18 +845,25 @@ impl Daemon {
 
 fn ipc_socket_path(config: &DaemonConfig) -> Option<PathBuf> {
     config.ipc.uds_path.as_ref().map(PathBuf::from)
-        .or_else(|| dirs_home().map(|d| d.join(".lain").join("socket")))
+        .or_else(|| {
+            #[cfg(windows)] { Some(PathBuf::from(r"\\.\pipe\lain")) }
+            #[cfg(unix)] { dirs_home().map(|d| d.join(".lain").join("socket")) }
+        })
 }
 
 fn ipc_socket_alive(path: &PathBuf) -> bool {
     #[cfg(unix)]
-    {
-        std::os::unix::net::UnixStream::connect(path).is_ok()
-    }
+    { std::os::unix::net::UnixStream::connect(path).is_ok() }
     #[cfg(windows)]
     {
-        // Try opening the named pipe — if it exists, daemon is running
-        std::fs::OpenOptions::new().read(true).write(true).open(path).is_ok()
+        // Try opening as client — succeeds only if a server is listening
+        use std::os::windows::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(0x40000000) // FILE_FLAG_OVERLAPPED for async pipe
+            .open(path)
+            .is_ok()
     }
 }
 

@@ -162,6 +162,12 @@ fn main() {
 
 fn run_daemon(foreground: bool) {
     if !foreground {
+        let socket_path = ipc_socket("");
+        // Check if daemon is already running before spawning
+        if ipc_req(&socket_path, r#"{"cmd":"Whoami"}"#).is_some() {
+            eprintln!("daemon is already running");
+            return;
+        }
         // Spawn as a separate process so the terminal is not blocked
         let exe = std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("lain"));
         match std::process::Command::new(&exe)
@@ -172,7 +178,6 @@ fn run_daemon(foreground: bool) {
             Ok(_child) => {
                 // Let the daemon start first, then print info from IPC
                 std::thread::sleep(std::time::Duration::from_secs(2));
-                let socket_path = ipc_socket("");
                 match ipc_req(&socket_path, r#"{"cmd":"Whoami"}"#) {
                     Some(v) => {
                         let pid = v.get("message").and_then(|m| m.as_str()).unwrap_or("?");
