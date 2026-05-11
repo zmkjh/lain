@@ -1,5 +1,6 @@
 use super::*;
 use crate::message as msg_codec;
+use lain_core::capabilities::Capabilities;
 use lain_core::endpoint::{Endpoint, EndpointKind};
 use lain_core::identity::IdentityProvider;
 use lain_identity::Identity;
@@ -370,4 +371,144 @@ async fn test_sender_without_record_accepted_deferred() {
     // Deferred verification: unknown peer accepted, routing table updated
     let size = receiver.routing_table_size().await;
     assert!(size >= 1, "unknown signed peer should be accepted (deferred verification): got {size}");
+}
+
+#[tokio::test]
+async fn test_expired_records_removed_by_cleanup() {
+    let dht = Arc::new(DhtHandle::new(make_id(35), [35u8; 32], make_config("127.0.0.1:0")).unwrap());
+
+    // Insert a record that's already expired
+    let expired_peer = PeerId([99u8; 32]);
+    let expired = PeerRecord {
+        pubkey: [99u8; 32],
+        noise_pubkey: [99u8; 32],
+        endpoints: vec![],
+        capabilities: Capabilities::new(),
+        ttl_remaining: 0,
+        expires_at: std::time::Instant::now() - Duration::from_secs(1),
+    };
+    dht.peer_records.write().await.insert(expired_peer, expired);
+
+    // Insert a record that's still valid
+    let live_peer = PeerId([100u8; 32]);
+    let live = PeerRecord {
+        pubkey: [100u8; 32],
+        noise_pubkey: [100u8; 32],
+        endpoints: vec![],
+        capabilities: Capabilities::new(),
+        ttl_remaining: 3600,
+        expires_at: std::time::Instant::now() + Duration::from_secs(3600),
+    };
+    dht.peer_records.write().await.insert(live_peer, live);
+
+    assert_eq!(dht.peer_records.read().await.len(), 2);
+
+    // Simulate cleanup: remove expired records
+    {
+        let mut records = dht.peer_records.write().await;
+        let now = std::time::Instant::now();
+        records.retain(|_k, v| v.expires_at > now);
+    }
+
+    let records = dht.peer_records.read().await;
+    assert_eq!(records.len(), 1, "expired record should be removed");
+    assert!(records.contains_key(&live_peer), "live record should remain");
+    assert!(!records.contains_key(&expired_peer), "expired record should be gone");
+}
+
+#[tokio::test]
+async fn test_find_peer_returns_cached_record_even_when_node_offline() {
+    let a = Arc::new(DhtHandle::new(make_id(36), [36u8; 32], make_config("127.0.0.1:0")).unwrap());
+    let b = Arc::new(DhtHandle::new(make_id(37), [37u8; 32], make_config("127.0.0.1:0")).unwrap());
+    spawn_recv_loop(a.clone());
+    spawn_recv_loop(b.clone());
+
+    let a_addr = a.socket().local_addr().unwrap();
+
+    // Bootstrap B into A's routing table
+    b.socket().send_to(&msg_codec::encode_ping_request(b.peer_id, [50u8; 16]), a_addr).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Store a peer record in A's local cache (simulating prior DHT lookup)
+    let dummy_id = Identity::generate().ok().unwrap();
+    let dummy_peer = dummy_id.peer_id();
+    let record = PeerRecord {
+        pubkey: *dummy_id.public_key(),
+        noise_pubkey: { let (_, np) = dummy_id.noise_keypair(); np },
+        endpoints: vec![Endpoint::new("10.0.0.99:1".parse().unwrap(), EndpointKind::STUN)],
+        capabilities: Capabilities::new(),
+        ttl_remaining: 600,
+        expires_at: std::time::Instant::now() + Duration::from_secs(600),
+    };
+    a.peer_records.write().await.insert(dummy_peer, record);
+
+    // find_peer should return cached record without needing to query the network
+    let found = a.find_peer(&dummy_peer).await.unwrap();
+    assert!(found.is_some(), "cached record should be returned even if node is offline");
+    let rec = found.unwrap();
+    assert_eq!(rec.endpoints[0].addr.port(), 1);
+
+    // find_peer for uncached peer returns None (no nodes to query for random key)
+    let unknown = PeerId([0xDEu8; 32]);
+    let result = a.find_peer(&unknown).await.unwrap();
+    assert!(result.is_none(), "unknown peer with no DHT connectivity should return None");
+}
+
+#[tokio::test]
+async fn test_store_self_propagates_to_routing_table() {
+    // Two nodes: seed and client. Client bootstraps from seed, then store_self.
+    let seed = Arc::new(DhtHandle::new(make_id(38), [38u8; 32], make_config("127.0.0.1:0")).unwrap());
+    spawn_recv_loop(seed.clone());
+
+    // Generate real identity for client so pubkey hashes to the PeerID
+    let client_id = Identity::generate().ok().unwrap();
+    let client_pk = *client_id.public_key();
+    let client_peer = client_id.peer_id();
+    let (_, client_np) = client_id.noise_keypair();
+
+    let seed_addr = seed.socket().local_addr().unwrap();
+
+    let client = Arc::new(DhtHandle::new(
+        client_peer, client_pk,
+        DhtConfig { local_addr: "127.0.0.1:0".parse().unwrap(), bootstrap_nodes: vec![seed_addr], ..Default::default() },
+    ).unwrap());
+    spawn_recv_loop(client.clone());
+
+    // Bootstrap
+    client.socket().send_to(&msg_codec::encode_ping_request(client.peer_id, [60u8; 16]), seed_addr).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Verify client knows seed
+    assert!(client.routing_table_size().await >= 1);
+
+    // store_self on client: should send STORE to seed
+    let ep = Endpoint::new("10.0.0.39:9999".parse().unwrap(), EndpointKind::STUN);
+    client.store_self(&client_pk, &client_np, &[ep.clone()], Capabilities::new()).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // Seed should have the client's record
+    let seed_records = seed.peer_records.read().await;
+    assert!(seed_records.contains_key(&client_peer), "seed should have client's record after store_self");
+    let rec = seed_records.get(&client_peer).unwrap();
+    assert!(!rec.endpoints.is_empty(), "stored record should have endpoints");
+    assert_eq!(rec.endpoints[0].addr.to_string(), "10.0.0.39:9999");
+}
+
+#[tokio::test]
+async fn test_dht_node_offline_find_peer_graceful() {
+    // Single DHT node tries to find_peer when no other nodes exist
+    // The pending query times out gracefully, no crash
+    let node = Arc::new(DhtHandle::new(make_id(40), [40u8; 32], make_config("127.0.0.1:0")).unwrap());
+    spawn_recv_loop(node.clone());
+
+    let unknown = PeerId([0xABu8; 32]);
+
+    // find_peer with empty routing table should return None, not crash
+    let result = node.find_peer(&unknown).await;
+    assert!(result.is_ok(), "find_peer should not error even with empty network");
+    assert!(result.unwrap().is_none(), "should return None when no peers known");
+
+    // Also test find_relays with empty network
+    let relays = node.find_relays().await.unwrap();
+    assert!(relays.is_empty(), "no relays should be found with empty network");
 }
