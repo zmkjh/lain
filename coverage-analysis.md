@@ -1,391 +1,276 @@
-# Feasibility of Infrastructure-Free Direct P2P Communication Across Chinese ISPs: A Coverage Analysis Under Heterogeneous NAT and IPv6 Constraints
+# 中国 ISP 异构 NAT 与 IPv6 约束下的无基础设施直连 P2P 覆盖率分析
 
-**Authors:** zmkjh
-
-**Affiliation:** njfu
-
-**Date:** May 2026
+**作者：** zmkjh  
+**机构：** 南京林业大学  
+**日期：** 2026 年 5 月
 
 ---
 
-## Abstract
+## 摘要
 
-The feasibility of infrastructure-free peer-to-peer (P2P) communication — without relay servers, fixed public-IP infrastructure nodes, or DHT supernodes — remains a critical yet underexplored problem in network stack design. This paper presents the first systematic coverage analysis of direct P2P connectivity across China's three major Internet Service Providers (ISPs): China Mobile, China Telecom, and China Unicom. We develop a theoretical model that decomposes the connectivity problem into an IPv4 NAT-compatibility layer and an IPv6 reachability layer, accounting for asymmetric initiation strategies that require only one peer to have inbound IPv6. Using the latest empirical data on NAT types (Cone, ADF Symmetric, APDF Symmetric) and IPv6 deployment rates (8.69 billion active users, 77% penetration as of December 2025), we construct a 7×7 ISP-NAT category matrix and derive a total direct connectivity probability of **98.35%** for random user pairs and **~99.7%** for technical early-adopter users. The remaining <2% gap is attributable to APDF Symmetric NAT pairs lacking IPv6, representing a mathematically provable hard boundary for direct connection — resolvable only through user-side IPv6 configuration or multi-hop overlay fallback. We provide rigorous proofs for each NAT-pair compatibility decision and discuss the implications for next-generation P2P library design.
+无基础设施的 P2P 直连通信——不依赖中继服务器、固定公网 IP 节点或 DHT 超级节点——是网络协议栈设计中一个关键但研究不足的问题。本文首次对中国三大运营商（移动、电信、联通）环境下的直接 P2P 连通性进行系统覆盖率分析。我们将连通性问题分解为 IPv4 NAT 兼容层和 IPv6 可达层，其中 IPv6 层明确区分了三种实际部署状态：全局单播地址可用、仅链路本地地址可用、完全不可用——后两种情况在国内家宽和移动网络中占很大比例。基于最新的 NAT 类型实证数据和 IPv6 部署统计（截至 2025 年 12 月，8.65 亿活跃 IPv6 用户，77% 普及率），我们构建了 7×7 ISP-NAT 类别矩阵，结合 IPv6 前缀不完整这一关键约束，得出随机用户配对直连成功概率约 97.8%。对于技术早期采用者群体，该概率接近 99.5%。剩余不可达场景集中于移动宽带 APDF 对称 NAT 且缺少全局 IPv6 地址的用户对，属于数学可证的直连硬边界，仅能通过用户侧 IPv6 配置或 P2P 多跳中继解决。本文为每个 NAT 配对的兼容性判定提供了严格证明，并讨论了 P2P 协议库设计的工程启示。
 
-**Keywords:** NAT traversal, P2P, IPv6, UDP hole punching, APDF, Symmetric NAT, China ISP, direct connectivity
-
----
-
-## 1. Introduction
-
-Peer-to-peer (P2P) communication allows devices to exchange data directly without centralized servers. In the idealized Internet model, any two devices with global IP addresses can communicate directly. In practice, Network Address Translation (NAT) devices, Carrier-Grade NAT (CGNAT), and stateful firewalls create significant barriers to direct connectivity.
-
-China presents a uniquely challenging yet illustrative environment for P2P connectivity analysis. With approximately 1.1 billion Internet users across three major ISPs, the country exhibits a heterogeneous mixture of NAT implementations (Cone, Address-Dependent Filtering Symmetric, and Address+Port-Dependent Filtering Symmetric) and varying levels of IPv6 deployment maturity. China also leads the world in IPv6 absolute deployment: as of September 2025, 865 million active IPv6 users accounted for 77% of all Chinese Internet users, with mobile network IPv6 traffic reaching 69% of total mobile traffic [1, 2].
-
-This paper investigates a specific question that, to the best of our knowledge, has not been systematically answered in the literature: **Given the heterogeneous NAT environments of Chinese ISPs and the constrained toolkit consisting only of STUN-based hole punching, port prediction, Birthday Attack, TCP Simultaneous Open, and IPv6 direct connection (with no relay servers, no DHT supernodes, and no fixed public-IP infrastructure), what percentage of arbitrary device pairs can achieve direct two-way communication?**
-
-We address this question through three contributions:
-
-1. **ISP-NAT classification**: We synthesize the latest community measurement data to classify each major Chinese ISP's broadband and cellular network into one of three NAT types: Cone (Endpoint-Independent Mapping), ADF Symmetric (Endpoint-Dependent Mapping with Address-Dependent Filtering), or APDF Symmetric (Endpoint-Dependent Mapping with Address+Port-Dependent Filtering).
-
-2. **Rigorous compatibility matrix**: We prove, for each possible NAT-type pair, whether direct IPv4 connectivity is theoretically possible using state-of-the-art traversal techniques.
-
-3. **Combined coverage model**: We model the joint probability of connectivity, incorporating both IPv4 NAT compatibility and IPv6 asymmetric reachability, and calculate the total addressable fraction of the Chinese Internet population.
-
-### 1.1 Prior Work
-
-UDP hole punching was first formalized by Ford et al. [3], who demonstrated that direct P2P connections were possible through a wide range of consumer NAT devices. Guha and Francis [4] later provided the first large-scale empirical characterization of NAT behavior. RFC 4787 [5] and RFC 5382 [6] standardized NAT behavioral requirements, recommending Endpoint-Independent Mapping (EIM) and Endpoint-Independent Filtering (EIF) as best practices. However, many CGNAT deployments in practice employ Endpoint-Dependent Mapping (EDM), commonly known as Symmetric NAT.
-
-Tailscale's Birthday Attack paper [7] described a probabilistic approach to traversing one-sided Symmetric NATs using K×K probe pairs (256×256 yielding ~64% success probability). libp2p's DCUtR specification [8] reported ~70% overall hole punch success in production across 4.4 million measurements.
-
-To our knowledge, no prior work has combined ISP-level NAT classification with IPv6 deployment data to compute holistic P2P coverage for a specific national Internet environment.
+**关键词：** NAT 穿透，P2P，IPv6 前缀分配，UDP 打洞，APDF，对称 NAT，中国 ISP，直连覆盖率
 
 ---
 
-## 2. Background and Definitions
+## 1. 导言
 
-### 2.1 NAT Classification
+P2P 通信允许设备在不依赖中心服务器的情况下直接交换数据。在理想化的互联网模型中，任意两台有全球地址的设备之间可以直连。实际环境中，NAT 设备、运营商级 NAT（CGNAT）、有状态防火墙构成了直连通信的主要障碍。
 
-Following RFC 4787, we classify NATs along two independent dimensions:
+中国为 P2P 连通性分析提供了一个独特且具说明性的环境。约 11 亿互联网用户分布在三大运营商之间，NAT 实现呈现异构混合（Cone、ADF 对称、APDF 对称），IPv6 部署成熟度参差不齐。中国在 IPv6 绝对部署规模上世界领先：截至 2025 年 9 月，8.65 亿活跃 IPv6 用户占中国网民 77%，移动网络 IPv6 流量达总移动流量的 69% [1,2]。
 
-**Mapping behavior** (how the NAT assigns external ports):
-- **Endpoint-Independent Mapping (EIM)**: The same external port is reused for all destinations (Cone NATs).
-- **Endpoint-Dependent Mapping (EDM)**: A different external port is assigned for each unique destination (Symmetric NATs).
+然而，**"IPv6 已部署"和"IPv6 可用于 P2P"之间存在巨大鸿沟**。运营商通常只为家宽用户分配 /64 前缀，但 CPE（光猫/路由器）默认防火墙策略拦截所有入站 IPv6 连接；部分省份移动宽带甚至不分配全局单播地址，仅提供链路本地地址（fe80::/10），导致 `ipv6_inbound` 检测为真而实际无公网 IPv6 可达性。移动蜂窝网络（4G/5G）中，核心网 ACL 策略广泛拦截入站 IPv6，仅允许出站连接。本文的覆盖模型明确区分了这些部署状态，而非简单地将"IPv6 可用"等同于"IPv6 可用于直连 P2P"。
 
-**Filtering behavior** (what inbound traffic the NAT allows):
-- **Endpoint-Independent Filtering (EIF)**: Any external host can send to the mapped port.
-- **Address-Dependent Filtering (ADF)**: Only hosts whose IP address matches a previously-contacted destination can send.
-- **Address and Port-Dependent Filtering (APDF)**: Only hosts whose IP and port match a previously-contacted destination can send.
+本文研究的核心问题是文献中尚未被系统回答的：**仅使用 STUN 打洞、端口预测、Birthday Attack、TCP Simultaneous Open 和 IPv6 直连（无中继服务器、无 DHT 超级节点、无固定公网 IP 基础设施），任意设备对之间实现双向直连的概率是多少？**
 
-We use the following three-category classification for this paper:
+我们通过三个贡献回答这个问题：
 
-| Notation | Name | Mapping | Filtering |
-|----------|------|---------|-----------|
-| C | Cone | EIM | EIF or ADF or APDF |
-| S_ADF | ADF Symmetric | EDM | ADF |
-| S_APDF | APDF Symmetric | EDM | APDF |
-
-The distinction between S_ADF and S_APDF is critical: both are "Symmetric" in the traditional taxonomy, but their traversal properties differ fundamentally.
-
-### 2.2 Traversal Technique Taxonomy
-
-We consider the following allowed techniques:
-
-1. **STUN-based UDP hole punch** [9]: Both peers contact a STUN server to discover their external addresses. Via an out-of-band signaling channel (invite channel), they exchange addresses and send UDP probes simultaneously to each other. Creates bidirectional NAT state entries allowing subsequent communication.
-
-2. **TCP Simultaneous Open (TSO) with wide time window**: Both peers send TCP SYN packets to each other simultaneously. The SYNs establish stateful NAT entries that allow the TCP three-way handshake to complete bidirectionally. A "wide" time window (seconds rather than milliseconds) is used to avoid timing sensitivity.
-
-3. **Birthday Attack with relay-mediated coordination**: Peers open K sockets each (K typically 16-256), discover their mapped ports via STUN, and exchange the full port list via a pre-established relay connection (which serves only as a signaling channel). Each peer then sends probes from all K sockets to all K addresses of the other peer. Without relay coordination, the Birthday Attack is limited to a single-round attempt using the port set included in the initial invite code.
-
-4. **IPv6 direct connection**: One peer acts as client (initiator) and the other as server (listener), using globally routable IPv6 addresses. Stateful firewalls, when present, are modeled as ADF (IP-only filtering), enabling connectivity as long as at least one peer's network allows inbound IPv6.
-
-**Explicitly excluded** are: TURN relays, multi-hop overlay forwarding, DHT supernodes with fixed public IPv4 addresses, and any dedicated infrastructure servers beyond external STUN endpoints. Note: relay-mediated Birthday Attack coordination (using a peer-to-peer relay node within the overlay network, not a dedicated server) is included as it constitutes a signaling-only use of an existing P2P connection rather than infrastructure dependency.
-
-### 2.3 Assumptions and Scope Boundaries
-
-Our analysis is built on the following explicit assumptions:
-
-**A1 (STUN Availability)**: Externally accessible STUN servers exist and are reachable by both peers. We assume neither the STUN protocol nor the specific servers are blocked by ISPs. In the Chinese context, we prioritize domestically-hosted STUN servers (miwifi.com, qq.com) to mitigate GFW-related interference.
-
-**A2 (Out-of-Band Signaling)**: An initial signaling channel (referred to as the "invite channel") exists between the two peers, allowing them to exchange a one-time message containing their discovered addresses, capability declarations, and port hints. This channel is assumed available at the start of the connection attempt but is not required to persist beyond the initial exchange. In practice, this corresponds to a user-shared invite code via instant messaging, QR code, or `lain://` URI.
-
-**A3 (UDP Reachability)**: Unless explicitly stated otherwise (e.g., Step 5 WebSocket fallback), UDP traffic between peers can traverse their respective ISP networks. We do not model ISP-level UDP blocking within China's domestic network, as such blocking between domestic ISPs is rare.
-
-**A4 (Homogeneous ISP Classification)**: Peers are classified into discrete categories based on their ISP and access type. Intra-category NAT behavior is assumed homogeneous. Real-world variation within a category (e.g., regional differences in Unicom's CGNAT policy) is discussed in §7.4 Limitations.
-
-**A5 (Independence)**: IPv6 reachability and IPv4 NAT type are treated as independent random variables. This is reasonable since IPv6 deployment and IPv4 CGNAT policy are managed by separate teams within ISPs and evolve on different timelines.
-
-**A6 (Traversal Technique Competence)**: The P2P stack correctly implements all allowed traversal techniques, including proper use of unconnected UDP sockets (required for asymmetric routing in Cone × S_APDF traversal) and STUN CHANGE-REQUEST for NAT behavior characterization.
+1. **ISP-NAT 分类**：综合最新社区测量数据，将三大运营商宽带和蜂窝网络的 NAT 行为分类为 Cone、ADF 对称、APDF 对称三种类型。
+2. **严格的兼容性矩阵**：对每一对 NAT 类型，从数学上证明使用最优穿透技术时 IPv4 直连是否可能。
+3. **联合覆盖模型**：将 IPv4 NAT 兼容性和 IPv6 非对称可达性联合建模，引入"前缀不完整"作为独立变量，计算中国互联网总人口中可直连的比例。
 
 ---
 
-## 3. Chinese ISP NAT and IPv6 Landscape
+## 2. 背景与定义
 
-### 3.1 Data Sources
+### 2.1 NAT 分类
 
-Our ISP classification draws on multiple data sources:
+遵循 RFC 4787，我们从两个独立维度对 NAT 分类：
 
-- National IPv6 Development Monitoring Platform official statistics (as of Q3-Q4 2025) [1, 2]
-- APNIC Labs AS-level IPv6 capability data [10]
-- IPv6-test.com crowdsourced measurements [11]
-- V2EX community reports on IPv6 inbound reachability [12]
-- CSDN WebRTC STUN penetration test results [13]
-- Third-party STUN-based NAT classification tool results [14]
+**映射行为**（NAT 如何分配外部端口）：
+- **端点无关映射（EIM）**：同一外部端口对所有目标地址复用（Cone NAT）。
+- **端点相关映射（EDM）**：对每个不同目标地址分配不同外部端口（对称 NAT）。
 
-Table 1 summarizes the classification for each ISP network type.
+**过滤行为**（NAT 允许哪些入站流量）：
+- **端点无关过滤（EIF）**：任意外部主机可向映射端口发送。
+- **地址相关过滤（ADF）**：仅 IP 地址匹配已联系目标的主机可发送。
+- **地址及端口相关过滤（APDF）**：仅 IP 和端口同时匹配已联系目标的主机可发送。
 
-**Table 1: Chinese ISP NAT and IPv6 Classification**
+本文使用的三类符号：
 
-| Category | Users (est.) | IPv4 Mapping | IPv4 Filtering | IPv6 Available? | IPv6 Inbound Reachable? |
-|----------|-------------|-------------|---------------|-----------------|------------------------|
-| A: CM Broadband | ~329M | EDM (Symmetric) | **APDF** (NAT4) | Yes | 80% (CPE FW configurable) |
-| B: CM 4G/5G | ~250M | EDM (Symmetric) | **ADF** | Yes | 30% (core network blocks; inter-op partially works) |
-| C: Telecom Broadband | ~200M | EIM (Cone) | APDF/EIF | Yes | 95% |
-| D: Telecom 4G/5G | ~150M | EIM (Restricted Cone) | APDF | Yes | 90% |
-| E: Unicom Broadband | ~120M | Mixed Cone/EDM | Mixed | Yes | 70% (regional variation) |
-| F: Unicom 4G/5G | ~100M | EDM (Symmetric) | Mixed | Yes | 30% (5G SA blocks; inter-op partially works) |
-| G: Other / Edge | ~200M | Mostly Cone | EIF/ADF | Varies | 60% |
+| 符号 | 名称 | 映射 | 过滤 |
+|------|------|------|------|
+| C | Cone | EIM | EIF/ADF/APDF 均可 |
+| S_ADF | ADF 对称 | EDM | ADF |
+| S_APDF | APDF 对称 | EDM | APDF |
 
-### 3.2 Key Observations
+S_ADF 和 S_APDF 的区分至关重要：两者在传统分类法中都是"对称 NAT"，但穿透性质根本不同。
 
-**China Mobile Broadband (Category A)** is the only category with strict APDF filtering in production. Henan province fully transitioned to NAT4 in 2023, and this has become representative of China Mobile's national broadband policy [14]. The STUN-binding test confirms Symmetric NAT with port-dependent filtering: `pystun3 -H stun.qq.com` yields "NAT Type: Symmetric NAT."
+### 2.2 允许使用的穿透技术
 
-**China Mobile 4G/5G (Category B)**, in contrast, uses ADF filtering rather than APDF. This is evidenced by WebRTC STUN penetration tests showing that "Mobile 4G to WiFi, Mobile 4G to Unicom 4G, Mobile 4G to Telecom 4G were all able to connect" [13]. If APDF were active, these connections would fail. The difference arises because mobile CGNAT pools use a shared address model (5-tuple-based session tracking) rather than the per-user fixed port allocation model used in broadband CGNAT [15].
+本分析考虑以下技术组合：
 
-**China Telecom** (Categories C, D) consistently provides Cone NAT on both broadband and cellular networks. IPv6 inbound is widely available. This makes Telecom the "easiest" ISP for P2P connectivity.
+1. **STUN UDP 打洞** [9]：双方通过 STUN 服务器获取公网地址，经由带外信令通道（invite）交换地址后同时向对方发送 UDP 探测包，建立双向 NAT 状态条目。
+2. **TCP Simultaneous Open（TSO）**：双方同时发送 TCP SYN 包，SYN 建立有状态 NAT 条目，在宽松时间窗口下完成三次握手。之后改为 QUIC/UDP 通信。
+3. **Birthday Attack**：双方各开 K 个 socket，通过 STUN 获取映射端口列表，经已有 P2P 中继节点交换端口集后进行 K×K 探测。
+4. **IPv6 直连**：一方发起、一方监听。有状态防火墙建模为 ADF。**关键约束**：至少一方拥有全局单播 IPv6 地址（且其网络允许入站 IPv6），链路本地地址（fe80::/10）不具备跨网段可达性，不计入覆盖。
 
-**China Unicom** (Categories E, F) exhibits the most variation. Broadband varies by province; some regions deploy Cone NAT while others use Symmetric. 5G SA networks block IPv6 inbound connections at the core network (UPF) level, similar to China Mobile's cellular behavior.
+**明确排除**：TURN 中继、多跳覆盖转发、固定公网 IPv4 DHT 超级节点、任何专用基础设施服务器。P2P 中继节点（由网络中已有节点自愿担任）不作为基础设施，属于覆盖层自有功能。
 
-**IPv6 deployment**: As of Q3 2025, China had 865 million active IPv6 users (77% of all Internet users), with mobile network IPv6 traffic at 69% and fixed network IPv6 traffic at 31% [2]. However, independent measurements by APNIC and Cloudflare place China's actual end-to-end IPv6 traffic at approximately 34-38% [16], indicating a gap between network capability and application-level usage.
+### 2.3 假设与边界
 
-### 3.3 Edge Case Analysis
+**A1（STUN 可达）**：公网 STUN 服务器存在且双方可达。在中国优先使用国内 STUN（miwifi、腾讯），缓解 GFW 干扰。STUN 不可达时 NAT 类型标记为 Unknown，走 mDNS 或 relay fallback。
 
-Beyond the mainstream categories, several boundary conditions affect real-world coverage.
+**A2（带外信令）**：双方之间存在一次性 invite 通道（即时通讯、二维码、`lain://` URI），用于交换地址和能力信息。该通道在初始交换后不需要持续可用。
 
-#### 3.3.1 CGNAT Multi-IP Pool Effects
+**A3（UDP 可达）**：国内运营商之间 UDP 流量的端到端可达性假设成立。运营商间的 UDP 封锁在国内场景下罕见。
 
-Large-scale CGNAT deployments (particularly China Mobile and China Unicom cellular) commonly employ multiple public IPv4 addresses in a pool. A single subscriber's traffic may exit through different public IPs depending on load balancing. This has two implications:
+**A4（同类同质）**：同一 ISP-接入类型类别的 NAT 行为假设同质。类别内部的地区差异在局限性部分讨论。
 
-1. **STUN consistency**: A peer performing two consecutive STUN queries may receive different mapped IP addresses, causing our EDM detection heuristic to report "Symmetric" when the NAT is actually Cone (EIM) but behind a multi-IP pool. This can cause **false positive Symmetric classification**, understating achievable connectivity.
-2. **Hole punch reliability**: Once a UDP flow is established through one pool IP, the CGNAT typically maintains affinity for that flow. Subsequent packets on the same 5-tuple continue through the same IP.
+**A5（独立性）**：IPv6 可达性与 IPv4 NAT 类型视为独立随机变量。IPv6 部署和 IPv4 CGNAT 政策由运营商内不同团队管理，演化节奏不同，此假设合理。
 
-Mitigation: Additional STUN queries (3-5) to probe the extent of IP variation. If all ports are consistent per IP but IP varies, classify as EIM + multi-IP rather than EDM. This is reflected in our updated STUN methodology in the companion design document.
-
-#### 3.3.2 Enterprise and Campus Firewalls
-
-Corporate and university networks introduce additional filtering layers beyond ISP NAT:
-- **Deep Packet Inspection (DPI)**: May block UDP entirely, forcing TCP-only paths
-- **Stateful IPv6 firewalls**: Often configured to block inbound IPv6 by default
-- **Application-layer filtering**: HTTP/HTTPS-only policies that block non-standard ports
-
-Users in such environments appear in our model in Category G (Other/Edge), where we conservatively estimate 60% IPv6 inbound reachability. In practice, enterprise networks are the primary drivers of the WebSocket fallback requirement (Step 5 of the traversal chain).
-
-#### 3.3.3 Mobile Network Specific Concerns
-
-Cellular networks introduce unique failure modes not captured by NAT-type classification alone:
-
-| Concern | Impact | Mitigation |
-|---------|--------|------------|
-| CGNAT session timeout (30-120s) | QUIC idle timeout may cause connection loss before keep-alive fires | Adaptive keep-alive based on observed timeout |
-| Inter-operator IPv6 routing | IPv6 paths between different mobile carriers may be asymmetric or blocked | IPv4 fallback within traversal chain |
-| Radio state transitions (RRC) | Dormant → Active transition adds 50-200ms latency spike | QUIC 0-RTT not applicable (new connection); connection migration may help |
-| 5G SA IPv6-only networks | Some 5G SA deployments are IPv6-only with NAT64 for IPv4; STUN may not work for IPv4 | Direct IPv6 path becomes the only option |
-
-#### 3.3.4 Dual-Stack Host NAT Variation
-
-A single device on a dual-stack network may exhibit different NAT behavior on IPv4 vs IPv6. For example, a CM Broadband user may have:
-- IPv4: S_APDF (strict CGNAT)
-- IPv6: Cone-equivalent (stateful firewall with EIF behavior after first outbound packet)
-
-Our model treats IPv4 and IPv6 reachability independently, which correctly captures this dual-behavior scenario.
-
-#### 3.3.5 The "Birthday Attack × APDF" Question
-
-A natural question is whether the Birthday Attack technique (K×K probe matrix, §2.2 item 3) can penetrate S_APDF filtering. Our Lemma 4 proof already establishes that it cannot: for any probe pair (i, j), the source port P_A_j (from A's K-th socket targeting B's i-th address) differs from P_A_stun (the port A advertised), and B's APDF filter requires an exact port match against the previously-advertised destination. The simultaneous opening of K sockets on each side creates K² probe pairs, but none meet the filter criteria because the filter predicate is not probabilistic—it is an exact-match comparison against a value that neither peer correctly predicts.
-
-Note: This does not preclude the theoretical possibility of a "supervised Birthday Attack" where a relay node that is reachable by both peers actively coordinates port selection to match filter expectations. This scenario falls outside our "infrastructure-free" scope but represents interesting future work.
+**A6（穿透能力完备）**：P2P 协议栈正确实现了所有允许的穿透技术，包括非连接式 UDP socket（Cone × S_APDF 非对称路由所需）和 STUN CHANGE-REQUEST 行为分类。
 
 ---
 
-## 4. IPv4 NAT Compatibility Analysis
+## 3. 中国 ISP NAT 与 IPv6 环境
 
-### 4.1 Lemma 1: Cone × Cone — Always Compatible
+### 3.1 数据来源
 
-**Proof.** Let the Cone peer have external address (IP_C, P_C) as discovered via STUN. Let the other Cone peer have external address (IP_C', P_C'). Both peers send UDP probes to each other's discovered addresses. Since both NATs use endpoint-independent mapping, the same external port serves all destinations. The first probe from each side creates a NAT state entry. Subsequent packets match the state entries and are forwarded. Filtering behavior (EIF, ADF, or APDF on either side) does not affect the outcome because:
-- With EIF: no filtering, all incoming packets accepted.
-- With ADF: the incoming source IP matches the destination IP of the outgoing probe (the same IP was contacted by the peer's probe).
-- With APDF: the incoming source (IP, port) matches the destination (IP, port) of the outgoing probe — by construction, both peers sent to the exact address the other peer's probe arrives from.
+ISP 分类依据多个数据源：
+- 国家 IPv6 发展监测平台官方统计（2025 Q3-Q4）[1,2]
+- APNIC Labs AS 级 IPv6 能力数据 [10]
+- IPv6-test.com 众包测量 [11]
+- V2EX 社区 IPv6 入站可达性报告 [12]
+- CSDN WebRTC STUN 穿透测试结果 [13]
+- 第三方 STUN NAT 分类工具结果 [14]
 
-Thus, Cone × Cone is always compatible. ∎
+**表 1：中国 ISP NAT 与 IPv6 分类**
 
-### 4.2 Lemma 2: Cone × S_APDF — Always Compatible
+| 类别 | 估计用户 | IPv4 映射 | IPv4 过滤 | IPv6 已部署 | 全局 IPv6 可用 | 入站 IPv6 通 |
+|------|---------|----------|----------|-----------|-------------|------------|
+| A: 移动宽带 | ~3.3 亿 | EDM | **APDF** (NAT4) | 是 | **部分**（部分地区只给 fe80::） | 配置后 80% |
+| B: 移动 4G/5G | ~2.5 亿 | EDM | **ADF** | 是 | **极少**（2409: 但核心网拦截） | ~30% |
+| C: 电信宽带 | ~2 亿 | EIM | APDF/EIF | 是 | **普遍** | 95% |
+| D: 电信 4G/5G | ~1.5 亿 | EIM | APDF | 是 | **普遍** | 90% |
+| E: 联通宽带 | ~1.2 亿 | 混合 | 混合 | 是 | **多数** | 70%（地区差异） |
+| F: 联通 4G/5G | ~1 亿 | EDM | 混合 | 是 | **部分** | 30%（5G SA 拦截） |
+| G: 其他/边缘 | ~2 亿 | 多为 Cone | EIF/ADF | 各异 | 各异 | 60% |
 
-**Proof.** Let C denote the Cone peer and A denote the S_APDF peer.
+### 3.2 IPv6"已部署"与"可用于 P2P"的关键差异
 
-1. C uses STUN to discover (IP_C, P_C).
-2. A uses STUN to discover (IP_A, P_A_stun), valid only for traffic to the STUN server.
-3. Via the invite channel, C and A exchange addresses.
-4. C sends a UDP probe from P_C to (IP_A, P_A_stun). C's Cone NAT maps this to (IP_C, P_C) — same port for all destinations.
-5. A sends a UDP probe to (IP_C, P_C). A's Symmetric NAT (EDM) creates a new mapping (IP_A, P_A_C) for destination (IP_C, P_C), distinct from P_A_stun.
+这是本文区别于已有文献的核心分析维度。中国宣称 77% IPv6 普及率 [2]，但这对 P2P 直连的实际意义被严重高估。我们将 IPv6 部署状态细分为四个层级：
 
-**At A's NAT:** The incoming probe from C arrives at P_A_stun, not P_A_C. Filtering check: P_A_stun was created for communication with the STUN server at (IP_STUN, 3478). The incoming source is (IP_C, P_C). Since IP_C ≠ IP_STUN, and APDF requires BOTH IP and port to match the previously-contacted destination, this packet is **DROPPED**.
+**层级 0：无 IPv6 栈。** 设备或操作系统未加载 IPv6 协议栈。所有通信必须经过 IPv4 + CGNAT。
 
-**At C's NAT:** The incoming probe from A arrives at P_C from source (IP_A, P_A_C). C's Cone NAT either has no filtering (EIF) or checks IP only (ADF). In both cases, the packet is forwarded because filter check (when present) only cares about IP_A. The application at C receives the packet from (IP_A, P_A_C).
+**层级 1：仅链路本地（本文在此机器上确认的状态）。** IPv6 栈在线、接口获取了 fe80::/10 链路本地地址，但运营商 DHCPv6/SLAAC 未分配全局单播前缀。`check_ipv6()` 返回 true（因为 bind [::1]:0 成功），但 `if_addrs` 遍历结果被 2000::/3 过滤规则排除——无可用全局地址。对 P2P 而言，**此状态等同于无 IPv6 直连能力**。尽管设备发送 IPv6 数据包时运营商 CGNAT 不会干预，但由于没有全局可路由地址，远程无法发起连接。不过出站 IPv6 连接可能通过 NAT64 等机制工作。
 
-**Resolution via asymmetric routing**: The hole punch "succeeds" because C now knows A's actual source address (IP_A, P_A_C) and can respond to it. C sends a response to (IP_A, P_A_C). At A's NAT, this incoming packet has source (IP_C, P_C) targeting P_A_C. A's NAT has previously created a state entry for A's outgoing probe to (IP_C, P_C). Filtering check: source (IP_C, P_C) matches the destination (IP_C, P_C) of the outgoing probe. Exact match → **FORWARDED**. Bidirectional communication is now established through the (IP_C, P_C) ↔ (IP_A, P_A_C) channel.
+**层级 2：全局地址可用但防火墙拦截入站。** 这是中国最普遍的 IPv6 部署状态。运营商分配了 /64 前缀（如 2409:8a00:abcd::/64），光猫和路由器获取了全局地址，但 CPE 默认防火墙策略丢弃所有入站 IPv6 SYN/第一个 UDP 包。本文第 5 节详述了非对称发起机制——仅需一方允许入站 IPv6，另一方（被拦截方）作为发起方仍可建立连接——因此本层级**计入可用**，但必须由被拦截方主动发起连接。
 
-This asymmetric mechanism works with C as the Cone side. A symmetric probe from A (simultaneously) is not required for success; C's first probe "leaked through" A's APDF filtering indirectly by revealing C's source address, which A can then target.
+**层级 3：全局地址且入站通。** IPv6 完全可用于 P2P。电信宽带和部分配置了 CPE 防火墙的移动宽带用户属于此类。
 
-However, note the limitation: C must NOT use a connected UDP socket (which rejects packets from non-matching source addresses). An unconnected socket with recvfrom() is required.
+**表 1 中的"全局 IPv6 可用"列**统计的是层级 2+3（有前缀分配），"入站 IPv6 通"列统计的是层级 3（防火墙已放开或至少可被 traverse）。覆盖率模型中使用"入站 IPv6 通"作为连通条件。
 
-Thus, Cone × S_APDF is compatible. ∎
+### 3.3 关键观察
 
-### 4.3 Lemma 3: S_ADF × S_ADF — Compatible
+**移动宽带（类别 A）** 是唯一在生产环境中严格实施 APDF 过滤的类别。河南移动 2023 年全面转为 NAT4 [14]。STUN 绑定测试确认对称 NAT 且端口相关过滤。IPv6 方面，部分省份移动宽带不分配全局前缀——仅提供链路本地地址——这意味着即使设备有 IPv6 栈且 CPE 防火墙已放开，仍然无法用于 P2P 直连。这是**层级 1**的典型案例。
 
-**Proof.** Let A and B be two S_ADF (ADF Symmetric) peers.
+**移动 4G/5G（类别 B）** 过滤为 ADF 而非 APDF。WebRTC STUN 穿透测试显示"移动 4G 到 WiFi、移动 4G 到联通 4G、移动 4G 到电信 4G 均可连通" [13]。APDF 若生效则这些连接必然失败。差异源于移动 CGNAT 池使用共享地址模型（基于五元组的会话追踪）而非家宽 CGNAT 的每用户固定端口分配 [15]。然而，IPv6 入站被核心网（UPF）层面拦截，即使手机获得了 2409: 前缀的全局 IPv6 地址，外部也无法主动连接。
 
-1. A discovers (IP_A, P_A_stun) and B discovers (IP_B, P_B_stun) via STUN.
-2. Via invite, they exchange these addresses.
-3. A sends probe to (IP_B, P_B_stun). EDM mapping creates new source (IP_A, P_A_B) for destination (IP_B, P_B_stun).
-4. B sends probe to (IP_A, P_A_stun). EDM mapping creates new source (IP_B, P_B_A) for destination (IP_A, P_A_stun).
+**电信（类别 C、D）** 在宽带和蜂窝网络上一致提供 Cone NAT。IPv6 入站广泛可用，是 P2P 连通性最友好的运营商。
 
-**At A's NAT:** Receives from (IP_B, P_B_A) to P_A_stun. A's STUN state for P_A_stun: destination (IP_STUN, 3478). ADF filter checks: source IP_B vs STUN_IP ≠ match → **DROPPED** at the STUN state.
+**联通（类别 E、F）** 变异性最大。宽带有省份差异——部分部署 Cone NAT、部分对称；5G SA 核心网拦截 IPv6 入站，与移动蜂窝行为类似。
 
-But A also has a second state entry: the outgoing probe from A to (IP_B, P_B_stun) created state with destination (IP_B, P_B_stun). The NAT allocated P_A_B for this. The incoming probe from B arrives at P_A_stun (not P_A_B), so the state entry for A→B doesn't help.
+### 3.4 边界情况
 
-**The resolution**: In practice, A opens K sockets and sends to all K of B's ports. One of these will land on P_B_A (B's actual mapped port for talking to A). The application at A uses an unconnected socket.
+#### 3.4.1 CGNAT 多 IP 池效应
 
-More fundamentally, the ADF check only requires matching the source IP (not port). If A sent any probe to IP_B (regardless of port), the filter state allows all packets from IP_B (any port) through to any of A's mapped ports for which a corresponding state exists.
+大规模 CGNAT 部署（尤其移动和联通蜂窝）通常使用多个公网 IPv4 地址池。单个用户的出站流量可能根据负载均衡经不同公网 IP 发出。后果：(1) 连续两次 STUN 查询可能获取不同映射 IP，导致我们的 EDM 检测将实际 Cone NAT 误判为对称 NAT（**假阳性**——本模型偏保守地低估了可连通性）；(2) 一旦 UDP 流建立，CGNAT 通常维持流亲和性。
 
-After the simultaneous exchange:
-- A's NAT state for its probe to (IP_B, P_B_stun): destination IP_B (port irrelevant for ADF). Incoming from (IP_B, _any_) matches this IP → forwarded to A's internal socket.
-- Similarly, B's NAT accepts from IP_A on any port.
+#### 3.4.2 企业与校园防火墙
 
-Thus, after the simultaneous probe exchange, bidirectional communication flows through A's and B's actual mapped channels. Since ADF only checks IP (not port), the exact port mapping becomes irrelevant — as long as both sides have a state entry with the other's IP, all port combinations work.
+企业和校园网引入额外过滤层：DPI 可能封禁 UDP、有状态 IPv6 防火墙默认拦截入站、应用层过滤限定 HTTP/HTTPS。此类用户归入类别 G（其他/边缘），保守估计 60% IPv6 入站可达。
 
-Thus, S_ADF × S_ADF is compatible. ∎
+#### 3.4.3 非全局 IPv6 前缀的深层影响
 
-### 4.4 Lemma 4: S_APDF × S_APDF — Incompatible
+本文将此作为独立维度而非简单归入层级 0。原因：(1) 运营商分配 fe80:: 或未分配前缀的行为在中国移动宽带中占比不可忽略；(2) 这类用户虽然 `ipv6_inbound` 检测为真（IPv6 栈功能正常），但 P2P 库如果不进一步检测全局 unicast 地址，会错误地将 IPv6 端点写入 invite，导致对端尝试连接一个不可达地址后超时——**这比"没有 IPv6"更糟糕，因为浪费了连接尝试的时间窗口**。Lain 的 2000::/3 过滤 + 层级 1 降级策略正是针对此场景设计。
 
-**Proof.** This is the hard boundary case. Let A and B be two S_APDF (APDF Symmetric) peers.
+---
 
-1. A uses STUN → (IP_A, P_A_stun). Valid only for STUN server.
-2. B uses STUN → (IP_B, P_B_stun). Valid only for STUN server.
-3. Via invite, exchange.
+## 4. IPv4 NAT 兼容性分析
 
-4. A sends probe to (IP_B, P_B_stun). EDM → new source (IP_A, P_A_B). Packet: (IP_A, P_A_B) → (IP_B, P_B_stun).
+### 4.1 引理 1：Cone × Cone——恒兼容
 
-5. B sends probe to (IP_A, P_A_stun). EDM → new source (IP_B, P_B_A). Packet: (IP_B, P_B_A) → (IP_A, P_A_stun).
+**证明。** 双方通过 STUN 发现各自的公网地址后交换。Cone NAT 的端点无关映射保证所有目标使用同一端口。首轮探测创建 NAT 状态条目，后续数据包匹配状态条目被转发。无论哪一侧的过滤行为（EIF/ADF/APDF），首轮探测包必定到达——因为两侧同时向对方已知地址发送，入站包的源地址恰为出站包的目标地址，过滤条件精确匹配。因此 Cone × Cone 恒兼容。∎
 
-**At B's NAT**: Two possible states exist:
-- State for B↔STUN: destination (IP_STUN, 3478). Incoming from (IP_A, P_A_B). Filter: (IP_A, P_A_B) ≠ (IP_STUN, 3478) → **DROP**.
-- State for B→A: destination (IP_A, P_A_stun). Incoming from (IP_A, P_A_B). Filter: source port P_A_B ≠ destination port P_A_stun. APDF requires exact port match → **DROP**.
+### 4.2 引理 2：Cone × S_APDF——恒兼容
 
-**At A's NAT**: Symmetrically:
-- State for A↔STUN: (IP_STUN, 3478) with incoming (IP_B, P_B_A) → **DROP**.
-- State for A→B: (IP_B, P_B_stun) with incoming (IP_B, P_B_A). P_B_A ≠ P_B_stun → **DROP**.
+**证明。** 设 C 为 Cone 侧、A 为 S_APDF 侧。
 
-Neither side can receive the other's probe. The fundamental barrier is the conjunction of EDM (which causes source ports to change per destination) and APDF (which requires exact source port matching). Even with K×K probes (Birthday Attack), no probe pair can match because for any probe pair (i, j), P_A_j ≠ P_A_stun and P_B_i ≠ P_B_stun, meaning the filter check always fails.
+1. C 通过 STUN 发现 (IP_C, P_C)。
+2. A 通过 STUN 发现 (IP_A, P_A_stun)，仅对 STUN 服务器有效。
+3. 通过 invite 交换地址。
+4. C 从 P_C 向 (IP_A, P_A_stun) 发送 UDP 探测。C 的 Cone NAT 映射为 (IP_C, P_C)——所有目标同一端口。
+5. A 向 (IP_C, P_C) 发送 UDP 探测。A 的对称 NAT 为目标 (IP_C, P_C) 创建新映射 (IP_A, P_A_C)，与 P_A_stun 不同。
 
-TCP Simultaneous Open does not help, as it only widens the timing window without addressing the port-matching problem.
+**A 侧 NAT**：从 C 来的入站包到达 P_A_stun。A 的 STUN 状态：目标 (IP_STUN, 3478)。入站源 (IP_C, P_C)。APDF 要求 IP 和端口同时匹配→ **丢弃**。
 
-Thus, S_APDF × S_APDF is provably incompatible for direct connection. ∎
+**C 侧 NAT**：从 A 来的入站包从源 (IP_A, P_A_C) 到达 P_C。C 的 Cone NAT 无过滤或仅 IP 过滤→ **转发**。C 的应用接收到来自 (IP_A, P_A_C) 的数据包。
 
-### 4.5 Lemma 5: S_APDF × S_ADF — Incompatible
+**通过非对称路由解决**：C 现在知道 A 的实际源地址 (IP_A, P_A_C)，可以向其发送。C 向 (IP_A, P_A_C) 发送响应。A 侧 NAT：入站源 (IP_C, P_C) 到达 P_A_C。A 的 A→C 状态：目标 (IP_C, P_C)。入站源 (IP_C, P_C)。APDF 检查：精确匹配→ **转发**。双向通信建立。
 
-**Proof.** Let A be S_APDF and B be S_ADF.
+此机制要求 C 使用非连接式 UDP socket（无 connect()），接受来自非预期源地址的数据包。Cone × S_APDF 兼容。∎
 
-1. Via STUN and invite: A knows (IP_B, P_B_stun), B knows (IP_A, P_A_stun).
-2. A probes (IP_B, P_B_stun) → EDM source (IP_A, P_A_B).
-3. B probes (IP_A, P_A_stun) → EDM source (IP_B, P_B_A).
+### 4.3 引理 3：S_ADF × S_ADF——兼容
 
-**At A's NAT (APDF):** A↔B state: destination (IP_B, P_B_stun). Incoming from (IP_B, P_B_A). APDF check: P_B_A ≠ P_B_stun → **DROP**.
+**证明。** ADF 仅检查源 IP，不检查端口。双方同时探测后，各自 NAT 创建了对对方 IP 的状态条目。ADF 允许所有来自该 IP 的数据包（任意端口）通过。双向通信流经各自已建立的通道。S_ADF × S_ADF 兼容。∎
 
-**At B's NAT (ADF):** B↔A state: destination (IP_A, P_A_stun). Incoming from (IP_A, P_A_B). ADF check: source IP_A matches destination IP_A → **FORWARD**.
+### 4.4 引理 4：S_APDF × S_APDF——不兼容
 
-Thus, only one direction works: B can receive from A, but A cannot receive from B. Since bidirectional communication is required, this pair is incompatible.
+**证明。** 这是硬边界。双方的 EDM 导致分配给对方的外部端口与 STUN 告知的端口不同，且 APDF 要求精确端口匹配。即使 K×K 探测，对于任意探测对 (i, j)，P_A_j ≠ P_A_stun 且 P_B_i ≠ P_B_stun，过滤谓词总是失败。Birthday Attack 在此场景下不改变结果——过滤不是概率性的，而是精确比较。TCP Simultaneous Open 只延长了时间窗口，不解决端口匹配问题。S_APDF × S_APDF 数学上不可直连。∎
 
-Note: even if B first probes A (thereby opening its ADF state), A's APDF filter still blocks B's probe. The asymmetry in filtering strictness creates an irrecoverable deadlock.
+### 4.5 引理 5：S_APDF × S_ADF——不兼容
 
-Thus, S_APDF × S_ADF is incompatible. ∎
+**证明。** A（APDF 侧）的过滤器要求精确端口匹配。B（ADF 侧）的探测包源端口 P_B_A 与 A 期望的 P_B_stun 不同→ A 侧丢弃。B 侧可以接收但无法向 A 发送。双向通信不可能。S_APDF × S_ADF 不兼容。∎
 
-### 4.6 Cone × S_ADF — Compatible
+### 4.6 Cone × S_ADF——兼容
 
-By analogous reasoning to Lemma 2, with the additional relaxation that the S_ADF side only checks IP (not port), making the traversal strictly easier than Cone × S_APDF. Compatible.
+推理同引理 2，且 S_ADF 侧仅检查 IP，穿透比 Cone × S_APDF 更容易。兼容。
 
-### 4.7 Summary Compatibility Matrix
+### 4.7 兼容性矩阵
 
-**Table 2: IPv4 NAT Direct Connection Compatibility**
+**表 2：IPv4 NAT 直连兼容性**
 
-|  | C (Cone) | S_ADF (ADF Symmetric) | S_APDF (APDF Symmetric) |
-|--|----------|----------------------|-------------------------|
+|  | C (Cone) | S_ADF | S_APDF |
+|--|----------|-------|--------|
 | **C (Cone)** | ✅ | ✅ | ✅ |
-| **S_ADF (ADF Symmetric)** | ✅ | ✅ | ❌ |
-| **S_APDF (APDF Symmetric)** | ✅ | ❌ | ❌ |
-
-The only incompatible pairs are (S_APDF, S_APDF) and (S_APDF, S_ADF) — both require at least one S_APDF peer paired with another non-Cone peer.
+| **S_ADF** | ✅ | ✅ | ❌ |
+| **S_APDF** | ✅ | ❌ | ❌ |
 
 ---
 
-## 5. IPv6 Reachability Analysis
+## 5. IPv6 可达性分析
 
-### 5.1 Asymmetric Initiation
+### 5.1 非对称发起机制
 
-A key insight enabling high IPv6 coverage is that **only one peer needs to have inbound IPv6 reachable**.
+一个关键洞察：**IPv6 直连只需要至少一方具备入站可达性**。
 
-Consider two peers X and Y. If X's network blocks all inbound IPv6 (e.g., China Mobile 5G core network ACL), X cannot receive an initial connection from Y. However, X can still initiate a connection to Y. If Y's network permits inbound IPv6 (or has a stateful firewall that allows return traffic), Y can receive X's initial packet. Once the connection is established (TCP handshake complete, or first UDP packets exchanged), bidirectional traffic flows through the established channel:
+设 X 的网络拦截所有入站 IPv6（如移动 5G 核心网 ACL），X 无法接收来自 Y 的初始连接。但 X 仍可主动向 Y 发起连接。若 Y 的网络允许入站 IPv6，则：
 
-1. X (IPv6-blocked) initiates TCP SYN → Y (IPv6-reachable).
-2. Y receives SYN, responds with SYN-ACK → X's core network allows (return traffic matches state entry).
-3. X responds with ACK → Y receives.
-4. Connection established — both directions flow.
+1. X（被拦截方）发起 TCP SYN → Y（可达方）。
+2. Y 收到 SYN，回复 SYN-ACK → X 的核心网允许通过（匹配出站状态）。
+3. X 回复 ACK → Y 收到。
+4. 连接建立，双方双向通信。
 
-For UDP-based protocols (QUIC):
-1. X sends initial packet → Y (creates state on X's core, arrives at Y).
-2. Y responds → X's core matches state entry → forwarded.
-3. Bidirectional UDP flow established.
+对 QUIC：
+1. X 发送初始包 → Y。
+2. Y 回复 → X 的核心网匹配状态→转发。
+3. 双向 QUIC 流建立。
 
-The **sufficient condition** for IPv6 direct connectivity of pair (X, Y) is:
+充要条件：∃ 至少一方 IPv6 入站可达。
 
-> ∃ at least one peer with IPv6 inbound reachable.
+P(IPv6 成功 | X, Y) = 1 − P(X 不可达) × P(Y 不可达)
 
-P(IPv6 success | X, Y) = 1 - P(X unreachable) × P(Y unreachable)
+### 5.2 各类型的 IPv6 可达性估计
 
-### 5.2 IPv6 Reachability Per Category
+**表 3：IPv6 入站可达性估计**
 
-**Table 3: IPv6 Inbound Reachability Estimates**
+| 类别 | 入站 IPv6 通 | 不通（用于计算） |
+|------|------------|---------------|
+| A: 移动宽带 | 80%* | 20% |
+| B: 移动 4G/5G | 30% | 70% |
+| C: 电信宽带 | 95% | 5% |
+| D: 电信 4G/5G | 90% | 10% |
+| E: 联通宽带 | 70% | 30% |
+| F: 联通 4G/5G | 30% | 70% |
+| G: 其他/边缘 | 60% | 40% |
 
-| Category | IPv6 Inbound Reachable | Unreachable (for calculation) |
-|----------|----------------------|-------------------------------|
-| A: CM Broadband | 80% | 20% |
-| B: CM 4G/5G | 30% | 70% |
-| C: Telecom Broadband | 95% | 5% |
-| D: Telecom 4G/5G | 90% | 10% |
-| E: Unicom Broadband | 70% | 30% |
-| F: Unicom 4G/5G | 30% | 70% |
-| G: Other/Edge | 60% | 40% |
-
-Note: These are average estimates. For technical early-adopter users, CM Broadband reachability approaches 100% (user-configurable CPE firewall), CM Cellular improves to ~50% (awareness of inter-operator connectivity), and Telecom/Unicom broadband approaches 98%.
+\* 移动宽带的"入站 IPv6 通"仅计算了层级 3（全局地址 + 防火墙放行）。层级 1 和层级 2 中防火墙未配置的用户不计入"通"。
 
 ---
 
-## 6. Combined Coverage Calculation
+## 6. 联合覆盖计算
 
-### 6.1 Model
+### 6.1 模型
 
-For a pair of peers (X, Y) from categories (i, j):
+对于来自类别 i 和 j 的 peer 对 (X, Y)：
 
-P(success) = 1 - P(IPv6 failure) × P(IPv4 failure)
+P(成功) = 1 − P(IPv6 失败) × P(IPv4 失败)
 
-Where:
-- P(IPv6 failure) = unreachable(i) × unreachable(j)   [both must be unreachable]
-- P(IPv4 failure) = 1 if pair (i, j) is IPv4-incompatible; 0 otherwise
+其中：
+- P(IPv6 失败) = unreachable(i) × unreachable(j)  [双方均不通]
+- P(IPv4 失败) = 1（若对 (i, j) IPv4 不兼容），否则 0
 
-The categories and their IPv4 NAT types are:
+### 6.2 类别 NAT 类型和权重
 
-| Category | Symbol | NAT Type |
-|----------|--------|----------|
-| A: CM Broadband | 1 | S_APDF |
-| B: CM 4G/5G | 2 | S_ADF |
-| C: Telecom Broadband | 3 | C (Cone) |
-| D: Telecom 4G/5G | 4 | C (Cone) |
-| E: Unicom Broadband | 5 | Mixed (treat as C conservative) |
-| F: Unicom 4G/5G | 6 | Mixed (treat as S_ADF conservative) |
-| G: Other/Edge | 7 | Mixed (treat as C) |
+| 类别 | 符号 | NAT |
+|------|------|-----|
+| A: 移动宽带 | 1 | S_APDF |
+| B: 移动 4G/5G | 2 | S_ADF |
+| C: 电信宽带 | 3 | C |
+| D: 电信 4G/5G | 4 | C |
+| E: 联通宽带 | 5 | C（保守） |
+| F: 联通 4G/5G | 6 | S_ADF（保守） |
+| G: 其他/边缘 | 7 | C |
 
-**IPv4-incompatible pairs** (from Table 2, applying to our 7 categories):
-- (1, 1): S_APDF × S_APDF → ❌
-- (1, 2): S_APDF × S_ADF → ❌
-- (1, 6): S_APDF × S_ADF → ❌ (treating Unicom 4G as S_ADF)
+**IPv4 不兼容对**：
+- (1, 1)：S_APDF × S_APDF—不兼容
+- (1, 2)：S_APDF × S_ADF—不兼容
+- (1, 6)：S_APDF × S_ADF—不兼容
 
-All other pairs are IPv4-compatible (any Cone peer pairs with any other peer type).
-
-### 6.2 Distribution Weights
-
-Using device-level network session proportions (normalized):
-
-| Category | Weight (w_i) |
-|----------|-------------|
+| 类别 | 权重 |
+|------|------|
 | A (1) | 0.25 |
 | B (2) | 0.20 |
 | C (3) | 0.15 |
@@ -394,45 +279,27 @@ Using device-level network session proportions (normalized):
 | F (6) | 0.08 |
 | G (7) | 0.11 |
 
-Σw_i = 1.00
+### 6.3 计算
 
-### 6.3 Calculation
+**对 (1, 1)：** w₁² = 0.0625, IPv6 失败 = 0.04, 贡献 = **0.00250**
 
-For each incompatible pair (i, j):
+**对 (1, 2)：** 2×w₁×w₂ = 0.1000, IPv6 失败 = 0.14, 贡献 = **0.01400**
 
-**Pair (1, 1):** CM Broadband × CM Broadband
-- Pair probability: w₁ × w₁ = 0.25 × 0.25 = 0.0625
-- P(v6 failure) = 0.20 × 0.20 = 0.04
-- P(v4 failure) = 1 (incompatible)
-- Contribution to failure: 0.0625 × 0.04 × 1 = **0.002500**
+**对 (1, 6)：** 2×w₁×w₆ = 0.0400, IPv6 失败 = 0.14, 贡献 = **0.00560**
 
-**Pair (1, 2):** CM Broadband × CM 4G/5G
-- Pair probability: 2 × w₁ × w₂ = 2 × 0.25 × 0.20 = 0.1000
-- P(v6 failure) = 0.20 × 0.70 = 0.14
-- P(v4 failure) = 1
-- Contribution: 0.1000 × 0.14 × 1 = **0.014000**
+**总失败概率：** 0.00250 + 0.01400 + 0.00560 = **0.02210**
 
-**Pair (1, 6):** CM Broadband × Unicom 4G/5G
-- Pair probability: 2 × w₁ × w₆ = 2 × 0.25 × 0.08 = 0.0400
-- P(v6 failure) = 0.20 × 0.70 = 0.14
-- P(v4 failure) = 1
-- Contribution: 0.0400 × 0.14 × 1 = **0.005600**
+**总成功概率：** 1 − 0.02210 = **0.97790 ≈ 97.79%**
 
-**Total failure probability:** 0.002500 + 0.014000 + 0.005600 = **0.0221**
+### 6.4 结果
 
-**Total success probability:** 1 - 0.0221 = **0.9779 ≈ 97.79%**
+| 层级 | 技术 | 累计覆盖 |
+|------|------|---------|
+| 第 1 层 | IPv6 直连 | ~84% |
+| 第 1+2 层 | + IPv4 STUN 打洞 | ~97.8% |
+| 第 1+2+3 层 | + P2P 中继（任意 Cone/IPv6 节点） | ~100% |
 
-### 6.4 Results
-
-| Layer | Technique | Cumulative Coverage |
-|-------|-----------|-------------------|
-| Layer 1 | IPv6 Direct (asymmetric initiation) | **~84%** |
-| Layer 1+2 | + IPv4 STUN Hole Punch | **~97.8%** |
-| Layer 1+2+3 | + P2P Relay (any Cone/IPv6 node) | **~100%** |
-
-The coverage figures above assume the Chinese ISP environment as modeled. Layer 3 (P2P relay) closes the remaining ~2.2% gap — the only requirement is that the overlay network contains at least one node with Cone NAT or IPv6 inbound, a condition satisfied in virtually any network of ≥3 nodes.
-
-**Table 4: Full 7×7 Pair Success Matrix (infrastructure-free, Layers 1+2 only)**
+**表 4：完整 7×7 配对成功率矩阵**
 
 |  | A(1) | B(2) | C(3) | D(4) | E(5) | F(6) | G(7) |
 |--|------|------|------|------|------|------|------|
@@ -444,160 +311,105 @@ The coverage figures above assume the Chinese ISP environment as modeled. Layer 
 | **F(6)** | 0.86 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 |
 | **G(7)** | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 |
 
-Cell values represent the probability of direct connection. Values < 1.00 indicate cases where both IPv6 is unreachable AND IPv4 is NAT-incompatible.
+### 6.5 灵敏度分析
 
-### 6.5 Sensitivity Analysis
+| 变化参数 | 范围 | 结果覆盖率 | Δ |
+|---------|------|-----------|----|
+| 移动宽带 IPv6 入站通 | 60%→95% | 97.2%→98.3% | ±0.6% |
+| 移动 4G/5G IPv6 入站通 | 10%→50% | 97.2%→98.4% | ±0.6% |
+| 联通 4G/5G IPv6 入站通 | 10%→50% | 97.6%→98.0% | ±0.2% |
+| 全部 v6 +10% | — | 98.4% | +0.6% |
+| 全部 v6 −10% | — | 97.0% | −0.8% |
+| 联通 4G 视为 Cone | — | 98.6% | +0.8% |
+| 最坏情况 | w₁=0.35, v6 −10% | 95.8% | −2.0% |
+| 最优情况 | w₁=0.15, v6 +10% | 99.1% | +1.3% |
 
-To assess the robustness of our estimate, we perform a one-at-a-time sensitivity analysis on key parameters.
-
-**Table 5: Sensitivity to IPv6 Reachability Assumptions**
-
-| Parameter Varied | Range | Resulting Coverage | Δ |
-|-----------------|-------|-------------------|----|
-| CM Broadband IPv6 reachable | 60% → 95% | 97.2% → 98.3% | ±0.6% |
-| CM 4G/5G IPv6 reachable | 10% → 50% | 97.2% → 98.4% | ±0.6% |
-| Unicom 4G/5G IPv6 reachable | 10% → 50% | 97.6% → 98.0% | ±0.2% |
-| All v6 rates +10% | — | 98.4% | +0.6% |
-| All v6 rates −10% | — | 97.0% | −0.8% |
-
-**Table 6: Sensitivity to NAT Classification and Weights**
-
-| Parameter Varied | Range | Resulting Coverage | Δ |
-|-----------------|-------|-------------------|----|
-| Unicom 4G treated as Cone (not S_ADF) | — | 98.6% | +0.8% |
-| CM Broadband weight (w₁) | 0.15 → 0.35 | 96.9% → 98.4% | ±0.8% |
-| Unicom 4G weight (w₆) | 0.04 → 0.12 | 97.3% → 98.2% | ±0.5% |
-| Worst-case combination | w₁=0.35, all v6 −10% | 95.8% | −2.0% |
-| Best-case combination | w₁=0.15, all v6 +10% | 99.1% | +1.3% |
-
-**Key observation**: The result is most sensitive to (a) the proportion of CM Broadband users in the population and (b) the IPv6 reachability rate of CM Broadband and CM Cellular users. Even under pessimistic assumptions (worst-case row), coverage remains above 95%. The central estimate of ~97.8% is robust to parameter variation within plausible ranges.
+**关键发现**：结果对移动宽带用户占比和该群体的 IPv6 入站可达率最敏感。在最坏假设下覆盖率仍 >95%。
 
 ---
 
-## 7. Discussion
+## 7. 讨论
 
-### 7.1 The ~2.2% Gap
+### 7.1 约 2.2% 的不可达场景
 
-The remaining ~2.2% failure cases all share a common characteristic: at least one peer is a China Mobile broadband user (Category A, S_APDF) whose IPv6 firewall has not been configured, paired with another peer that is either also a CM broadband user or a mobile user with blocked IPv6 inbound (Categories B or F).
+剩余约 2.2% 的失败案例全部共享一个特征：至少一方为移动宽带用户（类别 A，S_APDF）且其 IPv6 未被配置为入站可达（层级 1 或层级 2 未放开防火墙），另一方同样是移动宽带用户或 IPv6 被拦截的移动网络用户（类别 B、F）。
 
-The root cause is the mathematical impossibility of traversing APDF × APDF or APDF × ADF directly — the conjunction of endpoint-dependent mapping and address+port-dependent filtering creates an irrecoverable deadlock.
+根因是 APDF × APDF 或 APDF × ADF 穿透的数学不可能性——端点相关映射与端口相关过滤的合取产生了不可恢复的死锁。
 
-### 7.2 Closing the Gap
+### 7.2 IPv6 前缀不完整的工程影响
 
-Two options exist for the remaining gap:
+本文分析的独特贡献在于明确建模了"IPv6 已部署但不完整"对 P2P 覆盖的影响。具体而言：
 
-1. **User-side IPv6 configuration**: The most impactful action. If China Mobile broadband users configure their CPE to allow IPv6 inbound connections, Category A becomes fully reachable to ALL other categories. This alone eliminates >80% of the failure cases.
+**如果 P2P 库不做全局 unicast 检测**（即仅依赖 `check_ipv6()` 返回 true 就认为有 IPv6 可用），会导致：
+- 层级 1 用户（仅链路本地地址）的 IPv6 端点被写入 invite
+- 对端尝试连接 `fe80::xxxx:xxxx`——链路本地地址跨网段不可达，必然超时
+- 浪费了 IPv4 STUN/relay 路径的连接尝试时间
 
-2. **Multi-hop overlay fallback**: For the residual cases, routing traffic through an intermediate peer that happens to be reachable from both endpoints (the "multi-hop overlay" approach) provides a connection at the cost of increased latency and bandwidth overhead.
+**Lain 的当前实现**通过 `is_unicast_global()` 等价检查（`2000::/3` 前缀过滤）正确地处理了这一点：在真机上确认了 IPv6 栈在线但无全局前缀的情况，并自动降级到纯 IPv4 路径。
 
-### 7.3 Practical Implications for P2P Library Design
+### 7.3 弥补缺口
 
-The high success rate (97.8% general, ~99.5% technical) justifies a P2P library design where:
-- IPv6 direct connection is attempted first (asymmetric initiation from the blocked side)
-- IPv4 STUN-based hole punch serves as the primary fallback
-- Port prediction and Birthday Attack can be applied for rare edge cases
-- Multi-hop overlay routing is maintained as a last-resort fallback rather than a core path
+1. **用户侧 IPv6 配置**：影响最大的单一行动。移动宽带用户配置 CPE 允许 IPv6 入站后，类别 A 变为对所有类别完全可达，消除 80% 以上的失败案例。
+2. **P2P 多跳中继**：对于残余场景，经网络中对双方均可达的中间节点路由流量。
 
-### 7.4 Limitations and Validity Threats
+### 7.4 工程启示
 
-Our analysis has several limitations that affect the precision and generalizability of the results.
+- **三层架构已充分**：IPv6 直连 → STUN 打洞 → P2P 中继。覆盖~100%且零基础设施依赖（STUN 除外）。
+- **中继是 P2P 不是基础设施**：任意拥有 Cone NAT 或 IPv6 入站的节点可担任中继。≥3 个节点的网络在中继可用性上几乎确定。
+- **复杂性预算**：把精力投入 IPv6 做好（防火墙检测、非对称发起、全局前缀验证）和可靠 STUN（多服务器、CHANGE-REQUEST）。Birthday Attack 和 TSO 可选。
+- **移动优先**：设计时以移动端为主要场景——自适应计时器、数据预算、后台挂起/恢复。
 
-**Internal validity threats:**
+### 7.5 局限性
 
-1. **Distribution weights lack authoritative sourcing**: Category weights (w₁ through w₇) are derived from reported subscriber counts and estimated device-per-subscriber ratios, not from a controlled random sample. The China Internet Network Information Center (CNNIC) publishes biannual reports with more granular breakdowns, but our categories cross-cut their demographic dimensions (ISP × access type rather than geography × age). Our sensitivity analysis (§6.5) shows the estimate is stable within ±2% over a wide range of weight assumptions.
+内部有效性威胁：(1) 分布权重缺乏权威来源——来自报告用户数和估计的每用户设备比；(2) IPv6 可达性是高度偏斜分布上的点估计；(3) 测量数据可能在 2023-2025 年间过时；(4) 单宿主假设——移动设备实际频繁切换 WiFi/蜂窝。
 
-2. **IPv6 reachability is a point estimate on a highly skewed distribution**: Our binary "reachable/unreachable" classification masks continuous variation in IPv6 firewall strictness. A CM Broadband user with "IPv6 reachable" may still have stateful filtering that blocks certain inbound ports or protocols. The effective connectivity rate for such users may be lower than our model suggests.
-
-3. **Measurement data staleness**: The empirical NAT measurements we rely on [13, 14] were collected between 2023 and early 2025. ISP CGNAT configurations change incrementally; Henan Mobile's NAT4 transition in 2023 is one documented instance. Other provinces may have followed since our data collection, potentially expanding the S_APDF category.
-
-4. **Single-homing assumption**: We model each device as belonging to exactly one category. In reality, mobile devices frequently switch between WiFi (broadband) and cellular connections, changing their effective NAT type dynamically. A dual-SIM phone also has two independent cellular identities.
-
-**External validity threats:**
-
-5. **China-specific findings**: The high IPv6 deployment rate and specific NAT configurations are products of China's unique regulatory and infrastructure environment. The methodology generalizes to other countries, but the specific 97.8% figure does not.
-
-6. **Temporal evolution**: IPv6 deployment is increasing (~3-5% annually in China), and CGNAT policies are evolving. China's stated goal of "removing NAT" in favor of native IPv6 [1] would, if realized, eliminate the IPv4 NAT compatibility problem entirely—rendering our IPv4 analysis obsolete.
-
-7. **Application-layer protocol variance**: Different transport protocols (TCP vs UDP vs QUIC) have different traversal characteristics. QUIC over UDP benefits from UDP hole punching; TCP-based protocols rely on TSO or WS fallback. Our model treats "connectivity" as the establishment of any bidirectional channel, which may not be sufficient for applications requiring specific transport semantics.
-
-8. **NatType Distribution Estimation Methodology**: Our STUN-based NatType classification approach assumes the standard RFC 5780 methodology using a single STUN server with CHANGE-REQUEST. Recent work has shown that CGNAT multi-IP pools can cause misclassification (EIM+multi-IP incorrectly identified as EDM), potentially overstating the proportion of Symmetric NATs. We partially address this in §3.3.1.
+外部有效性威胁：(5) 中国特定——97.8% 数值不推广到其他国家；(6) 时间演化——IPv6 以每年 3-5% 增长，"去 NAT"目标若实现将完全消除 IPv4 NAT 兼容性问题；(7) 应用层协议差异——不同传输协议有不同穿透特性；(8) CGNAT 多 IP 池可能导致 Symmetric 分类假阳性，本文的保守 NAT 分类可能低估了实际可连通性。
 
 ---
 
-## 8. Conclusion
+## 8. 结论
 
-This paper provides the first systematic analysis of infrastructure-free direct P2P connectivity across China's heterogeneous ISP NAT environment. We demonstrate that through combined IPv6 asymmetric initiation and IPv4 STUN-based hole punching, **97.8%** of random user pairs can achieve direct communication without relying on any centralized infrastructure (the only external dependency is STUN). The remaining ~2.2% can be covered by peer-to-peer relay — any node in the overlay network with Cone NAT or IPv6 inbound capability can serve this role, requiring no dedicated servers. Sensitivity analysis confirms the robustness of these estimates, with worst-case scenarios still yielding >95% direct coverage.
+本文首次对中国异构 ISP NAT 环境下无基础设施直接 P2P 连通性进行了系统分析。通过结合 IPv6 非对称发起和 IPv4 STUN 打洞，**随机用户对的 97.8% 可实现不依赖任何中心化基础设施（唯一外部依赖为 STUN）的直接双向通信**。剩余约 2.2% 可由 P2P 中继覆盖。
 
-By layer:
-1. **IPv6 alone covers ~84%** of random pairs through asymmetric initiation — only one peer needs inbound IPv6.
-2. **STUN hole punching adds ~14%**, covering most IPv4-only cases where at least one peer has Cone NAT.
-3. **P2P relay covers the remaining ~2%** — S_APDF × S_APDF/S_ADF pairs without IPv6 — via any relay-capable node already in the network.
+本文的核心工程贡献是将 IPv6"前缀不完整"作为独立变量纳入覆盖模型——明确区分了"IPv6 栈在线"（层级 0-1）、"前缀已分配"（层级 2）、"可用于 P2P"（层级 3）三个层次——这是 P2P 库设计中的关键但常被忽视的区别。
 
-This suggests that a practical P2P library requires only three core components: IPv6 direct connection, STUN-based UDP hole punching, and peer-to-peer relay routing. More complex techniques (Birthday Attack, TCP Simultaneous Open, WebSocket fallback) are optional enhancements for edge cases where relay is temporarily unavailable — not required for near-universal connectivity.
-4. The remaining <3% gap is attributable to CM broadband users who haven't configured IPv6—a problem solvable through user education rather than additional technical complexity.
+依层次分解：
+1. **IPv6 单独覆盖 ~84%**——仅需一方 IPv6 入站可达。
+2. **STUN 打洞增加 ~14%**——覆盖大部分 IPv4-only 且至少一方 Cone NAT 的场景。
+3. **P2P 中继（任意 Cone/IPv6 节点）覆盖剩余 ~2%**——无需专用服务器。
 
-### 8.1 Future Work
-
-Several directions emerge from this analysis:
-
-1. **Live Measurement Campaign**: A large-scale active measurement study (>10,000 probes) would provide empirical validation of our theoretical model and refine the category weights and IPv6 reachability estimates. This could be implemented as an opt-in diagnostic feature in the Lain daemon itself, creating a feedback loop between deployment data and the coverage model.
-
-2. **Temporal Coverage Modeling**: The current model is static. A dynamic model incorporating IPv6 deployment growth rates (current trajectory: ~5% YoY in China) and CGNAT policy evolution could project coverage over a 5-year horizon and identify the crossover point where IPv6-priority becomes IPv6-only.
-
-3. **Multi-Hop Overlay Performance Model**: Extending the analysis to quantify the performance cost of relay fallback for the ~2.2% of pairs that require it—including latency overhead distributions, bandwidth contention, and relay churn effects—would provide a complete picture of the P2P library's operational characteristics.
-
-4. **Generalization to Other Regions**: Applying our methodology to other large national Internet markets (India with its 900M+ users and heterogeneous ISP landscape; Southeast Asia with its island geography and NAT proliferation; Europe with its high IPv6 adoption) would validate the framework's portability and identify region-specific hard boundaries.
-
-5. **Protocol-Level Optimization**: Investigating whether protocol-level optimizations (e.g., connection racing across multiple candidate paths, predictive STUN refresh, adaptive keep-alive based on observed NAT timeout) can push the boundary further for the incompatible pairs.
-
-### 8.2 Practical Implications
-
-These results have direct implications for the design of next-generation P2P libraries:
-- **Three layers suffice**: IPv6 direct → STUN hole punch → P2P relay. This covers ~100% of cases with zero infrastructure dependency beyond STUN.
-- **Relay is P2P, not infrastructure**: Any node with Cone NAT or IPv6 inbound can relay. A network of ≥3 nodes virtually guarantees relay availability without any dedicated servers.
-- **Complexity budget**: Invest in getting IPv6 right (firewall detection, asymmetric initiation) and reliable STUN (multi-server, CHANGE-REQUEST). Birthday Attack and TSO are optional.
-- **Mobile is the norm**: Design for mobile-first with adaptive timers, data budgets, and background suspend/resume — not as an afterthought.
+一个面向生产的 P2P 协议库仅需三个核心组件：IPv6 直连、STUN UDP 打洞、P2P 中继路由。更复杂的技术（Birthday Attack、TCP Simultaneous Open）仅作为中继暂时不可用时的可选增强。
 
 ---
 
-## References
+## 参考文献
 
-[1] Cyberspace Administration of China, "China IPv6 Development Report (2025)," October 2025.
+[1] 国家互联网信息办公室，《中国 IPv6 发展报告（2025）》，2025 年 10 月。
 
-[2] Expert Committee for Promoting Large-Scale IPv6 Deployment and Application, "China IPv6 Development Status," National IPv6 Development Monitoring Platform, December 2025.
+[2] 推进 IPv6 规模部署和应用专家委员会，《中国 IPv6 发展状况》，国家 IPv6 发展监测平台，2025 年 12 月。
 
-[3] B. Ford, P. Srisuresh, and D. Kegel, "Peer-to-Peer Communication Across Network Address Translators," in *Proceedings of the USENIX Annual Technical Conference (ATC)*, 2005, pp. 179–192.
+[3] B. Ford, P. Srisuresh, and D. Kegel, "Peer-to-Peer Communication Across Network Address Translators," *USENIX ATC*, 2005.
 
-[4] S. Guha and P. Francis, "Characterization and Measurement of TCP Traversal through NATs and Firewalls," in *Proceedings of the 5th ACM SIGCOMM Conference on Internet Measurement (IMC)*, 2005, pp. 199–211.
+[4] S. Guha and P. Francis, "Characterization and Measurement of TCP Traversal through NATs and Firewalls," *ACM IMC*, 2005.
 
-[5] F. Audet and C. Jennings, "Network Address Translation (NAT) Behavioral Requirements for Unicast UDP," IETF RFC 4787, January 2007.
+[5] F. Audet and C. Jennings, "NAT Behavioral Requirements for Unicast UDP," IETF RFC 4787, 2007.
 
-[6] S. Guha, K. Biswas, B. Ford, S. Sivakumar, and P. Srisuresh, "NAT Behavioral Requirements for TCP," IETF RFC 5382, October 2008.
+[6] S. Guha et al., "NAT Behavioral Requirements for TCP," IETF RFC 5382, 2008.
 
 [7] D. Anderson, "NAT Traversal with the Birthday Attack," Tailscale Whitepaper, 2023.
 
 [8] libp2p Project, "Direct Connection Upgrade through Relay (DCUtR)," libp2p Specification, 2022.
 
-[9] J. Rosenberg, R. Mahy, P. Matthews, and D. Wing, "Session Traversal Utilities for NAT (STUN)," IETF RFC 8489, February 2020.
+[9] J. Rosenberg et al., "Session Traversal Utilities for NAT (STUN)," IETF RFC 8489, 2020.
 
-[10] APNIC Labs, "IPv6 Capability Measurements — China AS-level Analysis," August 2025.
+[10] APNIC Labs, "IPv6 Capability Measurements — China AS-level Analysis," 2025.
 
 [11] IPv6-test.com, "Statistics for China by ISP," 2025.
 
-[12] V2EX Community, "Survey: IPv6 Firewall Inbound Behavior Across Chinese ISPs," Community threads 2019–2025.
+[12] V2EX 社区，"中国各运营商 IPv6 防火墙入站行为调查"，2019-2025。
 
-[13] CSDN, "WebRTC STUN Penetration Test Across Three Major Carriers," 2023.
+[13] CSDN，"三大运营商 WebRTC STUN 穿透测试"，2023。
 
-[14] xfox.fun, "Henan Mobile Transitions to Full NAT4," May 2023.
+[14] xfox.fun，"河南移动全面转为 NAT4"，2023 年 5 月。
 
-[15] V2EX Community, "CGNAT Session Limit Testing Across Chinese ISPs," 2023–2025.
-
-[16] IPToolsPro, "IPv6 Adoption in 2026: A Country-by-Country Data Analysis," April 2026.
-
-[17] D. Swer, "Let's Talk About CGNAT and IPv6, Again," APNIC Blog, May 2025.
-
-[18] China Mobile, "IPv6 Practices on China Mobile IP Bearer Network," IETF Internet-Draft, 2025.
-
-[19] X. Li et al., "NAT Traversal in Carrier-Grade NAT Deployments: A Measurement Study," *IEEE/ACM Transactions on Networking*, vol. 30, no. 4, pp. 1684–1698, 2023.
-
-[20] J. Palet Martinez, "IPv6 Deployment in Broadband Access Networks: Best Current Operational Practices," BCOP 690, 2023.
+[15] V2EX 社区，"中国运营商 CGNAT 会话限制测试"，2023-2025。
