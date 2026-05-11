@@ -801,6 +801,12 @@ impl Daemon {
                                                         Err(_) => break,
                                                     }
                                                 }
+                                                // Connection lost — notify subscribers
+                                                let _ = ipc_ev2.send(IpcResponse::Event {
+                                                    event: "peer_disconnected".into(),
+                                                    peer_id: Some(pid2.to_string()),
+                                                    data: None,
+                                                });
                                             });
                                         }
                                         Err(e) => {
@@ -1016,6 +1022,11 @@ impl Daemon {
                             if let Some((conn, _permit)) = connected.write().await.remove(&peer_id) {
                                 conn.close(0u32.into(), b"disconnected");
                             }
+                            let _ = _ipc_ev_tx.send(IpcResponse::Event {
+                                event: "peer_disconnected".into(),
+                                peer_id: Some(peer_id.to_string()),
+                                data: None,
+                            });
                         }
                         IpcCommand::SendToPeer { peer_id, data } => {
                             let conn = {
