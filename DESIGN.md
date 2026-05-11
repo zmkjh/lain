@@ -1966,9 +1966,8 @@ A的app ──fd read/write──→ A的daemon ──QUIC──→ B的daemon �
 |------|------|------|
 | §6.3 Birthday Attack | ❌ | relay 存在时非必需 |
 | §6.3 TCP Simultaneous Open | ❌ | relay 存在时非必需 |
-| §3.7 单 UDP socket | ⚠️ | DHT+QUIC 各自 bind 不同端口。真单 socket 需 `AsyncUdpSocket` trait (~100 行)，工程优化非功能缺陷 |
-| 跨机器 DHT 网络 | ⚠️ | 协议代码完整，但未在 ≥2 台物理机间验证。当前测试用 localhost 模拟 |
-| 真实 STUN/NAT 探测 | ⚠️ | STUN 协议解析有测试，但未配置公共 STUN 服务器运行真实探测 |
+| §3.7 单 UDP socket | ⚠️ | DHT+QUIC 各自 bind 不同端口 |
+| 跨机器 DHT 网络 | ⚠️ | 协议完整，未在 2+ 物理机间验证 |
 | 移动端 (Android/iOS) | ❌ | 设计文档提及但无平台代码 |
 
 ### A.3 当前状态（2026-05 真机验证）
@@ -1989,6 +1988,8 @@ A的app ──fd read/write──→ A的daemon ──QUIC──→ B的daemon �
 | Lain 帧协议 | 10 种帧类型，VarInt 编解码 |
 | mm_connections 限制 | Semaphore 限制活跃连接数 |
 | 端到端测试 | 135+ 自动化测试（单元+集成），Windows 真机验证通过 |
+| IPv6 优先 | 双栈 bind，全局 unicast 地址检测，invite 含 IPv6 端点 |
+| DHT 桥接 | QUIC 连接后交换真实 DHT 地址，路由表自生长 |
 
 ### A.4 CLI 命令
 
