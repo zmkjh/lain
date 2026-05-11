@@ -27,9 +27,9 @@ copy target\release\lain-cli.exe C:\Windows\System32\lain.exe
 **启动 daemon**
 
 ```bash
-$ lain
+$ lain daemon
 Lain daemon started
-PeerID: f8df8b59c08df278
+PeerID: a1b2c3d4e5f6a7b8
 Logs: ~/.lain/daemon.log
 ```
 
@@ -71,7 +71,8 @@ daemon shutting down
 
 | 命令 | 功能 |
 |------|------|
-| `lain` | 启动 daemon（后台模式，日志写文件） |
+| `lain` | 查看网络状态 |
+| `lain daemon` | 启动 daemon（后台模式，日志写文件） |
 | `lain daemon -f` | 前台运行（日志输出到终端） |
 | `lain whoami` | 查看自己的 PeerID |
 | `lain invite` | 生成邀请码 |

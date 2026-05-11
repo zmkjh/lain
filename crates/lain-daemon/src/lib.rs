@@ -974,7 +974,7 @@ impl Daemon {
                                             let _ = ipc_ev.send(IpcResponse::Event {
                                                 event: "peer_error".into(),
                                                 peer_id: Some(peer_id.clone()),
-                                                data: Some(serde_json::json!({"error": "peer not found in DHT"})),
+                                                data: Some(serde_json::json!({"error": "peer not found in DHT — connect to someone first to build the network"})),
                                             });
                                         }
                                     }

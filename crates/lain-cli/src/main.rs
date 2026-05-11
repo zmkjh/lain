@@ -126,7 +126,7 @@ fn main() {
         }
     }
 
-    match cli.command.unwrap_or(Command::Daemon) {
+    match cli.command.unwrap_or(Command::Status) {
         Command::Daemon => run_daemon(cli.foreground),
         Command::Whoami => {
             match ipc_req(&socket_path, r#"{"cmd":"Whoami"}"#) {
@@ -134,7 +134,7 @@ fn main() {
                     let pid = v.get("message").and_then(|m| m.as_str()).unwrap_or("?");
                     println!("PeerID: {pid}");
                 }
-                None => eprintln!("daemon not running"),
+                None => eprintln!("daemon not running — run 'lain daemon' to start"),
             }
         }
         Command::Invite => {
@@ -143,7 +143,7 @@ fn main() {
                     let inv = v.get("message").and_then(|m| m.as_str()).unwrap_or("?");
                     println!("Invite: {inv}");
                 }
-                None => eprintln!("daemon not running"),
+                None => eprintln!("daemon not running — run 'lain daemon' to start"),
             }
         }
         Command::Connect { invite } => connect_feedback(&socket_path, &invite),
@@ -152,20 +152,20 @@ fn main() {
         Command::Disconnect { peer_id } => {
             match ipc_req(&socket_path, &format!(r#"{{"cmd":"Disconnect","peer_id":"{peer_id}"}}"#)) {
                 Some(_) => println!("disconnected from {peer_id}"),
-                None => eprintln!("daemon not running"),
+                None => eprintln!("daemon not running — run 'lain daemon' to start"),
             }
         }
         Command::Monitor => monitor_loop(&socket_path),
         Command::Shutdown => {
             match ipc_req(&socket_path, r#"{"cmd":"Shutdown"}"#) {
                 Some(_) => println!("daemon shutting down"),
-                None => eprintln!("daemon not running"),
+                None => eprintln!("daemon not running — run 'lain daemon' to start"),
             }
         }
         Command::Status => {
             match ipc_req(&socket_path, r#"{"cmd":"ListPeers"}"#) {
                 Some(v) => print_status(&v),
-                None => eprintln!("daemon not running"),
+                None => eprintln!("daemon not running — run 'lain daemon' to start"),
             }
         }
     }
@@ -266,12 +266,15 @@ fn connect_feedback(socket_path: &PathBuf, invite: &str) {
         if reader.read_line(&mut line).is_err() { break; }
         if start.elapsed().as_secs() > 15 {
             println!("timeout — check 'lain status'");
-            // Suggest TSO exchange for NAT-incompatible pairs
+            // Suggest TSO exchange for hard-to-reach peers
             match ipc_req(socket_path, r#"{"cmd":"GetInvite"}"#) {
                 Some(v) => {
                     let my_inv = v.get("message").and_then(|m| m.as_str()).unwrap_or("?");
-                    println!("\nYour invite: {my_inv}");
-                    println!("Share this with your peer, then BOTH run:\n  lain tso <other-peer-invite>\nwithin 30 seconds.");
+                    println!("\nDirect connection failed. To use TSO (TCP simultaneous open):");
+                    println!("  1. Share your invite with the other person:");
+                    println!("     {my_inv}");
+                    println!("  2. Both of you run within 102 seconds:");
+                    println!("     lain tso <other-person-invite>");
                 }
                 None => {}
             }
