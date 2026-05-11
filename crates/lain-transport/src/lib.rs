@@ -8,7 +8,7 @@ use lain_core::identity::Ed25519PublicKey;
 use lain_core::peer::PeerId;
 use lain_core::transport::{Connection as CoreConn, IncomingConnection, PathType, TransportLayer};
 use lain_core::error::CoreError;
-use lain_noise::{NoiseHandshake, NoiseSession, encode_handshake_frame, parse_frame_header};
+use lain_noise::{NoiseHandshake, encode_handshake_frame, parse_frame_header};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;

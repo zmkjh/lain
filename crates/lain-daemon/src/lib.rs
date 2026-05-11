@@ -838,11 +838,12 @@ impl Daemon {
                                     match dht.find_peer(&pid).await {
                                         Ok(Some(record)) => {
                                             tracing::info!("found {pid} via DHT, connecting...");
-                                            match t.connect_raw(&record.noise_pubkey, &record.endpoints).await {
+                                            let eps = record.endpoints.clone();
+                                            let npk = record.noise_pubkey;
+                                            let conn_result = t.connect_raw(&npk, &eps).await;
+                                            match conn_result {
                                                 Ok(conn) => {
-                                                    connected_ref.write().await.insert(pid, (conn.clone(), {
-                                                        conn_sem2.acquire_owned().await.unwrap()
-                                                    }));
+                                                    connected_ref.write().await.insert(pid, (conn, conn_sem2.acquire_owned().await.unwrap()));
                                                     let _ = ipc_ev.send(IpcResponse::Event {
                                                         event: "peer_connected".into(),
                                                         peer_id: Some(pid.to_string()),
@@ -850,11 +851,53 @@ impl Daemon {
                                                     });
                                                 }
                                                 Err(e) => {
+                                                    // Relay fallback
+                                                    tracing::warn!("direct connect to {pid} failed: {e}, trying relay");
+                                                    if let Ok(relays) = dht.find_relays().await {
+                                                        for relay in relays {
+                                                            if relay.node_id == pid { continue; }
+                                                            if let Ok(Some(rec)) = dht.find_peer(&relay.node_id).await {
+                                                                if let Ok(relay_conn) = t.connect_raw(&rec.noise_pubkey, &rec.endpoints).await {
+                                                                    let mut rl = Vec::new();
+                                                                    rl.extend_from_slice(&PeerId::from_hex(&peer_id).unwrap_or(PeerId([0;32])).0);
+                                                                    rl.extend_from_slice(&pid.0);
+                                                                    let rl_frame = lain_core::frame::encode_frame(1, lain_core::frame::FrameType::RelayConnect, &rl);
+                                                                    if let Ok((mut s, _)) = relay_conn.open_bi().await {
+                                                                        s.write_all(&rl_frame).await.ok();
+                                                                        s.finish().ok();
+                                                                        connected_ref.write().await.insert(pid, (relay_conn, conn_sem2.acquire_owned().await.unwrap()));
+                                                                        let _ = ipc_ev.send(IpcResponse::Event {
+                                                                            event: "peer_connected".into(),
+                                                                            peer_id: Some(pid.to_string()),
+                                                                            data: Some(serde_json::json!({"via": "dht+relay"})),
+                                                                        });
+                                                                        return;
+                                                                    }
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                    // TSO fallback
+                                                    let tso_eps: Vec<_> = eps.iter().filter(|ep| ep.kind == lain_core::endpoint::EndpointKind::TSO).map(|ep| ep.addr).collect();
+                                                    if !tso_eps.is_empty() {
+                                                        match t.ts_connect(&npk, &tso_eps).await {
+                                                            Ok((_stream, _session, _peer)) => {
+                                                                let _ = ipc_ev.send(IpcResponse::Event {
+                                                                    event: "peer_connected".into(),
+                                                                    peer_id: Some(pid.to_string()),
+                                                                    data: Some(serde_json::json!({"via": "dht+tso"})),
+                                                                });
+                                                                return;
+                                                            }
+                                                            Err(e) => tracing::debug!("TSO to {pid}: {e}"),
+                                                        }
+                                                    }
                                                     let _ = ipc_ev.send(IpcResponse::Event {
                                                         event: "peer_error".into(),
                                                         peer_id: Some(pid.to_string()),
-                                                        data: Some(serde_json::json!({"error": e.to_string()})),
+                                                        data: Some(serde_json::json!({"error": format!("{e} (all paths exhausted)")})),
                                                     });
+                                                    return;
                                                 }
                                             }
                                         }
