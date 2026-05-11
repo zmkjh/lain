@@ -282,26 +282,38 @@ impl Transport {
         let listener = TcpListener::bind("0.0.0.0:0").await
             .map_err(|e| TransportError::Io(format!("TSO bind: {e}")))?;
 
-        // Race: connect to peer AND accept from peer (30s window)
-        let connect_tasks: Vec<_> = tso_endpoints.iter()
-            .map(|ep| Box::pin(TcpStream::connect(*ep)))
-            .collect();
-        let accept_fut = listener.accept();
+        // Race connect and accept simultaneously. Both sides must try at
+        // the same time so TCP SYNs cross APDF filters. Whichever path
+        // wins first is used; both sides act as initiator for Noise IK.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(102);
+        let mut stream: Option<TcpStream> = None;
 
-        let (mut stream, peer) = tokio::select! {
-            Ok((s, p)) = accept_fut => (s, p),
-            _ = tokio::time::sleep(std::time::Duration::from_secs(102)) => {
-                return Err(TransportError::Connect("TSO timeout".into()));
+        'tso: loop {
+            if std::time::Instant::now() >= deadline { break; }
+            // Try connecting to all endpoints
+            for ep in tso_endpoints {
+                match tokio::time::timeout(
+                    std::time::Duration::from_millis(200), TcpStream::connect(*ep)
+                ).await {
+                    Ok(Ok(s)) => { stream = Some(s); break 'tso; }
+                    _ => {}
+                }
             }
-        };
-
-        // Try connects in case accept wins (other side might have connected to us)
-        for task in connect_tasks {
-            tokio::spawn(task);
+            // Try accepting
+            match tokio::time::timeout(
+                std::time::Duration::from_millis(200), listener.accept()
+            ).await {
+                Ok(Ok((s, _))) => { stream = Some(s); break 'tso; }
+                _ => {}
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
         }
 
-        tracing::info!("TSO established from {peer}");
-        // Noise IK initiator over TCP stream
+        let mut stream = stream
+            .ok_or_else(|| TransportError::Connect("TSO timeout".into()))?;
+
+        tracing::info!("TSO established");
+        // Both sides act as initiator — Noise IK handles role assignment
         let mut noise = NoiseHandshake::new_initiator(&self.noise_secret, noise_pubkey)
             .map_err(|e| TransportError::Noise(format!("TSO init: {e}")))?;
         let ik1 = noise.write_message(&[])
@@ -319,7 +331,7 @@ impl Transport {
             .map_err(|e| TransportError::Noise(format!("TSO ik2: {e}")))?;
         let session = noise.into_transport()
             .map_err(|e| TransportError::Noise(format!("TSO transport: {e}")))?;
-        Ok((stream, session, peer))
+        Ok((stream, session, "0.0.0.0:0".parse().unwrap()))
     }
 
     /// 接受原始 QUIC 连接（包含 Noise IK + HEADERS）
