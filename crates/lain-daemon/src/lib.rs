@@ -173,7 +173,7 @@ impl Daemon {
             let probe = NatProbe::new(stun_addrs, 10);
             probe.probe().await.map_err(|e| DaemonError::Dht(e.to_string()))?
         };
-        tracing::info!("NAT: {:?}, IPv6 inbound: {}", nat_result.nat_type, nat_result.ipv6_inbound);
+        tracing::info!("NAT: {:?}, mapped addr: {:?}, IPv6: {}", nat_result.nat_type, nat_result.mapped_addr, nat_result.ipv6_inbound);
 
         // 2. 身份噪声密钥对
         let (_noise_secret, noise_pubkey) = self.identity.noise_keypair();
