@@ -21,3 +21,7 @@ sha2.workspace = true
 ed25519-dalek.workspace = true
 tokio-tungstenite.workspace = true
 sha1_smol.workspace = true
+
+[dev-dependencies]
+lain-identity = { path = "../lain-identity" }
+tokio = { workspace = true, features = ["net", "sync", "time", "rt", "macros"] }

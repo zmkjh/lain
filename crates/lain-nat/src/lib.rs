@@ -306,4 +306,138 @@ mod tests {
         let result = parse_xor_mapped(&data, &cookie).unwrap();
         assert_eq!(result.port(), port);
     }
+
+    #[test]
+    fn test_parse_mapped_address_ipv4() {
+        let ip = [10, 0, 0, 1u8];
+        let port: u16 = 8080;
+        let mut data = vec![0u8; 8];
+        data[0] = 0;
+        data[1] = 0x01; // IPv4
+        data[2..4].copy_from_slice(&port.to_be_bytes());
+        data[4..8].copy_from_slice(&ip);
+        let result = parse_mapped_address(&data, 8).unwrap();
+        assert_eq!(result.port(), 8080);
+        assert_eq!(result.ip().to_string(), "10.0.0.1");
+    }
+
+    #[test]
+    fn test_parse_mapped_address_ipv6() {
+        let ip = [0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1u8];
+        let port: u16 = 443;
+        let mut data = vec![0u8; 20];
+        data[0] = 0;
+        data[1] = 0x02; // IPv6
+        data[2..4].copy_from_slice(&port.to_be_bytes());
+        data[4..20].copy_from_slice(&ip);
+        let result = parse_mapped_address(&data, 20).unwrap();
+        assert_eq!(result.port(), 443);
+        assert!(result.is_ipv6());
+    }
+
+    #[test]
+    fn test_parse_mapped_address_rejects_too_short() {
+        assert!(parse_mapped_address(&[0u8; 3], 3).is_none());
+        // IPv4 needs 8 bytes
+        let mut data = vec![0u8; 6];
+        data[1] = 0x01;
+        assert!(parse_mapped_address(&data, 6).is_none());
+    }
+
+    #[test]
+    fn test_parse_mapped_address_unknown_family() {
+        let mut data = vec![0u8; 8];
+        data[1] = 0x03; // unknown family
+        assert!(parse_mapped_address(&data, 8).is_none());
+    }
+
+    #[test]
+    fn test_build_binding_request_with_change() {
+        let req = NatProbe::build_binding_request(true);
+        assert_eq!(req.len(), 28);
+        // CHANGE-REQUEST attr at offset 20
+        assert_eq!(&req[20..22], &[0x00, 0x03]); // type
+        assert_eq!(&req[22..24], &[0x00, 0x04]); // length
+        assert_eq!(&req[24..28], &[0x00, 0x00, 0x00, 0x04]); // change port flag
+    }
+
+    #[test]
+    fn test_parse_binding_response_with_mapped_address() {
+        // Build a minimal STUN response with MAPPED-ADDRESS
+        let mut msg = vec![0u8; 32];
+        msg[0] = 0x01; // Binding Success Response
+        msg[1] = 0x01;
+        // msg_len at [2..4] = 12 (attr only)
+        msg[2] = 0x00; msg[3] = 12;
+        // Attribute at offset 20: MAPPED-ADDRESS type=0x0001
+        msg[20] = 0x00; msg[21] = 0x01;
+        msg[22] = 0x00; msg[23] = 0x08; // attr_len = 8
+        msg[24] = 0; msg[25] = 1; // family=IPv4
+        msg[26] = 0x1F; msg[27] = 0x90; // port=8080
+        msg[28..32].copy_from_slice(&[192, 168, 1, 100]);
+
+        let result = NatProbe::parse_binding_response(&msg, "1.2.3.4:3478".parse().unwrap());
+        assert!(result.is_some());
+        let addr = result.unwrap();
+        assert_eq!(addr.port(), 8080);
+        assert_eq!(addr.ip().to_string(), "192.168.1.100");
+    }
+
+    #[test]
+    fn test_parse_binding_response_with_xor_mapped() {
+        let cookie: [u8; 4] = [0x21, 0x12, 0xA4, 0x42];
+        let real_ip = [10, 20, 30, 40u8];
+        let real_port: u16 = 9999;
+        let port_xor = real_port ^ u16::from_be_bytes([cookie[0], cookie[1]]);
+
+        let mut msg = vec![0u8; 32];
+        msg[0] = 0x01; msg[1] = 0x01;
+        msg[2] = 0x00; msg[3] = 12;
+        // XOR-MAPPED-ADDRESS: type=0x0020
+        msg[20] = 0x00; msg[21] = 0x20;
+        msg[22] = 0x00; msg[23] = 0x08;
+        msg[24] = 0; msg[25] = 1; // family
+        msg[26..28].copy_from_slice(&port_xor.to_be_bytes());
+        for i in 0..4 {
+            msg[28 + i] = real_ip[i] ^ cookie[i];
+        }
+
+        let result = NatProbe::parse_binding_response(&msg, "1.2.3.4:3478".parse().unwrap());
+        assert!(result.is_some());
+        let addr = result.unwrap();
+        assert_eq!(addr.port(), real_port);
+        assert_eq!(addr.ip().to_string(), "10.20.30.40");
+    }
+
+    #[test]
+    fn test_parse_binding_response_rejects_too_short() {
+        assert!(NatProbe::parse_binding_response(&[0u8; 10], "1.2.3.4:3478".parse().unwrap()).is_none());
+    }
+
+    #[test]
+    fn test_parse_binding_response_fallback_to_stun_addr() {
+        // No attributes, should fall back to STUN server addr
+        let mut msg = vec![0u8; 24];
+        msg[0] = 0x01; msg[1] = 0x01;
+        msg[2] = 0x00; msg[3] = 4; // msg_len=4, no content
+        let stun = "8.8.8.8:3478".parse().unwrap();
+        let result = NatProbe::parse_binding_response(&msg, stun).unwrap();
+        assert_eq!(result, stun);
+    }
+
+    #[test]
+    fn test_parse_xor_mapped_rejects_ipv6_family() {
+        let cookie = [0x21, 0x12, 0xA4, 0x42];
+        let mut data = vec![0u8; 20];
+        data[1] = 0x02; // IPv6 family
+        assert!(parse_xor_mapped(&data, &cookie).is_none());
+    }
+
+    #[test]
+    fn test_parse_xor_mapped_rejects_too_short() {
+        assert!(parse_xor_mapped(&[0u8; 3], &[0u8; 4]).is_none());
+        let mut data = vec![0u8; 6];
+        data[1] = 0x01;
+        assert!(parse_xor_mapped(&data, &[0u8; 4]).is_none());
+    }
 }

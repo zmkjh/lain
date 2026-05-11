@@ -960,6 +960,7 @@ dependencies = [
  "ed25519-dalek",
  "lain-core",
  "lain-dht",
+ "lain-identity",
  "lain-nat",
  "lain-noise",
  "quinn",

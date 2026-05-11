@@ -708,9 +708,139 @@ fn base64_encode(data: &[u8]) -> String {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+    use lain_identity::Identity;
+    use lain_core::identity::IdentityProvider;
+
     #[test]
     fn test_config_defaults() {
         let c = TransportConfig::default();
         assert_eq!(c.max_connections, 256);
+    }
+
+    #[tokio::test]
+    async fn test_new_with_specific_bind_addr() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let t = Transport::new(
+            TransportConfig { bind_addr: "127.0.0.1:0".parse().unwrap(), ..Default::default() },
+            [1u8; 32],
+            PeerId([2u8; 32]),
+            [3u8; 32],
+        ).unwrap();
+        let addr = t.local_addr().unwrap();
+        assert!(addr.port() > 0, "should bind to an available port");
+    }
+
+    #[tokio::test]
+    async fn test_local_addr_returns_bound_port() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let t = Transport::new(
+            TransportConfig { bind_addr: "127.0.0.1:0".parse().unwrap(), ..Default::default() },
+            [4u8; 32],
+            PeerId([5u8; 32]),
+            [6u8; 32],
+        ).unwrap();
+        let addr = t.local_addr().unwrap();
+        assert!(addr.ip().is_loopback());
+        assert!(addr.port() > 0);
+    }
+
+    #[test]
+    fn test_no_verify_client_structure() {
+        use rustls::client::danger::ServerCertVerifier;
+        use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
+
+        let nv = NoVerify;
+        let cert = CertificateDer::from(vec![]);
+        let name = ServerName::try_from("localhost").unwrap();
+        let time = UnixTime::since_unix_epoch(std::time::Duration::from_secs(0));
+
+        // All verify methods must return Ok
+        assert!(nv.verify_server_cert(&cert, &[], &name, &[], time).is_ok());
+        // TLS signature verifiers are no-ops in NoVerify; test they don't panic
+        assert!(nv.supported_verify_schemes().contains(&rustls::SignatureScheme::ED25519));
+
+        // supported_verify_schemes should include common ones
+        let schemes = nv.supported_verify_schemes();
+        assert!(!schemes.is_empty());
+        assert!(schemes.contains(&rustls::SignatureScheme::ED25519));
+    }
+
+    #[tokio::test]
+    async fn test_connect_raw_with_invalid_endpoint() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+
+        let id = Identity::generate().ok().unwrap();
+        let (ns, _np) = id.noise_keypair();
+
+        let t = Transport::new(
+            TransportConfig {
+                bind_addr: "127.0.0.1:0".parse().unwrap(),
+                traversal_timeout_secs: 1, // short timeout for test
+                ..Default::default()
+            },
+            ns, id.peer_id(), *id.public_key(),
+        ).unwrap();
+
+        // Try connecting to an unreachable port (nothing listening there)
+        let bad_ep = Endpoint::new("127.0.0.1:1".parse().unwrap(), EndpointKind::STUN);
+        let result = t.connect_raw(&[0u8; 32], &[bad_ep]).await;
+        assert!(result.is_err(), "connect to unreachable port should fail");
+    }
+
+    #[tokio::test]
+    async fn test_connect_raw_fallback_to_second_endpoint() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+
+        let id_a = Identity::generate().ok().unwrap();
+        let id_b = Identity::generate().ok().unwrap();
+        let (ns_a, _np_a) = id_a.noise_keypair();
+        let (ns_b, np_b) = id_b.noise_keypair();
+
+        let t_a = Transport::new(
+            TransportConfig {
+                bind_addr: "127.0.0.1:0".parse().unwrap(),
+                traversal_timeout_secs: 5,
+                ..Default::default()
+            },
+            ns_a, id_a.peer_id(), *id_a.public_key(),
+        ).unwrap();
+
+        let t_b = Arc::new(Transport::new(
+            TransportConfig { bind_addr: "127.0.0.1:0".parse().unwrap(), ..Default::default() },
+            ns_b, id_b.peer_id(), *id_b.public_key(),
+        ).unwrap());
+        let b_port = t_b.local_addr().unwrap().port();
+
+        // B accept
+        let t_b2 = t_b.clone();
+        let (conn_tx, mut conn_rx) = tokio::sync::mpsc::channel::<quinn::Connection>(1);
+        tokio::spawn(async move {
+            if let Ok((conn, _, _)) = t_b2.accept_connection().await {
+                conn_tx.send(conn).await.ok();
+            }
+        });
+
+        // Try: first endpoint is unreachable, second is reachable
+        let bad_ep = Endpoint::new("127.0.0.1:1".parse().unwrap(), EndpointKind::STUN);
+        let good_ep = Endpoint::new(format!("127.0.0.1:{b_port}").parse().unwrap(), EndpointKind::STUN);
+
+        let conn = t_a.connect_raw(&np_b, &[bad_ep, good_ep]).await;
+        assert!(conn.is_ok(), "should connect via second endpoint: {:?}", conn.err());
+
+        let _b_conn = conn_rx.recv().await.unwrap();
+    }
+
+    #[test]
+    fn test_config_custom_values() {
+        let c = TransportConfig {
+            bind_addr: "0.0.0.0:9000".parse().unwrap(),
+            max_connections: 128,
+            idle_timeout_ms: 60000,
+            traversal_timeout_secs: 15,
+        };
+        assert_eq!(c.max_connections, 128);
+        assert_eq!(c.idle_timeout_ms, 60000);
+        assert_eq!(c.traversal_timeout_secs, 15);
+        assert_eq!(c.bind_addr.port(), 9000);
     }
 }
