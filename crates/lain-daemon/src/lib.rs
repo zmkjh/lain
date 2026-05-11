@@ -175,12 +175,37 @@ impl Daemon {
         };
         tracing::info!("NAT: {:?}, mapped addr: {:?}, IPv6: {}", nat_result.nat_type, nat_result.mapped_addr, nat_result.ipv6_inbound);
 
-        // 2. 身份噪声密钥对
+        // 2. Purity under NAT: detect IPv6 global address for direct P2P
+        let bind_addr = if nat_result.ipv6_inbound {
+            "[::]:0".parse::<SocketAddr>()
+                .map_err(|e: std::net::AddrParseError| DaemonError::Config(e.to_string()))?
+        } else {
+            "0.0.0.0:0".parse::<SocketAddr>()
+                .map_err(|e: std::net::AddrParseError| DaemonError::Config(e.to_string()))?
+        };
+        let ipv6_addr: Option<std::net::SocketAddr> = if nat_result.ipv6_inbound {
+            if_addrs::get_if_addrs().ok().and_then(|ifs| {
+                ifs.into_iter().find_map(|i| {
+                    match i.addr {
+                        if_addrs::IfAddr::V6(v6)
+                            if !v6.ip.is_loopback() && !v6.ip.is_unspecified()
+                               && (v6.ip.segments()[0] & 0xE000) == 0x2000 => // 2000::/3 global unicast
+                            Some(SocketAddr::new(std::net::IpAddr::V6(v6.ip), 0)),
+                        _ => None,
+                    }
+                })
+            })
+        } else { None };
+        if let Some(ref addr) = ipv6_addr {
+            tracing::info!("IPv6 global: {}", addr.ip());
+        }
+
+        // 3. 身份噪声密钥对
         let (_noise_secret, noise_pubkey) = self.identity.noise_keypair();
 
-        // 3. 初始化 Transport (先绑定以获取端口)
+        // 3. 初始化 Transport (dual-stack when IPv6 available)
         let transport = Transport::new(
-            TransportConfig::default(),
+            TransportConfig { bind_addr, ..Default::default() },
             _noise_secret,
             peer_id,
             public_key,
@@ -201,8 +226,7 @@ impl Daemon {
             heartbeat_interval_secs: self.config.dht.heartbeat_interval_secs,
             republish_interval_secs: lain_core::DHT_REPUBLISH_SECS,
             idle_peer_timeout_secs: 900,
-            local_addr: "0.0.0.0:0".parse::<SocketAddr>()
-                .map_err(|e: std::net::AddrParseError| DaemonError::Config(e.to_string()))?,
+            local_addr: bind_addr,
             bootstrap_nodes: self.config.dht.bootstrap_nodes.clone(),
         };
 
@@ -238,13 +262,24 @@ impl Daemon {
 
         let local_dht_addr = dht.socket().local_addr()
             .map_err(|e| DaemonError::Config(format!("DHT addr: {e}")))?;
-        let mut endpoints = if let Some(addr) = nat_result.mapped_addr {
-            vec![Endpoint::new(addr, lain_core::endpoint::EndpointKind::STUN)]
-        } else {
-            vec![]
-        };
-        // Include DHT UDP port with public IP so peers can reach DHT behind NAT.
-        // local_dht_addr is 0.0.0.0:<port>; use STUN IP + DHT port for real routability.
+        // Build endpoint list: IPv6 (direct P2P, pure), STUN (NAT-piercing), DHT
+        let mut endpoints: Vec<Endpoint> = Vec::new();
+        if let Some(addr) = ipv6_addr {
+            // IPv6 is pure — no NAT, globally routable from the start
+            endpoints.push(Endpoint::new(
+                SocketAddr::new(addr.ip(), transport_port),
+                lain_core::endpoint::EndpointKind::IPv6,
+            ));
+        }
+        if let Some(addr) = nat_result.mapped_addr {
+            endpoints.push(Endpoint::new(addr, lain_core::endpoint::EndpointKind::STUN));
+        }
+        // Include DHT UDP ports so peers can reach our DHT socket
+        if let Some(ref addr) = ipv6_addr {
+            let ipv6_dht = SocketAddr::new(addr.ip(), local_dht_addr.port());
+            endpoints.push(Endpoint::new(ipv6_dht, lain_core::endpoint::EndpointKind::IPv6));
+        }
+        // IPv4 DHT: use STUN IP + DHT port for routability behind NAT
         let public_dht_addr = if let Some(stun) = nat_result.mapped_addr {
             SocketAddr::new(stun.ip(), local_dht_addr.port())
         } else {
