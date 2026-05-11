@@ -229,6 +229,58 @@ async fn test_pure_quic_connect() {
     let _ = server_handle.await;
 }
 
+// ── Test 6: End-to-end Lain (QUIC + Noise IK X25519 + data) ──
+
+#[tokio::test]
+async fn test_lain_end_to_end() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let _ = tracing_subscriber::fmt::try_init();
+    let id_a = Identity::generate().ok().unwrap();
+    let id_b = Identity::generate().ok().unwrap();
+    let (ns_a, np_a) = id_a.noise_keypair();
+    let (ns_b, np_b) = id_b.noise_keypair();
+
+    let t_a = Arc::new(Transport::new(
+        TransportConfig { bind_addr: "127.0.0.1:0".parse().unwrap(), ..Default::default() },
+        ns_a, id_a.peer_id(), *id_a.public_key()).unwrap());
+    let t_b = Arc::new(Transport::new(
+        TransportConfig { bind_addr: "127.0.0.1:0".parse().unwrap(), ..Default::default() },
+        ns_b, id_b.peer_id(), *id_b.public_key()).unwrap());
+
+    let b_addr: SocketAddr = format!("127.0.0.1:{}", t_b.local_addr().unwrap().port()).parse().unwrap();
+
+    // B accept loop — keep reading streams after Noise IK
+    let t_b2 = t_b.clone();
+    let (conn_tx, mut conn_rx) = tokio::sync::mpsc::channel::<quinn::Connection>(1);
+    tokio::spawn(async move {
+        if let Ok((conn, _, _)) = t_b2.accept_connection().await {
+            conn_tx.send(conn).await.ok();
+        }
+    });
+
+    // A connects using B's X25519 noise pubkey
+    let conn = t_a.connect_raw(&np_b, &[Endpoint::new(b_addr, EndpointKind::STUN)]).await
+        .expect("Lain connect should work");
+
+    // Get B's connection handle
+    let b_conn = conn_rx.recv().await.unwrap();
+
+    // A sends data, B reads it
+    let (mut a_send, mut a_recv) = conn.open_bi().await.unwrap();
+    a_send.write_all(b"hello lain e2e").await.unwrap();
+    a_send.finish().unwrap();
+
+    // B reads the incoming stream
+    let (mut b_send, mut b_recv) = b_conn.accept_bi().await.unwrap();
+    let data = b_recv.read_to_end(65536).await.unwrap();
+    b_send.write_all(&data).await.unwrap(); // echo back
+    b_send.finish().unwrap();
+
+    // A reads the echo
+    let echo = a_recv.read_to_end(65536).await.unwrap();
+    assert_eq!(echo, b"hello lain e2e", "end-to-end roundtrip");
+}
+
 #[derive(Debug)]
 struct NoVerifyClient;
 impl rustls::client::danger::ServerCertVerifier for NoVerifyClient {
