@@ -423,21 +423,30 @@ impl Daemon {
                 match t.accept_connection().await {
                     Ok((conn, _peer_id, _pubkey)) => {
                         let c = conn.clone();
+                        let my_id = peer_id;
                         let my_dht_addr = public_dht;
                         tokio::spawn(async move {
                             if let Ok((mut _send, mut recv)) = c.accept_bi().await {
                                 let mut buf = vec![0u8; 2048];
                                 if let Ok(Some(n)) = recv.read(&mut buf).await {
-                                    // DHT address exchange: non-frame plaintext stream
+                                    // DHT address exchange + PeerID: non-frame plaintext stream
+                                    // Format: "DHT_ADDR:ip:port:PeerIDhex"
                                     if buf[..n].starts_with(b"DHT_ADDR:") {
-                                        let peer_addr_str = std::str::from_utf8(&buf[7..n])
-                                            .unwrap_or("").trim();
-                                        if let Ok(peer_dht) = peer_addr_str.parse::<SocketAddr>() {
-                                            d.add_node(_peer_id, peer_dht).await;
-                                            // Respond with our DHT addr (public IP + DHT port)
-                                            let resp = format!("DHT_ADDR:{my_dht_addr}");
-                                            _send.write_all(resp.as_bytes()).await.ok();
-                                            _send.finish().ok();
+                                        let parts: Vec<&str> = std::str::from_utf8(&buf[7..n])
+                                            .unwrap_or("").trim().split(':').collect();
+                                        if parts.len() >= 3 {
+                                            if let Ok(peer_dht) = format!("{}:{}", parts[0], parts[1]).parse::<SocketAddr>() {
+                                                let correct_peer_id = if parts.len() >= 4 {
+                                                    PeerId::from_hex(parts[3]).unwrap_or(_peer_id)
+                                                } else {
+                                                    _peer_id
+                                                };
+                                                d.add_node(correct_peer_id, peer_dht).await;
+                                                // Respond with our DHT addr (public IP + DHT port) + PeerID
+                                                let resp = format!("DHT_ADDR:{my_dht_addr}:{}", my_id);
+                                                _send.write_all(resp.as_bytes()).await.ok();
+                                                _send.finish().ok();
+                                            }
                                         }
                                         return;
                                     }
@@ -705,16 +714,21 @@ impl Daemon {
                                             // correct DHT port (not the QUIC port).
                                             if let Some(dht_addr) = my_dht {
                                                 if let Ok((mut s, mut r)) = conn.open_bi().await {
-                                                    let msg = format!("DHT_ADDR:{dht_addr}");
+                                                    let msg = format!("DHT_ADDR:{dht_addr}:{my_id}");
                                                     if s.write_all(msg.as_bytes()).await.is_ok() {
                                                         s.finish().ok();
                                                         let mut buf = vec![0u8; 128];
                                                         if let Ok(Some(n)) = r.read(&mut buf).await {
                                                             if buf[..n].starts_with(b"DHT_ADDR:") {
-                                                                if let Ok(addr_str) = std::str::from_utf8(&buf[7..n]) {
-                                                                    if let Ok(peer_dht) = addr_str.trim().parse::<SocketAddr>() {
-                                                                        dht.add_node(pid, peer_dht).await;
-                                                                        tracing::info!("DHT bridged: {pid} @ {peer_dht}");
+                                                                let parts: Vec<&str> = std::str::from_utf8(&buf[7..n])
+                                                                    .unwrap_or("").trim().split(':').collect();
+                                                                if parts.len() >= 2 {
+                                                                    if let Ok(peer_dht) = format!("{}:{}", parts[0], parts[1]).parse::<SocketAddr>() {
+                                                                        let correct_pid = if parts.len() >= 3 {
+                                                                            PeerId::from_hex(parts[2]).unwrap_or(pid)
+                                                                        } else { pid };
+                                                                        dht.add_node(correct_pid, peer_dht).await;
+                                                                        tracing::info!("DHT bridged: {correct_pid} @ {peer_dht}");
                                                                     }
                                                                 }
                                                             }
