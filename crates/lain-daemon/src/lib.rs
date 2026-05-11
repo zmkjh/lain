@@ -695,11 +695,46 @@ impl Daemon {
                                             });
                                         }
                                         Err(e) => {
-                                            tracing::warn!("connect to {pid} failed: {e}");
+                                            tracing::warn!("direct connect to {pid} failed: {e}, trying relay");
+                                            // Fallback: relay through any reachable peer
+                                            if let Ok(relays) = dht.find_relays().await {
+                                                for relay in relays {
+                                                    if relay.node_id == my_id || relay.node_id == pid {
+                                                        continue;
+                                                    }
+                                                    if let Ok(Some(rec)) = dht.find_peer(&relay.node_id).await {
+                                                        if let Ok(relay_conn) = t.connect_raw(&rec.noise_pubkey, &rec.endpoints).await {
+                                                            let mut rl = Vec::with_capacity(64);
+                                                            rl.extend_from_slice(&my_id.0);
+                                                            rl.extend_from_slice(&pid.0);
+                                                            let rl_frame = lain_core::frame::encode_frame(
+                                                                1, lain_core::frame::FrameType::RelayConnect, &rl,
+                                                            );
+                                                            if let Ok((mut s, _)) = relay_conn.open_bi().await {
+                                                                s.write_all(&rl_frame).await.ok();
+                                                                s.finish().ok();
+                                                                tracing::info!("relay: {my_id} -> {pid} via {}", relay.node_id);
+                                                                // Connected via relay — same as direct
+                                                                connected_ref.write().await.insert(pid, (relay_conn, {
+                                                                    let permit = conn_sem2.clone().acquire_owned().await.unwrap();
+                                                                    permit
+                                                                }));
+                                                                let _ = ipc_ev.send(IpcResponse::Event {
+                                                                    event: "peer_connected".into(),
+                                                                    peer_id: Some(pid.to_string()),
+                                                                    data: Some(serde_json::json!({"via": "relay"})),
+                                                                });
+                                                                return;
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                            // All relay attempts failed
                                             let _ = ipc_ev.send(IpcResponse::Event {
                                                 event: "peer_error".into(),
                                                 peer_id: Some(pid.to_string()),
-                                                data: Some(serde_json::json!({"error": e.to_string()})),
+                                                data: Some(serde_json::json!({"error": format!("{e} (relay unavailable)")})),
                                             });
                                         }
                                     }
