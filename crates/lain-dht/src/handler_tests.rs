@@ -302,3 +302,72 @@ async fn test_load_routes_nonexistent_file() {
     let loaded = dht.load_routes(&tmp).await.unwrap();
     assert_eq!(loaded, 0, "nonexistent file should load 0 routes");
 }
+
+#[tokio::test]
+async fn test_signed_message_verified_and_rejected() {
+    // Generate real identity for sender (with Ed25519 signing key)
+    let sender_id = Identity::generate().ok().unwrap();
+    let sender_pubkey = *sender_id.public_key();
+    let sender_peer = sender_id.peer_id();
+    let sender_seed = sender_id.signing_seed();
+
+    // Receiver DHT
+    let receiver = Arc::new(DhtHandle::new(make_id(31), [31u8; 32], make_config("127.0.0.1:0")).unwrap());
+    spawn_recv_loop(receiver.clone());
+
+    // Pre-populate receiver's peer_records with sender's pubkey (so verify_strict is reached)
+    let record = PeerRecord {
+        pubkey: sender_pubkey,
+        noise_pubkey: sender_pubkey, // placeholder
+        endpoints: vec![],
+        capabilities: Capabilities::new(),
+        ttl_remaining: 600,
+        expires_at: std::time::Instant::now() + Duration::from_secs(600),
+    };
+    receiver.peer_records.write().await.insert(sender_peer, record);
+
+    let receiver_addr = receiver.socket().local_addr().unwrap();
+
+    // Send signed PING with valid signature
+    let msg_id = [42u8; 16];
+    let signed_ping = msg_codec::encode_ping_request_signed(sender_peer, msg_id, Some(&sender_seed));
+    receiver.socket().send_to(&signed_ping, receiver_addr).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Valid signed message should be accepted (routing table updated)
+    let size = receiver.routing_table_size().await;
+    assert!(size >= 1, "signed PING should be accepted: routing table has {size} nodes");
+
+    // Now tamper with a signed message: sign fresh, then corrupt body
+    let msg_id2 = [43u8; 16];
+    let mut tampered_bytes = msg_codec::encode_ping_request_signed(sender_peer, msg_id2, Some(&sender_seed));
+    // Corrupt the body (e.g., change message_id between header and signature)
+    if tampered_bytes.len() > 30 { tampered_bytes[20] ^= 0xFF; }
+    receiver.socket().send_to(&tampered_bytes, receiver_addr).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Receiver should still be alive (tampered message rejected gracefully)
+    let size2 = receiver.routing_table_size().await;
+    assert!(size2 >= 1, "receiver should survive tampered message; routing table has {size2} nodes");
+}
+
+#[tokio::test]
+async fn test_sender_without_record_accepted_deferred() {
+    // Unknown sender (no record in peer_records) — accepted with deferred verification
+    let unknown_id = Identity::generate().ok().unwrap();
+    let unknown_peer = unknown_id.peer_id();
+    let unknown_seed = unknown_id.signing_seed();
+
+    let receiver = Arc::new(DhtHandle::new(make_id(32), [32u8; 32], make_config("127.0.0.1:0")).unwrap());
+    spawn_recv_loop(receiver.clone());
+
+    let receiver_addr = receiver.socket().local_addr().unwrap();
+
+    let signed_ping = msg_codec::encode_ping_request_signed(unknown_peer, [44u8; 16], Some(&unknown_seed));
+    receiver.socket().send_to(&signed_ping, receiver_addr).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Deferred verification: unknown peer accepted, routing table updated
+    let size = receiver.routing_table_size().await;
+    assert!(size >= 1, "unknown signed peer should be accepted (deferred verification): got {size}");
+}

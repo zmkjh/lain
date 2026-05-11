@@ -721,3 +721,58 @@ fn dirs_home() -> Option<PathBuf> {
     { if let Ok(h) = std::env::var("HOME") { return Some(PathBuf::from(h)); } }
     None
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use lain_identity::Identity;
+
+    // Test the stored peer format used by save_peers/load_peers
+    #[test]
+    fn test_peer_json_roundtrip() {
+        let id = Identity::generate().ok().unwrap();
+        let pid = id.peer_id();
+
+        // Create a stored peer list (same format as save_peers writes)
+        let entries = vec![StoredPeer {
+            peer_id_hex: pid.to_hex(),
+            pubkey_hex: String::new(),
+            endpoints: vec!["127.0.0.1:8080".to_string()],
+        }];
+
+        // Sign and wrap (same as save_peers does)
+        let sig = id.sign(serde_json::to_string(&entries).unwrap().as_bytes());
+        let signed = serde_json::json!({
+            "data": entries,
+            "sig": hex::encode(sig),
+        });
+
+        let json = serde_json::to_string(&signed).unwrap();
+
+        // Parse back (same logic as load_peers)
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let loaded: Vec<StoredPeer> = serde_json::from_value(parsed["data"].clone()).unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].peer_id_hex, pid.to_hex());
+        assert_eq!(loaded[0].endpoints[0], "127.0.0.1:8080");
+    }
+
+    #[test]
+    fn test_peer_json_load_legacy_format() {
+        let id = Identity::generate().ok().unwrap();
+        let pid = id.peer_id();
+
+        // Legacy format: just the array, no signature wrapper
+        let entries = vec![StoredPeer {
+            peer_id_hex: pid.to_hex(),
+            pubkey_hex: String::new(),
+            endpoints: vec!["10.0.0.1:443".to_string()],
+        }];
+        let json = serde_json::to_string(&entries).unwrap();
+
+        // Parse as legacy (load_peers fallback path)
+        let parsed: Vec<StoredPeer> = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].peer_id_hex, pid.to_hex());
+    }
+}

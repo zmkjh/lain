@@ -210,4 +210,54 @@ mod tests {
         assert!(secret.iter().any(|&b| b != 0));
         assert!(public.iter().any(|&b| b != 0));
     }
+
+    #[test]
+    fn test_save_and_load_identity() {
+        let id = Identity::generate().unwrap();
+        let pid = id.peer_id();
+        let pk = *id.public_key();
+
+        // Sign to have a known signature
+        let sig_before = id.sign(b"test data");
+
+        // Save to temp file
+        let tmp = std::env::temp_dir().join("lain_test_identity.json");
+        id.save_to_file(&tmp).unwrap();
+        assert!(tmp.exists());
+
+        // Load back
+        let loaded = Identity::load_from_file(&tmp).unwrap();
+        assert_eq!(loaded.peer_id(), pid, "PeerID should match");
+        assert_eq!(loaded.public_key(), &pk, "public key should match");
+
+        // Loaded identity should produce same signatures
+        let sig_after = loaded.sign(b"test data");
+        assert_eq!(sig_before, sig_after, "signatures from saved/loaded identity should match");
+
+        // Noise keypair should also be deterministic
+        let (s_before, p_before) = id.noise_keypair();
+        let (s_after, p_after) = loaded.noise_keypair();
+        assert_eq!(s_before, s_after);
+        assert_eq!(p_before, p_after);
+
+        // Cleanup
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn test_corrupted_identity_rejected() {
+        let id = Identity::generate().unwrap();
+        let tmp = std::env::temp_dir().join("lain_test_identity_corrupt.json");
+        id.save_to_file(&tmp).unwrap();
+
+        // Corrupt the file: change one byte
+        let bytes = std::fs::read_to_string(&tmp).unwrap();
+        let corrupted = bytes.replace(":", ":X").replace("0", "9"); // break json or hex
+        std::fs::write(&tmp, corrupted).unwrap();
+
+        let result = Identity::load_from_file(&tmp);
+        assert!(result.is_err(), "corrupted identity file should fail to load");
+
+        let _ = std::fs::remove_file(&tmp);
+    }
 }
