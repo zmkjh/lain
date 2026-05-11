@@ -271,8 +271,13 @@ impl Daemon {
                 lain_core::endpoint::EndpointKind::IPv6,
             ));
         }
-        if let Some(addr) = nat_result.mapped_addr {
-            endpoints.push(Endpoint::new(addr, lain_core::endpoint::EndpointKind::STUN));
+        if let Some(stun) = nat_result.mapped_addr {
+            // STUN gives us the public IP, but the port is for the probe socket.
+            // Combine STUN IP with our actual QUIC transport port.
+            endpoints.push(Endpoint::new(
+                SocketAddr::new(stun.ip(), transport_port),
+                lain_core::endpoint::EndpointKind::STUN,
+            ));
         }
         // Include DHT UDP ports so peers can reach our DHT socket
         if let Some(ref addr) = ipv6_addr {

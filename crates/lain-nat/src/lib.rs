@@ -168,7 +168,7 @@ impl NatProbe {
         if data.len() < 20 {
             return None;
         }
-        if data[0] != 0x01 && data[0] != 0x01 {
+        if data[0] != 0x01 || data[1] != 0x01 {
             return None;
         }
         let msg_len = u16::from_be_bytes([data[2], data[3]]) as usize;
