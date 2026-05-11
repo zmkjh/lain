@@ -262,6 +262,7 @@ fn decode_endpoint_binary(data: &[u8], offset: &mut usize) -> Option<Endpoint> {
         2 => EndpointKind::LAN,
         3 => EndpointKind::WebSocket,
         4 => EndpointKind::Relay,
+        5 => EndpointKind::TSO,
         _ => EndpointKind::LAN,
     };
     let ttl_bytes = [data[*offset], data[*offset + 1], data[*offset + 2], data[*offset + 3]];

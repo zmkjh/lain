@@ -8,7 +8,7 @@ use lain_core::identity::Ed25519PublicKey;
 use lain_core::peer::PeerId;
 use lain_core::transport::{Connection as CoreConn, IncomingConnection, PathType, TransportLayer};
 use lain_core::error::CoreError;
-use lain_noise::{NoiseHandshake, encode_handshake_frame, parse_frame_header};
+use lain_noise::{NoiseHandshake, NoiseSession, encode_handshake_frame, parse_frame_header};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -268,6 +268,58 @@ impl Transport {
                 }
             }
         });
+    }
+
+    /// TCP Simultaneous Open: both sides bind TCP and connect simultaneously.
+    /// Used as fallback when UDP hole punch fails (APDF Symmetric NAT pairs).
+    /// Returns raw TCP stream after Noise IK handshake.
+    pub async fn ts_connect(
+        &self,
+        noise_pubkey: &Ed25519PublicKey,
+        tso_endpoints: &[SocketAddr],
+    ) -> Result<(tokio::net::TcpStream, lain_noise::NoiseSession, SocketAddr), TransportError> {
+        use tokio::net::{TcpListener, TcpStream};
+        let listener = TcpListener::bind("0.0.0.0:0").await
+            .map_err(|e| TransportError::Io(format!("TSO bind: {e}")))?;
+
+        // Race: connect to peer AND accept from peer (30s window)
+        let connect_tasks: Vec<_> = tso_endpoints.iter()
+            .map(|ep| Box::pin(TcpStream::connect(*ep)))
+            .collect();
+        let accept_fut = listener.accept();
+
+        let (mut stream, peer) = tokio::select! {
+            Ok((s, p)) = accept_fut => (s, p),
+            _ = tokio::time::sleep(std::time::Duration::from_secs(30)) => {
+                return Err(TransportError::Connect("TSO timeout".into()));
+            }
+        };
+
+        // Try connects in case accept wins (other side might have connected to us)
+        for task in connect_tasks {
+            tokio::spawn(task);
+        }
+
+        tracing::info!("TSO established from {peer}");
+        // Noise IK initiator over TCP stream
+        let mut noise = NoiseHandshake::new_initiator(&self.noise_secret, noise_pubkey)
+            .map_err(|e| TransportError::Noise(format!("TSO init: {e}")))?;
+        let ik1 = noise.write_message(&[])
+            .map_err(|e| TransportError::Noise(format!("TSO ik1: {e}")))?;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        stream.write_all(&encode_handshake_frame(0, &ik1)).await
+            .map_err(|e| TransportError::Io(format!("TSO send: {e}")))?;
+        let mut buf = vec![0u8; 4096];
+        let n = stream.read(&mut buf).await
+            .map_err(|e| TransportError::Io(format!("TSO recv: {e}")))?;
+        let header = parse_frame_header(&buf[..n])
+            .map_err(|e| TransportError::Noise(format!("TSO parse: {e}")))?;
+        let payload = &buf[8..8 + header.payload_len.min(n - 8)];
+        noise.read_message(payload)
+            .map_err(|e| TransportError::Noise(format!("TSO ik2: {e}")))?;
+        let session = noise.into_transport()
+            .map_err(|e| TransportError::Noise(format!("TSO transport: {e}")))?;
+        Ok((stream, session, peer))
     }
 
     /// 接受原始 QUIC 连接（包含 Noise IK + HEADERS）

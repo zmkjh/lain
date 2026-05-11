@@ -401,6 +401,7 @@ pub fn parse_endpoints(data: &[u8], ep_data_len: usize) -> Vec<Endpoint> {
             2 => EndpointKind::LAN,
             3 => EndpointKind::WebSocket,
             4 => EndpointKind::Relay,
+            5 => EndpointKind::TSO,
             _ => EndpointKind::STUN,
         };
         let ttl_bytes = [data[offset], data[offset+1], data[offset+2], data[offset+3]];

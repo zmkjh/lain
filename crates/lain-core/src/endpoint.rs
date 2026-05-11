@@ -18,6 +18,7 @@ pub enum EndpointKind {
     LAN = 2,
     WebSocket = 3,
     Relay = 4,
+    TSO = 5,         // TCP Simultaneous Open port
 }
 
 mod serde_socket_addr {
