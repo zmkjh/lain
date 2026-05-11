@@ -2035,4 +2035,33 @@ $ lain shutdown          # 停止 daemon
 | relay pipe 超时 | `accept_bi()` 30s timeout |
 | 崩溃恢复 | `peers.json` 每次心跳保存 (30-120s 间隔) |
 
+### A.7 密钥架构
+
+| 密钥类型 | 用途 | 存储位置 |
+|---------|------|---------|
+| Ed25519 签名密钥 | PeerID 身份验证、DHT RPC 签名、invite 签名 | `~/.lain/identity.json` |
+| X25519 交换密钥 | Noise IK 端到端加密 | 从 Ed25519 seed 派生，存在 DHT/noise_pubkey 字段 |
+
+**Ed25519 → X25519 派生**：
+```
+seed = SigningKey::to_bytes()               # 32-byte raw seed
+secret = x25519_dalek::StaticSecret::from(seed)  # X25519 applies own clamping
+public = x25519_dalek::PublicKey::from(&secret)  # X25519 public key
+```
+
+注意：Ed25519 和 X25519 从同一个 seed 产生**不同**的标量（Ed25519 会预过 SHA-512），因此 DHT 同时存储两种公钥。
+
+**协议变更**：
+- PeerRecord 新增 `noise_pubkey: [u8; 32]` 字段
+- STORE 消息 payload 从 68 字节扩至 100 字节（+32 noise_pubkey）
+- InviteCode 新增 `noise_pk: [u8; 32]` 字段，编码从 74 字节扩至 106 字节
+
+### A.8 测试覆盖
+
+| 层级 | 数量 | 覆盖 |
+|------|------|------|
+| DHT 路由表单元 | 10 | 插入、满拒、距离、bucket index、最近排序、500 节点压力 |
+| Noise IK 单元 | 7 | 握手、帧编解码、VarInt、加密往返 |
+| 集成测试 | 9 | bootstrap+find、store+find、纯 QUIC、限速存活、畸形安全、**端到端加密往返** |
+
 用户和开发者不需要关心最终走的是哪条路径——daemon 透明选择。
