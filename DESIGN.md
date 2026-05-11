@@ -555,8 +555,8 @@ Layer 3 依赖 P2P relay 节点（见 §7），不依赖任何中心化服务器
 
 | Peer A | Peer B | 直连 | 兜底 |
 |--------|--------|------|------|
-| S_APDF | S_APDF | ❌ | IPv6 或 relay |
-| S_APDF | S_ADF | ❌ | IPv6 或 relay |
+| S_APDF | S_APDF | 不兼容 | IPv6 或 relay |
+| S_APDF | S_ADF | 不兼容 | IPv6 或 relay |
 
 其他所有 NAT 组合均可直连（详见 `coverage-analysis.md` 第 4 章证明）。
 
