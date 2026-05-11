@@ -158,7 +158,7 @@ impl Daemon {
         tracing::info!("NAT: {:?}, IPv6 inbound: {}", nat_result.nat_type, nat_result.ipv6_inbound);
 
         // 2. 身份噪声密钥对
-        let (_noise_secret, _noise_public) = self.identity.noise_keypair();
+        let (_noise_secret, noise_pubkey) = self.identity.noise_keypair();
 
         // 3. 初始化 Transport (先绑定以获取端口)
         let transport = Transport::new(
@@ -218,7 +218,7 @@ impl Daemon {
             vec![]
         };
 
-        if let Err(e) = dht.store_self(&public_key, &endpoints, capabilities).await {
+        if let Err(e) = dht.store_self(&public_key, &noise_pubkey, &endpoints, capabilities).await {
             tracing::warn!("initial DHT STORE failed: {e}");
         }
 
@@ -433,6 +433,7 @@ impl Daemon {
                     if !new_endpoints.is_empty() {
                         let _ = dht_iface.store_self(
                             &public_key_iface,
+                            &noise_pubkey,
                             &new_endpoints,
                             capabilities_iface,
                         ).await;
@@ -656,7 +657,7 @@ impl Daemon {
                         continue;
                     }
                     if let Err(e) = dht_arc.store_self(
-                        &public_key, &endpoints, capabilities,
+                        &public_key, &noise_pubkey, &endpoints, capabilities,
                     ).await {
                         tracing::debug!("DHT heartbeat: {e}");
                     }

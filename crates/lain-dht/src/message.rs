@@ -39,6 +39,7 @@ pub fn encode_store_request_signed(
     key: &[u8; 32],
     ttl: u32,
     pubkey: &[u8; 32],
+    noise_pubkey: &[u8; 32],
     endpoints: &[Endpoint],
     seed: Option<&[u8; 32]>,
 ) -> Vec<u8> {
@@ -46,6 +47,7 @@ pub fn encode_store_request_signed(
     payload.extend_from_slice(key);
     payload.extend_from_slice(&ttl.to_be_bytes());
     payload.extend_from_slice(pubkey);
+    payload.extend_from_slice(noise_pubkey);
     let mut endpoints_data = Vec::new();
     for ep in endpoints {
         encode_endpoint(&mut endpoints_data, ep);
@@ -94,12 +96,14 @@ pub fn encode_store_request(
     key: &[u8; 32],
     ttl: u32,
     pubkey: &[u8; 32],
+    noise_pubkey: &[u8; 32],
     endpoints: &[Endpoint],
 ) -> Vec<u8> {
     let mut payload = Vec::new();
     payload.extend_from_slice(key);
     payload.extend_from_slice(&ttl.to_be_bytes());
     payload.extend_from_slice(pubkey);
+    payload.extend_from_slice(noise_pubkey);
 
     let mut endpoints_data = Vec::new();
     for ep in endpoints {
@@ -357,15 +361,17 @@ pub fn parse_nodes_from_payload(payload: &[u8]) -> Option<Vec<(PeerId, SocketAdd
 
 /// Parse a PeerRecord from FIND_VALUE response payload (after has_value byte)
 pub fn parse_record_from_payload(payload: &[u8]) -> Option<PeerRecord> {
-    if payload.len() < 38 {
-        return None; // min: ttl(4) + pubkey(32) + ep_len(2)
+    if payload.len() < 70 {
+        return None; // min: ttl(4) + pubkey(32) + noise_pubkey(32) + ep_len(2)
     }
     let ttl_remaining = u32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]);
     let mut pubkey = [0u8; 32];
     pubkey.copy_from_slice(&payload[4..36]);
-    let ep_len = u16::from_be_bytes([payload[36], payload[37]]) as usize;
+    let mut noise_pubkey = [0u8; 32];
+    noise_pubkey.copy_from_slice(&payload[36..68]);
+    let ep_len = u16::from_be_bytes([payload[68], payload[69]]) as usize;
     let mut endpoints = Vec::with_capacity(ep_len.min(64));
-    let mut offset = 38usize;
+    let mut offset = 70usize;
     for _ in 0..ep_len {
         let addr = match decode_address(payload, &mut offset) {
             Some(a) => a,
@@ -390,6 +396,7 @@ pub fn parse_record_from_payload(payload: &[u8]) -> Option<PeerRecord> {
 
     Some(PeerRecord {
         pubkey,
+        noise_pubkey,
         endpoints,
         capabilities: Capabilities::new(),
         ttl_remaining,

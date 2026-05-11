@@ -9,6 +9,7 @@ lain-core = { path = "../lain-core" }
 ed25519-dalek.workspace = true
 sha2.workspace = true
 rand.workspace = true
+x25519-dalek.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 thiserror.workspace = true

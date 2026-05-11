@@ -70,6 +70,7 @@ impl Default for DhtConfig {
 #[derive(Clone, Debug)]
 pub struct PeerRecord {
     pub pubkey: [u8; 32],
+    pub noise_pubkey: [u8; 32],   // X25519 public key for Noise IK
     pub endpoints: Vec<Endpoint>,
     pub capabilities: Capabilities,
     pub ttl_remaining: u32,
@@ -214,8 +215,8 @@ impl DhtHandle {
         msg_codec::encode_find_node_request_signed(self.peer_id, message_id, target_id, self.signing_key.as_ref())
     }
 
-    fn encode_store(&self, key: &[u8; 32], ttl: u32, pubkey: &[u8; 32], endpoints: &[Endpoint]) -> Vec<u8> {
-        msg_codec::encode_store_request_signed(self.peer_id, key, ttl, pubkey, endpoints, self.signing_key.as_ref())
+    fn encode_store(&self, key: &[u8; 32], ttl: u32, pubkey: &[u8; 32], noise_pubkey: &[u8; 32], endpoints: &[Endpoint]) -> Vec<u8> {
+        msg_codec::encode_store_request_signed(self.peer_id, key, ttl, pubkey, noise_pubkey, endpoints, self.signing_key.as_ref())
     }
 
     fn encode_find_value(&self, message_id: [u8; 16], key: &[u8; 32]) -> Vec<u8> {
@@ -226,6 +227,7 @@ impl DhtHandle {
     pub async fn store_self(
         &self,
         pubkey: &[u8; 32],
+        noise_pubkey: &[u8; 32],
         endpoints: &[Endpoint],
         capabilities: Capabilities,
     ) -> Result<(), DhtError> {
@@ -237,6 +239,7 @@ impl DhtHandle {
             &self.peer_id.0,
             self.config.ttl_seconds,
             pubkey,
+            noise_pubkey,
             endpoints,
         );
         for node in &closest {
@@ -245,6 +248,7 @@ impl DhtHandle {
         // Save locally
         let record = PeerRecord {
             pubkey: *pubkey,
+            noise_pubkey: *noise_pubkey,
             endpoints: endpoints.to_vec(),
             capabilities,
             ttl_remaining: self.config.ttl_seconds,
@@ -469,10 +473,12 @@ impl DhtHandle {
                     let key = PeerId(msg.payload[..32].try_into().unwrap_or([0u8; 32]));
                     let ttl = u32::from_be_bytes([msg.payload[32], msg.payload[33], msg.payload[34], msg.payload[35]]);
                     let effective_ttl = if ttl == 0 || ttl > 3600 { 300 } else { ttl };
-                    // Store the record locally (parse pubkey + endpoints)
-                    if msg.payload.len() >= 68 {
+                    // Store the record locally (parse pubkey + noise_pubkey + endpoints)
+                    if msg.payload.len() >= 100 {
                         let mut pubkey = [0u8; 32];
                         pubkey.copy_from_slice(&msg.payload[36..68]);
+                        let mut noise_pubkey = [0u8; 32];
+                        noise_pubkey.copy_from_slice(&msg.payload[68..100]);
 
                         // Verify pubkey matches PeerID (SHA256(pubkey) == key)
                         let expected_id = PeerId(sha2::Sha256::digest(&pubkey).into());
@@ -483,6 +489,7 @@ impl DhtHandle {
 
                         let record = PeerRecord {
                             pubkey,
+                            noise_pubkey,
                             endpoints: vec![],
                             capabilities: Capabilities::new(),
                             ttl_remaining: effective_ttl,
@@ -491,6 +498,7 @@ impl DhtHandle {
                         self.peer_records.write().await.insert(key, record);
                         let _ = self.event_tx.send(CoreDhtEvent::PeerDiscovered(key, PeerRecord {
                             pubkey,
+                            noise_pubkey,
                             endpoints: vec![],
                             capabilities: Capabilities::new(),
                             ttl_remaining: effective_ttl,

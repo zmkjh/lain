@@ -22,7 +22,7 @@ async fn spawn_node(bootstrap_addr: Option<SocketAddr>) -> (PeerId, Arc<DhtHandl
     let identity = Identity::generate().ok().unwrap();
     let peer_id = identity.peer_id();
     let public_key = *identity.public_key();
-    let (noise_secret, _) = identity.noise_keypair();
+    let (noise_secret, noise_pubkey) = identity.noise_keypair();
 
     let transport = Arc::new(
         Transport::new(
@@ -67,7 +67,7 @@ async fn spawn_node(bootstrap_addr: Option<SocketAddr>) -> (PeerId, Arc<DhtHandl
         format!("127.0.0.1:{local_port}").parse().unwrap(),
         EndpointKind::STUN,
     );
-    let _ = dht.store_self(&public_key, &[ep], Capabilities::new()).await;
+    let _ = dht.store_self(&public_key, &noise_pubkey, &[ep], Capabilities::new()).await;
 
     (peer_id, dht, transport)
 }
