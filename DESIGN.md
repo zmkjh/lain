@@ -1987,6 +1987,8 @@ A的app ──fd read/write──→ A的daemon ──QUIC──→ B的daemon �
 | Lain 帧协议 | 10 种帧类型（Headers/Data/DataDgram/Close/Ping/Pong/PathChange/StreamResume/RelayConnect/RelayData），VarInt 编解码 |
 | 连接数上限 | `mm_connections` Semaphore 限制并发 QUIC 连接 |
 | DHT 桥接 | QUIC 连接成功后通过专用 stream 交换双方真实 DHT 地址，路由表从 0 自生长 |
+| TSO + Birthday Attack | 16 端口 TCP 同时打开，K×K 并发穿透 APDF NAT，102s 时间窗口，PeerID 比较确定 Noise IK 角色 |
+| 四层 fallback | 直连→relay→TSO→relay 自动链路，覆盖所有 NAT 类型组合 |
 | routes.json 持久化 | 每次心跳保存路由表，启动时加载，支持崩溃恢复 |
 
 ### A.4 IPv6 的现实与策略
