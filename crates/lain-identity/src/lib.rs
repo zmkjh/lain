@@ -36,6 +36,7 @@ struct StoredIdentity {
 
 pub struct Identity {
     signing_key: SigningKey,
+    #[allow(dead_code)]
     verifying_key: VerifyingKey,
     public_key: Ed25519PublicKey,
     peer_id: PeerId,
