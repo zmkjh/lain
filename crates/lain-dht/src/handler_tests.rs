@@ -170,22 +170,40 @@ async fn test_find_value_not_found_returns_nodes() {
     let a = Arc::new(DhtHandle::new(make_id(18), [18u8; 32], make_config("127.0.0.1:0")).unwrap());
     let b = Arc::new(DhtHandle::new(make_id(19), [19u8; 32], make_config("127.0.0.1:0")).unwrap());
     spawn_recv_loop(a.clone());
-    spawn_recv_loop(b.clone());
 
+    // Don't spawn B's recv loop — we'll read its socket directly to verify response
+    let b_sock = b.socket();
     let a_addr = a.socket().local_addr().unwrap();
 
     // Bootstrap
-    b.socket().send_to(&msg_codec::encode_ping_request(b.peer_id, [10u8; 16]), a_addr).await.unwrap();
+    let ping = msg_codec::encode_ping_request(b.peer_id, [10u8; 16]);
+    b_sock.send_to(&ping, a_addr).await.unwrap();
     tokio::time::sleep(Duration::from_millis(100)).await;
 
-    // FIND_VALUE for a key that doesn't exist — should return k-closest nodes, not crash
+    // FIND_VALUE for a key that doesn't exist
     let nonexistent = PeerId([0xFFu8; 32]);
-    b.socket().send_to(&msg_codec::encode_find_value_request(b.peer_id, [11u8; 16], &nonexistent.0), a_addr).await.unwrap();
+    let msg_id = [11u8; 16];
+    let fv = msg_codec::encode_find_value_request(b.peer_id, msg_id, &nonexistent.0);
+    b_sock.send_to(&fv, a_addr).await.unwrap();
 
-    tokio::time::sleep(Duration::from_millis(200)).await;
-    // A should still be alive and functional
-    let a_size = a.routing_table_size().await;
-    assert!(a_size >= 1, "A should still have B in routing table after not-found query: got {a_size}");
+    // Read responses from B's socket until we find the FIND_VALUE response
+    let mut buf = vec![0u8; 2048];
+    let mut found = false;
+    for _ in 0..10 {
+        match tokio::time::timeout(Duration::from_millis(500), b_sock.recv_from(&mut buf)).await {
+            Ok(Ok((len, _src))) => {
+                if let Some(msg) = msg_codec::decode_message(&buf[..len]) {
+                    if msg.is_response && msg.message_id == msg_id {
+                        assert_eq!(msg.payload[0], 0, "first byte should be 0 (not found)");
+                        found = true;
+                        break;
+                    }
+                }
+            }
+            _ => break,
+        }
+    }
+    assert!(found, "should have received FIND_VALUE not-found response");
 }
 
 #[tokio::test]

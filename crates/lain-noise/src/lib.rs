@@ -450,19 +450,17 @@ mod tests {
     }
 
     #[test]
-    fn test_noise_wrong_pubkey_fails() {
+    fn test_noise_wrong_pubkey_fails_handshake() {
         let (init_secret, _init_public) = generate_keypair();
-        let (_resp_secret, _resp_public) = generate_keypair();
+        let (resp_secret, _resp_public) = generate_keypair();
         let (_, wrong_pubkey) = generate_keypair();
 
-        // Initiator with wrong responder pubkey — handshake should fail
-        let result = NoiseHandshake::new_initiator(&init_secret, &wrong_pubkey)
-            .map(|mut h| h.write_message(&[]));
+        // Initiator encrypts with wrong responder pubkey — responder must reject
+        let mut init = NoiseHandshake::new_initiator(&init_secret, &wrong_pubkey).unwrap();
+        let mut resp = NoiseHandshake::new_responder(&resp_secret).unwrap();
 
-        // The handshake setup itself succeeds (it's just key registration),
-        // but the IK message encrypt will succeed too. The actual failure
-        // happens when responder tries to read the message with wrong initiator key.
-        // This test verifies the handshake builder doesn't crash with arbitrary keys.
-        let _ = result;
+        let ik1 = init.write_message(&[]).unwrap();
+        let result = resp.read_message(&ik1);
+        assert!(result.is_err(), "handshake must fail when initiator uses wrong remote pubkey");
     }
 }
