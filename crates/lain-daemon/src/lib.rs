@@ -270,15 +270,27 @@ impl Daemon {
                 let d = dht_relay.clone();
                 match t.accept_connection().await {
                     Ok((conn, _peer_id, _pubkey)) => {
-                        // Bridge: every accepted QUIC connection also feeds the DHT
-                        // so our routing table grows from incoming peers.
-                        dht_relay.add_node(_peer_id, conn.remote_address()).await;
-
                         let c = conn.clone();
                         tokio::spawn(async move {
                             if let Ok((mut _send, mut recv)) = c.accept_bi().await {
                                 let mut buf = vec![0u8; 2048];
                                 if let Ok(Some(n)) = recv.read(&mut buf).await {
+                                    // DHT address exchange: non-frame plaintext stream
+                                    if buf[..n].starts_with(b"DHT_ADDR:") {
+                                        let peer_addr_str = std::str::from_utf8(&buf[7..n])
+                                            .unwrap_or("").trim();
+                                        if let Ok(peer_dht) = peer_addr_str.parse::<SocketAddr>() {
+                                            d.add_node(_peer_id, peer_dht).await;
+                                            // Respond with our DHT addr
+                                            if let Ok(my_dht) = d.socket().local_addr() {
+                                                let resp = format!("DHT_ADDR:{my_dht}");
+                                                _send.write_all(resp.as_bytes()).await.ok();
+                                                _send.finish().ok();
+                                            }
+                                        }
+                                        return;
+                                    }
+
                                     if let Some((_sid, ft, _len, hdr_len)) = frame::decode_frame_header(&buf[..n]) {
                                         if ft == FrameType::RelayConnect {
                                             let payload = &buf[hdr_len..hdr_len + (_len as usize).min(n - hdr_len)];
@@ -541,21 +553,41 @@ impl Daemon {
                                 let eps = inv.endpoints.clone();
                                 let dht = dht_arc.clone();
                                 let my_id = peer_id;
+                                let my_dht = endpoints.last().map(|e| e.addr);
                                 tokio::spawn(async move {
                                     match t.connect_raw(&noise_pk, &eps).await {
                                         Ok(conn) => {
-                                            // Bridge QUIC → DHT: feed peer's DHT address
-                                            // into routing table so the DHT can grow organically.
-                                            if let Some(dht_ep) = eps.last() {
-                                                dht.add_node(pid, dht_ep.addr).await;
-                                            }
-                                            // Also ping peer's DHT to trigger discovery
-                                            let ping = lain_dht::message::encode_ping_request(
-                                                my_id,
-                                                rand::random::<u128>().to_be_bytes(),
-                                            );
-                                            for ep in &eps {
-                                                dht.send_msg(&ping, ep.addr).await;
+                                            // Bridge QUIC → DHT: exchange DHT addresses
+                                            // via a QUIC stream so both sides learn the
+                                            // correct DHT port (not the QUIC port).
+                                            if let Some(dht_addr) = my_dht {
+                                                if let Ok((mut s, mut r)) = conn.open_bi().await {
+                                                    let msg = format!("DHT_ADDR:{dht_addr}");
+                                                    if s.write_all(msg.as_bytes()).await.is_ok() {
+                                                        s.finish().ok();
+                                                        let mut buf = vec![0u8; 128];
+                                                        if let Ok(Some(n)) = r.read(&mut buf).await {
+                                                            if buf[..n].starts_with(b"DHT_ADDR:") {
+                                                                if let Ok(addr_str) = std::str::from_utf8(&buf[7..n]) {
+                                                                    if let Ok(peer_dht) = addr_str.trim().parse::<SocketAddr>() {
+                                                                        dht.add_node(pid, peer_dht).await;
+                                                                        tracing::info!("DHT bridged: {pid} @ {peer_dht}");
+                                                                    }
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                                // Also send PING to peer DHT once we have its addr
+                                                let ping = lain_dht::message::encode_ping_request(
+                                                    my_id,
+                                                    rand::random::<u128>().to_be_bytes(),
+                                                );
+                                                // Try both STUN endpoint and DHT endpoint
+                                                for ep in &eps {
+                                                    dht.send_msg(&ping, ep.addr).await;
+                                                }
+                                                dht.send_msg(&ping, dht_addr).await;
                                             }
 
                                             // Acquire connection slot
