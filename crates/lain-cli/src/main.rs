@@ -146,8 +146,10 @@ fn main() {
         Command::Connect { invite } => connect_feedback(&socket_path, &invite),
         Command::Monitor => monitor_loop(&socket_path),
         Command::Shutdown => {
-            let _ = ipc_req(&socket_path, r#"{"cmd":"Shutdown"}"#);
-            println!("daemon shutting down");
+            match ipc_req(&socket_path, r#"{"cmd":"Shutdown"}"#) {
+                Some(_) => println!("daemon shutting down"),
+                None => eprintln!("daemon not running"),
+            }
         }
         Command::Status => {
             match ipc_req(&socket_path, r#"{"cmd":"ListPeers"}"#) {
@@ -253,7 +255,11 @@ fn monitor_loop(socket_path: &PathBuf) {
         line.clear();
         if reader.read_line(&mut line).is_err() { break; }
         if let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) {
-            let event = v.get("event").and_then(|e| e.as_str()).unwrap_or("?");
+            // Skip non-event messages (e.g. subscription confirmation)
+            let event = match v.get("event").and_then(|e| e.as_str()) {
+                Some(e) => e,
+                None => continue,
+            };
             let peer = v.get("peer_id").and_then(|p| p.as_str()).unwrap_or("-");
             match event {
                 "peer_connected" => println!("[connected] {peer}"),
