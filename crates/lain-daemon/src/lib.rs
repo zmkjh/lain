@@ -638,6 +638,10 @@ impl Daemon {
                                 let dht = dht_arc.clone();
                                 let my_id = peer_id;
                                 let my_dht = endpoints.last().map(|e| e.addr);
+                                let my_endpoints = endpoints.clone();
+                                let my_pubkey = public_key;
+                                let my_noise_pk = noise_pubkey;
+                                let my_caps = capabilities;
                                 tokio::spawn(async move {
                                     match t.connect_raw(&noise_pk, &eps).await {
                                         Ok(conn) => {
@@ -694,6 +698,13 @@ impl Daemon {
                                                 peer_id: Some(pid.to_string()),
                                                 data: None,
                                             });
+
+                                            // Immediately push our record to the DHT so
+                                            // the new peer (and their neighbors) can find us
+                                            // without waiting for the next heartbeat.
+                                            let _ = dht.store_self(
+                                                &my_pubkey, &my_noise_pk, &my_endpoints, my_caps,
+                                            ).await;
 
                                             // Spawn reader task for incoming data
                                             let ipc_ev2 = ipc_ev.clone();
