@@ -653,6 +653,7 @@ impl crate::PeerRecord {
     fn into_core(&self, _peer_id: &PeerId) -> lain_core::dht::PeerRecord {
         lain_core::dht::PeerRecord {
             pubkey: self.pubkey,
+            noise_pubkey: self.noise_pubkey,
             endpoints: self.endpoints.clone(),
             capabilities: self.capabilities,
             ttl_remaining: self.ttl_remaining,

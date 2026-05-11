@@ -16,6 +16,7 @@ pub struct NodeInfo {
 #[derive(Clone, Debug)]
 pub struct PeerRecord {
     pub pubkey: Ed25519PublicKey,
+    pub noise_pubkey: Ed25519PublicKey,  // X25519 for Noise IK
     pub endpoints: Vec<Endpoint>,
     pub capabilities: Capabilities,
     pub ttl_remaining: u32,
