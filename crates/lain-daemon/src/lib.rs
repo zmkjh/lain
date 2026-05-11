@@ -243,8 +243,14 @@ impl Daemon {
         } else {
             vec![]
         };
-        // Include DHT UDP port so peers can populate their routing tables after connect
-        endpoints.push(Endpoint::new(local_dht_addr, lain_core::endpoint::EndpointKind::STUN));
+        // Include DHT UDP port with public IP so peers can reach DHT behind NAT.
+        // local_dht_addr is 0.0.0.0:<port>; use STUN IP + DHT port for real routability.
+        let public_dht_addr = if let Some(stun) = nat_result.mapped_addr {
+            SocketAddr::new(stun.ip(), local_dht_addr.port())
+        } else {
+            local_dht_addr
+        };
+        endpoints.push(Endpoint::new(public_dht_addr, lain_core::endpoint::EndpointKind::STUN));
 
         if let Err(e) = dht.store_self(&public_key, &noise_pubkey, &endpoints, capabilities).await {
             tracing::warn!("initial DHT STORE failed: {e}");
@@ -264,6 +270,7 @@ impl Daemon {
         // Spawn relay accept loop: handle incoming RelayConnect frames
         let transport_relay = transport.clone();
         let dht_relay = dht_for_mdns.clone();
+        let public_dht = public_dht_addr;
         tokio::spawn(async move {
             loop {
                 let t = transport_relay.clone();
@@ -271,6 +278,7 @@ impl Daemon {
                 match t.accept_connection().await {
                     Ok((conn, _peer_id, _pubkey)) => {
                         let c = conn.clone();
+                        let my_dht_addr = public_dht;
                         tokio::spawn(async move {
                             if let Ok((mut _send, mut recv)) = c.accept_bi().await {
                                 let mut buf = vec![0u8; 2048];
@@ -281,12 +289,10 @@ impl Daemon {
                                             .unwrap_or("").trim();
                                         if let Ok(peer_dht) = peer_addr_str.parse::<SocketAddr>() {
                                             d.add_node(_peer_id, peer_dht).await;
-                                            // Respond with our DHT addr
-                                            if let Ok(my_dht) = d.socket().local_addr() {
-                                                let resp = format!("DHT_ADDR:{my_dht}");
-                                                _send.write_all(resp.as_bytes()).await.ok();
-                                                _send.finish().ok();
-                                            }
+                                            // Respond with our DHT addr (public IP + DHT port)
+                                            let resp = format!("DHT_ADDR:{my_dht_addr}");
+                                            _send.write_all(resp.as_bytes()).await.ok();
+                                            _send.finish().ok();
                                         }
                                         return;
                                     }
