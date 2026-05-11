@@ -1941,140 +1941,108 @@ A的app ──fd read/write──→ A的daemon ──QUIC──→ B的daemon �
 
 ## 附录 A：实现对照（2026-05）
 
-以下记录实际实现与原始设计的差异及新增功能。
+以下记录实际实现与原始设计的差异、新增功能、以及当前覆盖状态。
 
-### A.1 设计已实现
+### A.1 已实现的章节
 
-| 章节 | 状态 | 备注 |
-|------|------|------|
-| §3.6 Trait 接口 | ✅ | IdentityProvider, NatProber, TransportLayer, DhtBackend |
-| §4 身份 | ✅ | Ed25519, PeerID=SHA256, 持久化, X25519 转换 |
-| §5 发现 | ✅ | InviteCode Base62, mDNS LAN 注册+浏览 |
-| §6.1 NAT 探测 | ✅ | STUN Binding + CHANGE-REQUEST, Cone/ADF/APDF 分类 |
-| §6.2 三层模型 | ✅ | IPv6 → STUN → Relay 优先级遍历 |
-| §6.6 WebSocket | ✅ | HTTP Upgrade 监听, WS 帧编解码 |
-| §7 Relay 发现+转发 | ✅ | RELAY_NEEDED RPC, pipe_connections 双向桥接 |
-| §7.4 Relay 下线迁移 | ✅ | 管道断开后自动 DHT 查找新 relay 重连 |
-| §8 节点生命周期 | ✅ | LIVE/STALE/EXPIRED, Dormant, 自适应心跳 |
-| §9 Kademlia DHT | ✅ | 256 bucket, 6 RPC, Ed25519 签名+验证, routes.json |
-| §10 数据传输 | ✅ | QUIC+NoiseIK+HEADERS, STREAM_RESUME, keepalive |
-| §11 IPC | ✅ | UDS/NamedPipe/HTTP, JSON 行协议, fd 传递 |
+原始设计文档 17 章中，以下章节已完成代码实现：
 
-### A.2 设计未实现
+- **§3.6 Trait 接口** — `IdentityProvider`, `NatProber`, `TransportLayer`, `DhtBackend` 四个核心 trait
+- **§4 身份与安全** — Ed25519 密钥对生成/签名/验证，PeerID = SHA256(pubkey)，X25519 密钥派生用于 Noise IK，identity.json 持久化（包含损坏检测）
+- **§5 发现与邀请** — InviteCode Base62 编解码（自实现，非第三方库），mDNS LAN 服务注册与浏览
+- **§6.1 NAT 类型探测** — STUN Binding Request + CHANGE-REQUEST 协议，Cone/ADFSymmetric/APDFSymmetric 三类分类，配置了 miwifi / qq / Google 三级公共 STUN 服务器
+- **§6.2 三层穿透模型** — IPv6 直连 → STUN 地址 → Relay 转发的优先级遍历，connect_raw 按端点优先级递减尝试
+- **§6.6 WebSocket Fallback** — HTTP Upgrade 监听，WS 帧编解码（依赖 quinn 的 WebSocket transport）
+- **§7 Relay** — RELAY_NEEDED DHT RPC，pipe_connections 双向桥接，管道断开后自动 DHT 查找新 relay 重连
+- **§8 节点生命周期** — LIVE/STALE/EXPIRED 三态转换，Dormant 休眠模式，自适应心跳（Symmetric 30s，Cone 120s）
+- **§9 Kademlia DHT** — 256 bucket，6 种 RPC 消息类型（PING/STORE/FIND_VALUE/FIND_NODE/RELAY_NEEDED/ADDR_REFLECT），Ed25519 签名+verify_strict 验证，routes.json 持久化
+- **§10 数据传输** — QUIC + Noise IK 加密隧道，HEADERS 协商，StreamResume 断线续传，per-connection keepalive
+- **§11 IPC 与应用接口** — Unix Domain Socket + Windows Named Pipe + HTTP 三通道，JSON 行协议，跨平台 IpcStream 抽象
 
-| 章节 | 状态 | 原因 |
-|------|------|------|
-| §6.3 Birthday Attack | ❌ | relay 存在时非必需 |
-| §6.3 TCP Simultaneous Open | ❌ | relay 存在时非必需 |
-| §3.7 单 UDP socket | ⚠️ | DHT+QUIC 各自 bind 不同端口 |
-| 跨机器 DHT 网络 | ⚠️ | 协议完整，未在 2+ 物理机间验证 |
-| 移动端 (Android/iOS) | ❌ | 设计文档提及但无平台代码 |
+### A.2 未实现的章节
 
-### A.3 当前状态（2026-05 真机验证）
+这些功能在设计文档中存在但未进入代码：
+
+- **Birthday Attack NAT 穿透** — relay 存在时非必需。只有当所有候选 relay 均不可达时才有价值。
+- **TCP Simultaneous Open** — 同上，relay 路径覆盖了对称 NAT 互连场景。
+- **单 UDP socket** — DHT 和 QUIC 各自 bind 独立端口。真单 socket 需要实现 quinn 的 `AsyncUdpSocket` trait（约 100 行），属于工程优化而非功能缺陷。
+- **移动端 (Android/iOS)** — 设计文档提及了 Android 前台服务通知和 iOS Background Task，但无平台代码。不影响桌面 P2P 场景。
+- **跨机器 DHT 网络** — 全部协议逻辑在两节点 localhost 上通过集成测试验证（12 个端到端场景），但未在 2 台以上物理机组建的异构网络（不同 NAT 类型、不同操作系统）中进行验证。
+
+### A.3 超出原始设计的实现
+
+以下功能在原始设计文档中未被详细描述，但实现中作为必要组成部分加入：
 
 | 功能 | 说明 |
 |------|------|
-| Base62 编码 | InviteCode 自定义 Base62 编解码器（非第三方库） |
-| invite 动态刷新 | 每次心跳更新端点，`lain invite` 实时反映当前地址 |
-| CLI 实时反馈 | `connect` 订阅事件 15s 内返回成功/失败 |
-| 跨平台 CLI | IpcStream 抽象：Unix→UnixStream, Windows→NamedPipe |
-| Windows Named Pipe IPC | 双向 JSON 行协议，`\\.\pipe\lain` |
-| 重复启动检测 | 启动时检查 IPC socket 是否已被监听 |
-| 静默 daemon | 默认日志写文件，`--foreground` 恢复终端输出 |
-| per-peer 限速 | DHT 20 msg/s 滑动窗口，10 分钟清理 |
-| 自适应心跳 | Symmetric NAT: 30s, Cone: 120s |
-| bucket 自动刷新 | 启动后对 256 桶递归 FIND_NODE |
-| peers.json 签名 | Ed25519 签名防篡改，每次心跳写入 |
-| Lain 帧协议 | 10 种帧类型，VarInt 编解码 |
-| mm_connections 限制 | Semaphore 限制活跃连接数 |
-| 端到端测试 | 135+ 自动化测试（单元+集成），Windows 真机验证通过 |
-| IPv6 优先 | 双栈 bind，全局 unicast 地址检测，invite 含 IPv6 端点 |
-| DHT 桥接 | QUIC 连接后交换真实 DHT 地址，路由表自生长 |
+| Base62 编解码 | InviteCode 的自定义 Base62 编解码器，未使用第三方库 |
+| invite 动态刷新 | 每次心跳更新端点列表，`lain invite` 实时反映当前 NAT 映射地址 |
+| CLI 实时反馈 | `connect` 订阅 IPC 事件，15s 内返回连接成功或失败 |
+| 跨平台 IpcStream 抽象 | Unix→UnixStream / Windows→NamedPipe 统一接口 |
+| 重复启动检测 | 启动时检查 IPC socket/pipe 是否已被另一个进程监听 |
+| 静默模式 | 默认日志写入 `~/.lain/daemon.log`，`-f` 恢复终端输出 |
+| per-peer 限速 | DHT 消息 20 msg/s 滑动窗口，10 分钟未活跃自动清理计数 |
+| bucket 自举刷新 | 启动后对全部 256 桶依次 FIND_NODE 目标，加速路由表填充 |
+| peers.json Ed25519 签名 | 每心跳写入时附带身份签名，加载时验证防篡改 |
+| Lain 帧协议 | 10 种帧类型（Headers/Data/DataDgram/Close/Ping/Pong/PathChange/StreamResume/RelayConnect/RelayData），VarInt 编解码 |
+| 连接数上限 | `mm_connections` Semaphore 限制并发 QUIC 连接 |
+| DHT 桥接 | QUIC 连接成功后通过专用 stream 交换双方真实 DHT 地址，路由表从 0 自生长 |
+| routes.json 持久化 | 每次心跳保存路由表，启动时加载，支持崩溃恢复 |
 
-### A.4 CLI 命令
+### A.4 IPv6 的现实与策略
+
+Lain 设计上把 IPv6 视为最优路径——全球唯一地址意味着零 NAT、零 relay、纯直连。但现实世界中 IPv6 的覆盖率严重不均：
+
+- **有全局 IPv6 地址（2000::/3）** — 直接最佳路径。设备地址即为公网身份，invite 首个端点即为 IPv6，连接延迟最低、无中间节点。
+- **有 IPv6 栈但无全局地址** — 典型场景：运营商未分配前缀、路由器未开启 DHCPv6/SLAAC。此时仅检测到 link-local 地址（fe80::），daemon 自动降级为 IPv4 路径，不依赖 IPv6。
+- **无 IPv6 栈** — 完全走 IPv4 + STUN + relay。
+
+代码处理策略：
 
 ```
-$ lain                   # 启动 daemon (quiet mode, log to ~/.lain/daemon.log)
-$ lain daemon            # 同上
-$ lain daemon -f         # 前台运行 (log to stdout)
-$ lain whoami            # 查看 PeerID
-$ lain invite            # 生成 invite 码
-$ lain connect <code>    # 连接到 peer (支持 lain:// 或裸 Base62)
-$ lain monitor           # 订阅事件流（诊断用）
-$ lain status            # 查看网络状态
-$ lain shutdown          # 停止 daemon
+启动时 NAT 探测 → check_ipv6() bind [::1]:0
+  ├─ 成功 → IPv6 栈在线
+  │   └─ if_addrs 遍历 → 过滤全局 unicast (2000::/3)
+  │       ├─ 找到 → transport/DHT bind [::]:0（双栈）
+  │       │         endpoints = [IPv6端点, IPv6-DHT, STUN, DHT]
+  │       │         对端优先走 IPv6 直连
+  │       └─ 没找到 → bind [::]:0 仍可用（接受 IPv6 入站）
+  │                   endpoints = [STUN, DHT]，不包含 IPv6 端点
+  └─ 失败 → bind 0.0.0.0:0（纯 IPv4），走 STUN + relay
 ```
 
-数据收发通过 IPC API 由应用程序实现，CLI 不做文件传输。
+这意味着即使运营商暂时不开 IPv6，系统也能完整工作。一旦未来开启，无需修改代码或配置——下次启动时自动检测到全局地址并启用 IPv6 优先路径。邀请码会自然变长（多了 IPv6 端点），但编码后仍是合法的 Base62 字符串。
 
-### A.5 IPC JSON 协议
+### A.5 测试覆盖分析
 
-每行一条 JSON（`\n` 分隔），tagged union：
+当前总计 **135 个自动化测试**（0 warning，全部通过），分布如下：
 
-```json
-→ {"cmd":"Connect","invite":"lain://..."}
-← {"type":"Ok","message":"connecting: lain://..."}
+| 模块 | 测试数 | 覆盖范围 |
+|------|--------|----------|
+| `lain-core` | 14 | VarInt 编解码 + 10 种 FrameType 往返 + 违法帧拒绝 |
+| `lain-identity` | 6 | Ed25519 生成/签名/验证/确定性 + Noise 密钥转换 + identity.json 持久化及损坏拒绝 |
+| `lain-nat` | 14 | STUN 绑定请求构造 + XOR-MAPPED-ADDRESS + MAPPED-ADDRESS 解析 + IPv4/IPv6 处理 + 截断/未知族拒绝 + 完整属性遍历 |
+| `lain-noise` | 10 | 完整 Noise IK 握手 + 多轮加密往返 + 4KB 大包 + 空包 + 错误公钥握手失败 |
+| `lain-dht` | 38 | 路由表(10) + 消息编解码(11) + handler(17)：PING/PONG/STORE/FIND_VALUE/FIND_NODE + Ed25519 签名 verify_strict + 篡改拒绝 + TTL clamp + deferred verification + 离线缓存查找 + 过期清理 + routes.json 存取 |
+| `lain-discovery` | 8 | invite Base62/URI 往返 + 多端点 + 过期检测 + 无效输入拒绝 + 全字段（noise_pk/caps/priority/timestamp/signature）一致性 |
+| `lain-transport` | 7 | config 默认值/自定义 + bind/local_addr + NoVerify TLS 结构 + 多端点 fallback + 不可达地址报错 |
+| `lain-daemon` | 39 | IPC 全命令序列化/反序列化(16) + Windows Named Pipe 真机往返(5) + peers.json 签名格式往返 + conn_mgr + iface_watcher + 集成测试(12)：bootstrap+find+store+relay e2e+并发 10 连接+畸形消息 |
+| **总计** | **135** | Windows 真机 CLI 全命令（whoami/invite/status/monitor/shutdown）通过 |
 
-→ {"cmd":"Whoami"}
-← {"type":"Ok","message":"a1b2c3d4"}
+**未覆盖但已通过真机验证的路径：**
+- Named Pipe IPC 实际收发（5 个 Windows-only 测试）
+- STUN 公网地址探测（真机日志确认 `mapped addr: Some(117.88.30.86:52225)`）
+- 全局 IPv6 地址过滤（真机确认 link-local 被正确排除）
+- routes.json 心跳保存与启动加载（真机日志确认）
 
-→ {"cmd":"ListPeers"}
-← {"type":"Ok","data":{"peer_id":"...","nat_type":"Cone","dht_nodes":47,"peers":[...]}}
+**仍未自动化测试的路径：**
+- 异构 NAT 类型间的直连/relay 路径（需要两台以上物理机）
+- 多跳 DHT 路由收敛（需要 3+ 节点）
+- 移动端平台的网络状态切换（WiFi ↔ 蜂窝）
 
-→ {"cmd":"Subscribe"}
-← {"type":"Event","event":"peer_connected","peer_id":"..."}
-← {"type":"Event","event":"data","peer_id":"...","data":{...}}
+### A.6 已知局限
 
-→ {"cmd":"Shutdown"}
-← {"type":"Ok","message":"shutting down"}
-```
-
-### A.6 可靠性加固
-
-| 机制 | 实现 |
-|------|------|
-| 签名信任链 | STORE pubkey 验证 `PeerID == SHA256(pubkey)`, DHT 入站验签 |
-| 重复连接 | Connect 前查 `connected` HashMap 去重 |
-| IPC 不阻塞 | `try_send` 替代 `send`, channel 满 drop |
-| IPC 身份验证 | Unix SO_PEERCRED 同 UID |
-| Invite 防篡改 | 验证 `PeerID == SHA256(pubkey)` |
-| Noise IK 超时 | accept `read()` 15s timeout |
-| relay pipe 超时 | `accept_bi()` 30s timeout |
-| 崩溃恢复 | `peers.json` 每次心跳保存 (30-120s 间隔) |
-
-### A.7 密钥架构
-
-| 密钥类型 | 用途 | 存储位置 |
-|---------|------|---------|
-| Ed25519 签名密钥 | PeerID 身份验证、DHT RPC 签名、invite 签名 | `~/.lain/identity.json` |
-| X25519 交换密钥 | Noise IK 端到端加密 | 从 Ed25519 seed 派生，存在 DHT/noise_pubkey 字段 |
-
-**Ed25519 → X25519 派生**：
-```
-seed = SigningKey::to_bytes()               # 32-byte raw seed
-secret = x25519_dalek::StaticSecret::from(seed)  # X25519 applies own clamping
-public = x25519_dalek::PublicKey::from(&secret)  # X25519 public key
-```
-
-注意：Ed25519 和 X25519 从同一个 seed 产生**不同**的标量（Ed25519 会预过 SHA-512），因此 DHT 同时存储两种公钥。
-
-**协议变更**：
-- PeerRecord 新增 `noise_pubkey: [u8; 32]` 字段
-- STORE 消息 payload 从 68 字节扩至 100 字节（+32 noise_pubkey）
-- InviteCode 新增 `noise_pk: [u8; 32]` 字段，编码从 74 字节扩至 106 字节
-
-### A.8 测试覆盖（2026-05 实际）
-
-| 模块 | 数量 | 覆盖内容 |
-|------|------|----------|
-| lain-core | 14 | VarInt, 10 种 FrameType 往返, 非法帧拒绝, 帧类型有效性 |
-| lain-identity | 6 | 生成, 签名验证, 确定性, Noise 转换, 持久化往返, 损坏拒绝 |
-| lain-nat | 14 | STUN 绑定请求, XOR-MAPPED-ADDRESS, MAPPED-ADDRESS, 截断拒绝, 属性遍历, fallback |
-| lain-noise | 10 | 完整握手, 多轮收发, 大包+空包, 错误密钥拒绝, VarInt |
-| lain-dht | 38 | 路由表(10) + 消息序列化(11) + handler(PING/STORE/FIND_VALUE/FIND_NODE/签名验证/篡改/TTL)(17) |
-| lain-discovery | 7 | invite Base62, URI, 多端点, 过期, 非法输入 |
-| lain-transport | 7 | config, bind, local_addr, NoVerify, 多端点 fallback |
-| lain-daemon | 39 | IPC 序列化+Windows Pipe(16) + peers.json(2) + 集成(12 含 relay e2e+并发) |
-| **总计** | **135** | 零 warning, Windows 真机 CLI 启动+whoami+invite+status+monitor+shutdown 全部通过 |
-
-用户和开发者不需要关心最终走的是哪条路径——daemon 透明选择。
+- **DHT 端口与 QUIC 端口分离** — 当前两个协议各自 bind 独立 UDP socket。真单 socket 需要给 quinn 提供自定义 `AsyncUdpSocket` wrapper，实现后可从 invite 中移除 DHT 独立端点，简化暴露面。
+- **Symmetric NAT 下 DHT 可达性依赖心跳** — Symmetric NAT 为每个目的地址分配独立映射端口。DHT 的 UDP 映射由心跳 PING 保持存活。如果心跳间隔内映射过期，外部节点无法向本机 DHT 发送请求（但本机仍可主动发起）。
+- **第一人仍是孤岛** — 无公网 bootstrap 节点是 lain 的核心设计选择。第一个人上线时 DHT 为空，需要 out-of-band 传递第一个 invite（二维码、面对面、即时通讯等）。这是有意为之，不是缺陷。
+- **mDNS 限局域网** — 在没有 bootstrap 节点且没有 invite 的情况下，只能在局域网内通过 mDNS 互相发现。广域网传播必须从 invite 开始。
