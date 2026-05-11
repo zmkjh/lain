@@ -187,7 +187,9 @@ impl Transport {
                 .map_err(|e| TransportError::Tls(format!("client quic: {e}")))?
         ));
 
-        let mut eps: Vec<_> = endpoints.iter().collect();
+        let mut eps: Vec<_> = endpoints.iter()
+            .filter(|e| e.kind != EndpointKind::TSO) // TSO handled by ts_connect
+            .collect();
         eps.sort_by(|a, b| b.priority.cmp(&a.priority));
 
         for ep in eps {
