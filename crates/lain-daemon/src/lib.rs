@@ -231,16 +231,20 @@ impl Daemon {
             }
         }
 
-        // 5. STORE self
+        // 5. STORE self — build endpoint list including DHT port so peers can discover it
         let capabilities = Capabilities::new()
             .with(if nat_result.ipv6_inbound { Capabilities::IPV6_INBOUND } else { 0 })
             .with(if nat_result.nat_type.is_symmetric() { 0 } else { Capabilities::RELAY_CAPABLE });
 
-        let endpoints = if let Some(addr) = nat_result.mapped_addr {
+        let local_dht_addr = dht.socket().local_addr()
+            .map_err(|e| DaemonError::Config(format!("DHT addr: {e}")))?;
+        let mut endpoints = if let Some(addr) = nat_result.mapped_addr {
             vec![Endpoint::new(addr, lain_core::endpoint::EndpointKind::STUN)]
         } else {
             vec![]
         };
+        // Include DHT UDP port so peers can populate their routing tables after connect
+        endpoints.push(Endpoint::new(local_dht_addr, lain_core::endpoint::EndpointKind::STUN));
 
         if let Err(e) = dht.store_self(&public_key, &noise_pubkey, &endpoints, capabilities).await {
             tracing::warn!("initial DHT STORE failed: {e}");
@@ -266,6 +270,10 @@ impl Daemon {
                 let d = dht_relay.clone();
                 match t.accept_connection().await {
                     Ok((conn, _peer_id, _pubkey)) => {
+                        // Bridge: every accepted QUIC connection also feeds the DHT
+                        // so our routing table grows from incoming peers.
+                        dht_relay.add_node(_peer_id, conn.remote_address()).await;
+
                         let c = conn.clone();
                         tokio::spawn(async move {
                             if let Ok((mut _send, mut recv)) = c.accept_bi().await {
@@ -531,9 +539,25 @@ impl Daemon {
                                 let pid = inv.peer_id;
                                 let noise_pk = inv.noise_pk;
                                 let eps = inv.endpoints.clone();
+                                let dht = dht_arc.clone();
+                                let my_id = peer_id;
                                 tokio::spawn(async move {
                                     match t.connect_raw(&noise_pk, &eps).await {
                                         Ok(conn) => {
+                                            // Bridge QUIC → DHT: feed peer's DHT address
+                                            // into routing table so the DHT can grow organically.
+                                            if let Some(dht_ep) = eps.last() {
+                                                dht.add_node(pid, dht_ep.addr).await;
+                                            }
+                                            // Also ping peer's DHT to trigger discovery
+                                            let ping = lain_dht::message::encode_ping_request(
+                                                my_id,
+                                                rand::random::<u128>().to_be_bytes(),
+                                            );
+                                            for ep in &eps {
+                                                dht.send_msg(&ping, ep.addr).await;
+                                            }
+
                                             // Acquire connection slot
                                             let permit = match conn_sem2.clone().acquire_owned().await {
                                                 Ok(p) => p,

@@ -355,6 +355,15 @@ impl DhtHandle {
         self.routing_table.read().await.size()
     }
 
+    /// Add a node to the routing table (for cross-layer bridging, e.g. QUIC→DHT).
+    pub async fn add_node(&self, node_id: PeerId, address: SocketAddr) {
+        self.routing_table.write().await.insert_or_update(BucketEntry {
+            node_id,
+            address,
+            last_seen: std::time::Instant::now(),
+        });
+    }
+
     /// Per-peer 限速：每秒最多 20 条消息
     async fn check_rate_limit(&self, peer_id: &PeerId) -> bool {
         let mut limits = self.peer_ratelimit.write().await;
