@@ -535,12 +535,14 @@ impl Daemon {
                                                     match c.accept_bi().await {
                                                         Ok((_send, mut recv)) => {
                                                             match recv.read_to_end(65536).await {
-                                                                Ok(_data) => {
+                                                                Ok(data) => {
+                                                                    use base64::Engine;
+                                                                    let b64 = base64::engine::general_purpose::STANDARD.encode(&data);
                                                                     let _ = ipc_ev2.send(IpcResponse::Event {
                                                                         event: "data".into(),
                                                                         peer_id: Some(pid2.to_string()),
                                                                         data: Some(serde_json::json!({
-                                                                            "bytes": "incoming_data"
+                                                                            "bytes": b64
                                                                         })),
                                                                     });
                                                                 }
