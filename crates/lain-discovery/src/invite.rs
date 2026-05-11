@@ -400,10 +400,48 @@ mod tests {
     }
 
     #[test]
+    fn test_invite_full_roundtrip_all_fields() {
+        let peer_id = PeerId([0xAAu8; 32]);
+        let ed_pk = [0xBBu8; 32];
+        let noise_pk = [0xCCu8; 32]; // different from ed25519_pk (real scenario)
+        let caps = Capabilities { bits: 0b1010 };
+        let ep1 = Endpoint { addr: "10.0.0.1:8080".parse().unwrap(), kind: EndpointKind::LAN, priority: 100, ttl_seconds: 300 };
+        let ep2 = Endpoint { addr: "1.2.3.4:9999".parse().unwrap(), kind: EndpointKind::STUN, priority: 80, ttl_seconds: 600 };
+        let sign_fn = |data: &[u8]| -> [u8; 64] {
+            let mut sig = [0u8; 64];
+            sig[..32].copy_from_slice(&ed_pk);
+            sig[32..].copy_from_slice(&data[..32]);
+            sig
+        };
+
+        let invite = InviteCode::new(peer_id, ed_pk, noise_pk, caps, vec![ep1, ep2], &sign_fn);
+        let b62 = invite.to_base62();
+        let decoded = InviteCode::from_base62(&b62).unwrap();
+
+        assert_eq!(decoded.peer_id, peer_id);
+        assert_eq!(decoded.ed25519_pk, ed_pk);
+        assert_eq!(decoded.noise_pk, noise_pk, "noise_pk should survive roundtrip");
+        assert_eq!(decoded.capabilities.bits, caps.bits);
+        assert_eq!(decoded.endpoints.len(), 2);
+        assert_eq!(decoded.endpoints[0].addr.to_string(), "10.0.0.1:8080");
+        assert_eq!(decoded.endpoints[0].kind, EndpointKind::LAN);
+        assert_eq!(decoded.endpoints[0].priority, 100);
+        assert_eq!(decoded.endpoints[1].addr.to_string(), "1.2.3.4:9999");
+        assert_eq!(decoded.endpoints[1].kind, EndpointKind::STUN);
+        assert_eq!(decoded.endpoints[1].priority, 80);
+        assert_eq!(decoded.timestamp, invite.timestamp);
+        assert_eq!(decoded.signature, invite.signature);
+
+        // Verify the signature over the payload (not just copied)
+        let payload = decoded.encode_payload();
+        let expected_sig = sign_fn(&payload);
+        assert_eq!(decoded.signature, expected_sig);
+    }
+
+    #[test]
     fn test_invite_from_base62_rejects_invalid() {
         assert!(InviteCode::from_base62("!!!").is_err());
         assert!(InviteCode::from_base62("").is_err());
-        // Too short for a valid invite
         assert!(InviteCode::from_base62("abc").is_err());
     }
 }
