@@ -1973,7 +1973,7 @@ A的app ──fd read/write──→ A的daemon ──QUIC──→ B的daemon �
 | 功能 | 说明 |
 |------|------|
 | Base62 编码 | InviteCode 自定义 Base62 编解码器（非第三方库） |
-| 文件收发 | `lain send <file>` 通过 IPC base64 传输，`monitor` 自动保存 |
+| invite 动态刷新 | 每次心跳更新端点，`lain invite` 实时反映当前地址 |
 | CLI 实时反馈 | `connect` 订阅事件 15s 内返回成功/失败 |
 | 跨平台 CLI | IpcStream 抽象：Unix→UnixStream, Windows→NamedPipe |
 | 重复启动检测 | 启动时检查 IPC socket 是否已被监听 |

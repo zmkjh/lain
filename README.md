@@ -39,14 +39,7 @@ connecting...
 connected to a1b2c3d4e5f6a7b8
 ```
 
-**发文件**
-
-```bash
-$ lain send a1b2c3d4 ./hello.txt
-sent 13 bytes to a1b2c3d4
-```
-
-**看状态**
+**看状态 + 监控事件**
 
 ```bash
 $ lain status
@@ -55,8 +48,10 @@ NAT:       Cone
 IPv6:      yes
 DHT nodes: 47
 Connected: 1
-Peers:
-  ffe4d9a8
+
+$ lain monitor
+[connected] ffe4d9a8
+[data] from ffe4d9a8 (1024 bytes)
 ```
 
 **停 daemon**
@@ -74,11 +69,11 @@ $ lain shutdown
 | `lain whoami` | 查看自己的 PeerID |
 | `lain invite` | 生成邀请码 |
 | `lain connect <code>` | 连接到 peer |
-| `lain monitor` | 监控事件流（诊断） |
+| `lain monitor` | 监控事件流（诊断：连接、数据通知） |
 | `lain status` | 查看网络状态 |
 | `lain shutdown` | 停止 daemon |
 
-数据收发通过 IPC API 由应用程序实现（Python/JS 等），详见 DESIGN.md 附录 A.5。
+CLI 只管 daemon 生命周期。数据收发通过 IPC API 实现。
 
 ## 原理
 
@@ -93,6 +88,35 @@ A ←── 数据流 ──→ B 端到端加密通信
 ```
 
 用户不需要配置 IP、端口、NAT 类型、TLS 证书。底层自动完成穿透、握手、加密、路由查找。
+
+## 应用开发
+
+数据收发不在 CLI 里——Lain 是基础设施，应用通过 IPC API 使用。
+
+```python
+import socket, json, base64
+
+s = socket.socket(socket.AF_UNIX)
+s.connect("/home/user/.lain/socket")
+
+# 连接 peer
+s.send(json.dumps({"cmd":"Connect","invite":"lain://..."}).encode()+b"\n")
+
+# 订阅事件
+s.send(b'{"cmd":"Subscribe"}\n')
+
+# 收数据
+while True:
+    ev = json.loads(s.recv(4096))
+    if ev.get("event") == "data":
+        raw = base64.b64decode(ev["data"]["bytes"])
+
+# 发数据
+data = base64.b64encode(b"hello").decode()
+s.send(json.dumps({"cmd":"Send","peer_id":"...","data":data}).encode()+b"\n")
+```
+
+IPC 协议详情见 DESIGN.md 附录 A.5。
 
 ## 跨平台
 
