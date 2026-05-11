@@ -154,6 +154,27 @@ impl Daemon {
         let peer_id = self.peer_id();
         let public_key = self.public_key();
 
+        // Start IPC early so CLI can connect immediately (before slow STUN probe)
+        let uds_path = self.config.ipc.uds_path.as_deref()
+            .map(PathBuf::from)
+            .or_else(|| dirs_home().map(|d| d.join(".lain").join("socket")));
+
+        let (ipc_cmd_tx, mut ipc_cmd_rx) = mpsc::channel::<IpcCommand>(256);
+        let ipc_server = IpcServer::new(ipc::IpcConfig {
+            uds_path: uds_path.clone(),
+            http_addr: self.config.ipc.http_addr,
+        }, ipc_cmd_tx);
+
+        let _ipc_ev_tx = ipc_server.event_sender();
+
+        tokio::spawn(async move {
+            if let Err(e) = ipc_server.run().await {
+                tracing::error!("IPC: {e}");
+            }
+        });
+
+        tracing::info!("IPC ready at {:?}", uds_path);
+
         // 1. NAT 探测 (resolve STUN hostnames to addresses)
         let stun_addrs: Vec<std::net::SocketAddr> = {
             let mut addrs = Vec::new();
@@ -460,28 +481,7 @@ impl Daemon {
         );
         tracing::info!("Invite: lain://{}", init_invite.to_base62());
 
-        // 7. 启动 IPC
-        let uds_path = self.config.ipc.uds_path.as_deref()
-            .map(PathBuf::from)
-            .or_else(|| dirs_home().map(|d| d.join(".lain").join("socket")));
-
-        tracing::info!("IPC ready at {:?}", uds_path);
-
-        let (ipc_cmd_tx, mut ipc_cmd_rx) = mpsc::channel::<IpcCommand>(256);
-        let ipc_server = IpcServer::new(ipc::IpcConfig {
-            uds_path: uds_path.clone(),
-            http_addr: self.config.ipc.http_addr,
-        }, ipc_cmd_tx);
-
-        let _ipc_ev_tx = ipc_server.event_sender();
-
-        tokio::spawn(async move {
-            if let Err(e) = ipc_server.run().await {
-                tracing::error!("IPC: {e}");
-            }
-        });
-
-        tracing::info!("IPC ready at {:?}", uds_path);
+        // 7. (IPC was started early at the top of run())
 
         // 8. 启动 DHT + IPC 事件循环
         let socket = dht_for_mdns.socket();
