@@ -580,6 +580,15 @@ impl Daemon {
                                     expected == inv.peer_id && inv.noise_pk.iter().any(|&b| b != 0)
                                 });
                             if let Some(inv) = code {
+                                if inv.is_expired() {
+                                    tracing::warn!("invite expired for {}", inv.peer_id);
+                                    let _ = _ipc_ev_tx.send(IpcResponse::Event {
+                                        event: "peer_error".into(),
+                                        peer_id: Some(inv.peer_id.to_string()),
+                                        data: Some(serde_json::json!({"error": "invite expired"})),
+                                    });
+                                    continue;
+                                }
                                 // Check if already connected
                                 if connected.read().await.contains_key(&inv.peer_id) {
                                     tracing::info!("already connected to {}", inv.peer_id);
@@ -703,6 +712,13 @@ impl Daemon {
                                     if let Err(e) = dht.find_peer(&pid).await {
                                         tracing::debug!("DHT find_peer({pid}): {e}");
                                     }
+                                });
+                            } else {
+                                tracing::warn!("invalid invite: {invite}");
+                                let _ = _ipc_ev_tx.send(IpcResponse::Event {
+                                    event: "peer_error".into(),
+                                    peer_id: None,
+                                    data: Some(serde_json::json!({"error": "invalid invite code"})),
                                 });
                             }
                         }

@@ -210,6 +210,14 @@ fn connect_feedback(socket_path: &PathBuf, invite: &str) {
     let mut reader = BufReader::new(stream);
     let mut line = String::new();
     reader.read_line(&mut line).ok();
+    // Check immediate response for errors
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) {
+        if v.get("type").and_then(|t| t.as_str()) == Some("Error") {
+            let msg = v.get("message").and_then(|m| m.as_str()).unwrap_or("unknown error");
+            eprintln!("cannot connect: {msg}");
+            return;
+        }
+    }
     println!("connecting...");
     // Subscribe
     reader.get_mut().write_all(b"{\"cmd\":\"Subscribe\"}\n").ok();
