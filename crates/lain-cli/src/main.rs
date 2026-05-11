@@ -281,9 +281,15 @@ fn monitor_loop(socket_path: &PathBuf) {
                         if let Some(b64) = data_field.get("bytes").and_then(|b| b.as_str()) {
                             use base64::Engine;
                             if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(b64) {
-                                let filename = format!("received_from_{peer}.bin");
+                                let home = std::env::var("HOME").ok()
+                                    .or_else(|| std::env::var("USERPROFILE").ok())
+                                    .map(PathBuf::from)
+                                    .unwrap_or_else(|| PathBuf::from("."));
+                                let dir = home.join(".lain").join("received");
+                                let _ = std::fs::create_dir_all(&dir);
+                                let filename = dir.join(format!("from_{peer}.bin"));
                                 let _ = std::fs::write(&filename, &bytes);
-                                println!("[data] from {peer} → saved {filename} ({} bytes)", bytes.len());
+                                println!("[data] {peer} → saved {}", filename.display());
                             }
                         } else {
                             println!("[data] from {peer}");
