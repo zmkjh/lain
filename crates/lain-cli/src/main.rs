@@ -60,7 +60,7 @@ struct Cli {
     #[arg(short = 's', long, default_value = "")]
     socket: String,
     /// Run in foreground (log to stdout instead of file)
-    #[arg(short = 'f', long)]
+    #[arg(short = 'f', long, global = true)]
     foreground: bool,
 }
 

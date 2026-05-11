@@ -1992,7 +1992,7 @@ A的app ──fd read/write──→ A的daemon ──QUIC──→ B的daemon �
 ```
 $ lain                   # 启动 daemon (quiet mode, log to ~/.lain/daemon.log)
 $ lain daemon            # 同上
-$ lain -f daemon         # 前台运行 (log to stdout)
+$ lain daemon -f         # 前台运行 (log to stdout)
 $ lain whoami            # 查看 PeerID
 $ lain invite            # 生成 invite 码
 $ lain connect <code>    # 连接到 peer (支持 lain:// 或裸 Base62)

@@ -63,7 +63,7 @@ $ lain shutdown
 | 命令 | 功能 |
 |------|------|
 | `lain` 或 `lain daemon` | 启动守护进程 |
-| `lain -f daemon` | 前台运行（日志输出到终端） |
+| `lain daemon -f` | 前台运行（日志输出到终端） |
 | `lain whoami` | 查看自己的 PeerID |
 | `lain invite` | 生成邀请码 |
 | `lain connect <code>` | 连接到 peer |
