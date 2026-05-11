@@ -79,12 +79,10 @@ fn dirs_home() -> Option<PathBuf> {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Start the daemon
     Daemon,
     Whoami,
     Invite,
     Connect { invite: String },
-    Send { peer_id: String, file: String },
     Monitor,
     Shutdown,
     Status,
@@ -146,7 +144,6 @@ fn main() {
             }
         }
         Command::Connect { invite } => connect_feedback(&socket_path, &invite),
-        Command::Send { peer_id, file } => send_file(&socket_path, &peer_id, &file),
         Command::Monitor => monitor_loop(&socket_path),
         Command::Shutdown => {
             let _ = ipc_req(&socket_path, r#"{"cmd":"Shutdown"}"#);
@@ -239,21 +236,6 @@ fn connect_feedback(socket_path: &PathBuf, invite: &str) {
                     _ => {}
                 }
             }
-        }
-    }
-}
-
-fn send_file(socket_path: &PathBuf, peer_id: &str, file: &str) {
-    let data = match std::fs::read(file) {
-        Ok(d) => d,
-        Err(e) => { eprintln!("cannot read {file}: {e}"); return; }
-    };
-    use base64::Engine;
-    let b64 = base64::engine::general_purpose::STANDARD.encode(&data);
-    let req = serde_json::json!({"cmd":"Send","peer_id":peer_id,"data":b64}).to_string();
-    if let Some(resp) = ipc_req(socket_path, &req) {
-        if resp.get("type").and_then(|t| t.as_str()) == Some("Ok") {
-            println!("sent {} bytes to {peer_id}", data.len());
         }
     }
 }
