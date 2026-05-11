@@ -313,34 +313,34 @@ impl Daemon {
         };
         endpoints.push(Endpoint::new(public_dht_addr, lain_core::endpoint::EndpointKind::STUN));
 
-        // TSO TCP port: for TCP Simultaneous Open fallback when UDP hole punch fails
-        let tso_listener = tokio::net::TcpListener::bind(bind_addr).await
-            .map_err(|e| DaemonError::Config(format!("TSO bind: {e}")))?;
-        let tso_port = tso_listener.local_addr()
-            .map_err(|e| DaemonError::Config(format!("TSO addr: {e}")))?
-            .port();
-        if let Some(stun) = nat_result.mapped_addr {
-            endpoints.push(Endpoint::new(
-                SocketAddr::new(stun.ip(), tso_port),
-                lain_core::endpoint::EndpointKind::TSO,
-            ));
-        }
-        tracing::info!("TSO TCP: port {tso_port}");
-        // Spawn TSO accept loop: accept incoming TCP connections for TSO
-        tokio::spawn(async move {
-            loop {
-                match tso_listener.accept().await {
-                    Ok((mut stream, peer_addr)) => {
-                        use tokio::io::AsyncWriteExt;
-                        tokio::spawn(async move {
-                            tracing::debug!("TSO accepted from {peer_addr}");
-                            let _ = stream.write_all(b"TSO_OK").await;
-                        });
-                    }
-                    Err(_) => break,
-                }
+        // TSO TCP ports: bind N sockets for birthday-attack-style TSO,
+        // increasing probability of TCP simultaneous open through APDF NAT.
+        const TSO_PORTS: u16 = 16;
+        for _ in 0..TSO_PORTS {
+            let tso_listener = tokio::net::TcpListener::bind(bind_addr).await
+                .map_err(|e| DaemonError::Config(format!("TSO bind: {e}")))?;
+            let tso_port = tso_listener.local_addr()
+                .map_err(|e| DaemonError::Config(format!("TSO addr: {e}")))?
+                .port();
+            if let Some(stun) = nat_result.mapped_addr {
+                endpoints.push(Endpoint::new(
+                    SocketAddr::new(stun.ip(), tso_port),
+                    lain_core::endpoint::EndpointKind::TSO,
+                ));
             }
-        });
+            tokio::spawn(async move {
+                use tokio::io::AsyncWriteExt;
+                loop {
+                    match tso_listener.accept().await {
+                        Ok((mut stream, _)) => {
+                            let _ = stream.write_all(b"TSO_OK").await;
+                        }
+                        Err(_) => break,
+                    }
+                }
+            });
+        }
+        tracing::info!("TSO TCP: {TSO_PORTS} ports");
 
         if let Err(e) = dht.store_self(&public_key, &noise_pubkey, &endpoints, capabilities).await {
             tracing::warn!("initial DHT STORE failed: {e}");
