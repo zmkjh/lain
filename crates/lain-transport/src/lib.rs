@@ -169,10 +169,10 @@ impl Transport {
         })
     }
 
-    /// 主动连接并返回原始 QUIC 连接（用于 daemon 管理流）
+    /// 主动连接并返回原始 QUIC 连接
     pub async fn connect_raw(
         &self,
-        remote_pubkey: &Ed25519PublicKey,
+        noise_pubkey: &Ed25519PublicKey,
         endpoints: &[Endpoint],
     ) -> Result<quinn::Connection, TransportError> {
         let client_crypto = rustls::ClientConfig::builder_with_protocol_versions(&[
@@ -193,7 +193,7 @@ impl Transport {
         for ep in eps {
             match tokio::time::timeout(
                 std::time::Duration::from_secs(self.config.traversal_timeout_secs),
-                self.try_connect(remote_pubkey, ep.addr, &quic_client_cfg),
+                self.try_connect(noise_pubkey, ep.addr, &quic_client_cfg),
             ).await {
                 Ok(Ok(conn)) => return Ok(conn),
                 Ok(Err(e)) => tracing::debug!("connect {}: {e}", ep.addr),
@@ -205,16 +205,11 @@ impl Transport {
 
     async fn try_connect(
         &self,
-        remote_pubkey: &Ed25519PublicKey,
+        noise_pubkey: &Ed25519PublicKey,
         addr: SocketAddr,
         client_cfg: &quinn::ClientConfig,
     ) -> Result<quinn::Connection, TransportError> {
         // Convert Ed25519 pubkey → X25519 for Noise IK (use Montgomery form)
-        let x25519_pub = match ed25519_dalek::VerifyingKey::from_bytes(remote_pubkey) {
-            Ok(vk) => vk.to_montgomery().to_bytes(),
-            Err(_) => return Err(TransportError::Noise("invalid ed25519 pubkey".into())),
-        };
-
         let conn = self.endpoint
             .connect_with(client_cfg.clone(), addr, "lain")
             .map_err(|e| TransportError::Connect(format!("connect: {e}")))?
@@ -224,7 +219,7 @@ impl Transport {
         let (mut send, mut recv) = conn.open_bi().await
             .map_err(|e| TransportError::Connect(format!("bi: {e}")))?;
 
-        let mut noise = NoiseHandshake::new_initiator(&self.noise_secret, &x25519_pub)
+        let mut noise = NoiseHandshake::new_initiator(&self.noise_secret, noise_pubkey)
             .map_err(|e| TransportError::Noise(format!("init: {e}")))?;
 
         let ik1 = noise.write_message(&[])
@@ -479,11 +474,6 @@ impl Transport {
         path: PathType,
         client_cfg: &quinn::ClientConfig,
     ) -> Result<(CoreConn, PathType, quinn::Connection), TransportError> {
-        // Convert Ed25519 pubkey → X25519 for Noise IK
-        let x25519_pub = ed25519_dalek::VerifyingKey::from_bytes(remote_pubkey)
-            .map(|vk| vk.to_montgomery().to_bytes())
-            .map_err(|_| TransportError::Noise("invalid pubkey".into()))?;
-
         let conn = self.endpoint
             .connect_with(client_cfg.clone(), addr, "lain")
             .map_err(|e| TransportError::Connect(format!("connect: {e}")))?
@@ -495,7 +485,7 @@ impl Transport {
             .await
             .map_err(|e| TransportError::Connect(format!("bi: {e}")))?;
 
-        let mut noise = NoiseHandshake::new_initiator(&self.noise_secret, &x25519_pub)
+        let mut noise = NoiseHandshake::new_initiator(&self.noise_secret, remote_pubkey)
             .map_err(|e| TransportError::Noise(format!("init: {e}")))?;
 
         let ik1 = noise.write_message(&[])

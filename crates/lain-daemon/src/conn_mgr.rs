@@ -70,7 +70,7 @@ impl ConnectionManager {
                 }
             };
 
-            match transport.connect_raw(&record.pubkey, &record.endpoints).await {
+            match transport.connect_raw(&record.noise_pubkey, &record.endpoints).await {
                 Ok(conn) => {
                     tracing::info!("{peer_id} reconnected!");
 
