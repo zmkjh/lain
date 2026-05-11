@@ -166,7 +166,97 @@ async fn test_rate_limit_survives_flood() {
     assert!(size >= 0); // survived
 }
 
-// ── Test 5: Malformed messages don't crash ──
+// ── Test 5: Pure QUIC connection (no Noise IK) ──
+
+#[tokio::test]
+async fn test_pure_quic_connect() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
+    // Self-signed cert for server
+    let key_pair = rcgen::KeyPair::generate().unwrap();
+    let cert = rcgen::CertificateParams::new(vec!["localhost".into()]).unwrap()
+        .self_signed(&key_pair).unwrap();
+    let cert_der = rustls::pki_types::CertificateDer::from(cert.der().to_vec());
+    let key_der = rustls::pki_types::PrivatePkcs8KeyDer::from(key_pair.serialize_der());
+    let key = rustls::pki_types::PrivateKeyDer::from(key_der);
+
+    let server_config = rustls::ServerConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
+        .with_no_client_auth()
+        .with_single_cert(vec![cert_der], key).unwrap();
+    let server_cfg = quinn::ServerConfig::with_crypto(Arc::new(
+        quinn::crypto::rustls::QuicServerConfig::try_from(server_config).unwrap(),
+    ));
+
+    let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    let runtime = quinn::default_runtime().unwrap();
+    let server = quinn::Endpoint::new(quinn::EndpointConfig::default(), Some(server_cfg), socket, runtime).unwrap();
+    let server_addr = server.local_addr().unwrap();
+
+    // Spawn server — keep endpoint alive until data exchange completes
+    let (done_tx, done_rx) = tokio::sync::oneshot::channel::<()>();
+    let server_handle = tokio::spawn(async move {
+        if let Some(incoming) = server.accept().await {
+            let conn = incoming.await.unwrap();
+            let (mut send, mut recv) = conn.accept_bi().await.unwrap();
+            let mut buf = vec![0u8; 1024];
+            if let Ok(n) = recv.read_to_end(65536).await {
+                send.write_all(&n).await.unwrap();
+                send.finish().unwrap();
+            }
+            let _ = done_rx.await; // wait for client to confirm
+        }
+    });
+
+    // Client connect
+    let client_crypto = rustls::ClientConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(NoVerifyClient))
+        .with_no_client_auth();
+    let client_cfg = quinn::ClientConfig::new(Arc::new(
+        quinn::crypto::rustls::QuicClientConfig::try_from(client_crypto).unwrap(),
+    ));
+
+    let mut client = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+    let conn = client.connect_with(client_cfg, server_addr, "localhost").unwrap().await.unwrap();
+
+    let (mut send, mut recv) = conn.open_bi().await.unwrap();
+    send.write_all(b"hello quic").await.unwrap();
+    send.finish().unwrap();
+
+    let data = recv.read_to_end(65536).await.unwrap();
+    assert_eq!(data, b"hello quic", "QUIC roundtrip should work");
+    let _ = done_tx.send(());
+    let _ = server_handle.await;
+}
+
+#[derive(Debug)]
+struct NoVerifyClient;
+impl rustls::client::danger::ServerCertVerifier for NoVerifyClient {
+    fn verify_server_cert(&self, _: &rustls::pki_types::CertificateDer<'_>, _: &[rustls::pki_types::CertificateDer<'_>], _: &rustls::pki_types::ServerName<'_>, _: &[u8], _: rustls::pki_types::UnixTime) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+    fn verify_tls12_signature(&self, _: &[u8], _: &rustls::pki_types::CertificateDer<'_>, _: &rustls::DigitallySignedStruct) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+    fn verify_tls13_signature(&self, _: &[u8], _: &rustls::pki_types::CertificateDer<'_>, _: &rustls::DigitallySignedStruct) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        vec![
+            rustls::SignatureScheme::RSA_PKCS1_SHA256,
+            rustls::SignatureScheme::RSA_PKCS1_SHA384, 
+            rustls::SignatureScheme::RSA_PKCS1_SHA512,
+            rustls::SignatureScheme::ECDSA_NISTP256_SHA256,
+            rustls::SignatureScheme::ECDSA_NISTP384_SHA384,
+            rustls::SignatureScheme::RSA_PSS_SHA256,
+            rustls::SignatureScheme::RSA_PSS_SHA384,
+            rustls::SignatureScheme::RSA_PSS_SHA512,
+            rustls::SignatureScheme::ED25519,
+        ]
+    }
+}
+
+// ── Test 7: Malformed messages don't crash ──
 
 #[tokio::test]
 async fn test_malformed_messages_dont_crash() {
