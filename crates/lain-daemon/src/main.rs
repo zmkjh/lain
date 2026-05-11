@@ -4,6 +4,12 @@
 
 fn main() {
     tracing_subscriber::fmt::init();
+
+    // rustls crypto provider must be installed before any QUIC activity
+    if rustls::crypto::CryptoProvider::get_default().is_none() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    }
+
     let rt = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
 
     rt.block_on(async {

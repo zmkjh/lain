@@ -144,6 +144,10 @@ impl Daemon {
     pub fn sign(&self, data: &[u8]) -> [u8; 64] { self.identity.sign(data) }
 
     pub async fn run(&self) -> Result<(), DaemonError> {
+        // Ensure rustls crypto provider is installed before QUIC/Transport init
+        if rustls::crypto::CryptoProvider::get_default().is_none() {
+            let _ = rustls::crypto::ring::default_provider().install_default();
+        }
         *self.state.write().await = DaemonState::Running;
         tracing::info!("Daemon is running");
 
@@ -175,7 +179,7 @@ impl Daemon {
             .map_err(|e| DaemonError::Config(e.to_string()))?;
         tracing::info!("transport on port {transport_port}");
 
-        // 4. 初始化 DHT (共享同一端口)
+        // 4. 初始化 DHT (separate UDP socket, not shared with QUIC transport)
         let dht_config = lain_dht::DhtConfig {
             k: self.config.dht.k,
             alpha: self.config.dht.alpha,
@@ -183,8 +187,7 @@ impl Daemon {
             heartbeat_interval_secs: self.config.dht.heartbeat_interval_secs,
             republish_interval_secs: lain_core::DHT_REPUBLISH_SECS,
             idle_peer_timeout_secs: 900,
-            local_addr: format!("0.0.0.0:{}", transport_port)
-                .parse::<SocketAddr>()
+            local_addr: "0.0.0.0:0".parse::<SocketAddr>()
                 .map_err(|e: std::net::AddrParseError| DaemonError::Config(e.to_string()))?,
             bootstrap_nodes: self.config.dht.bootstrap_nodes.clone(),
         };
