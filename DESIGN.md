@@ -1966,9 +1966,12 @@ A的app ──fd read/write──→ A的daemon ──QUIC──→ B的daemon �
 |------|------|------|
 | §6.3 Birthday Attack | ❌ | relay 存在时非必需 |
 | §6.3 TCP Simultaneous Open | ❌ | relay 存在时非必需 |
-| §3.7 单 UDP socket | ⚠️ | DHT+QUIC 各自 bind 不同端口。真单 socket 需要实现 `AsyncUdpSocket` trait (~100 行)，属于工程优化而非功能缺陷 |
+| §3.7 单 UDP socket | ⚠️ | DHT+QUIC 各自 bind 不同端口。真单 socket 需 `AsyncUdpSocket` trait (~100 行)，工程优化非功能缺陷 |
+| 跨机器 DHT 网络 | ⚠️ | 协议代码完整，但未在 ≥2 台物理机间验证。当前测试用 localhost 模拟 |
+| 真实 STUN/NAT 探测 | ⚠️ | STUN 协议解析有测试，但未配置公共 STUN 服务器运行真实探测 |
+| 移动端 (Android/iOS) | ❌ | 设计文档提及但无平台代码 |
 
-### A.3 实现超出设计
+### A.3 当前状态（2026-05 真机验证）
 
 | 功能 | 说明 |
 |------|------|
@@ -2059,12 +2062,18 @@ public = x25519_dalek::PublicKey::from(&secret)  # X25519 public key
 - STORE 消息 payload 从 68 字节扩至 100 字节（+32 noise_pubkey）
 - InviteCode 新增 `noise_pk: [u8; 32]` 字段，编码从 74 字节扩至 106 字节
 
-### A.8 测试覆盖
+### A.8 测试覆盖（2026-05 实际）
 
-| 层级 | 数量 | 覆盖 |
-|------|------|------|
-| DHT 路由表单元 | 10 | 插入、满拒、距离、bucket index、最近排序、500 节点压力 |
-| Noise IK 单元 | 7 | 握手、帧编解码、VarInt、加密往返 |
-| 集成测试 | 9 | bootstrap+find、store+find、纯 QUIC、限速存活、畸形安全、**端到端加密往返** |
+| 模块 | 数量 | 覆盖内容 |
+|------|------|----------|
+| lain-core | 14 | VarInt, 10 种 FrameType 往返, 非法帧拒绝, 帧类型有效性 |
+| lain-identity | 6 | 生成, 签名验证, 确定性, Noise 转换, 持久化往返, 损坏拒绝 |
+| lain-nat | 14 | STUN 绑定请求, XOR-MAPPED-ADDRESS, MAPPED-ADDRESS, 截断拒绝, 属性遍历, fallback |
+| lain-noise | 10 | 完整握手, 多轮收发, 大包+空包, 错误密钥拒绝, VarInt |
+| lain-dht | 38 | 路由表(10) + 消息序列化(11) + handler(PING/STORE/FIND_VALUE/FIND_NODE/签名验证/篡改/TTL)(17) |
+| lain-discovery | 7 | invite Base62, URI, 多端点, 过期, 非法输入 |
+| lain-transport | 7 | config, bind, local_addr, NoVerify, 多端点 fallback |
+| lain-daemon | 39 | IPC 序列化+Windows Pipe(16) + peers.json(2) + 集成(12 含 relay e2e+并发) |
+| **总计** | **135** | 零 warning, Windows 真机 CLI 启动+whoami+invite+status+monitor+shutdown 全部通过 |
 
 用户和开发者不需要关心最终走的是哪条路径——daemon 透明选择。

@@ -9,6 +9,8 @@ pub struct DaemonConfig {
     pub transport: TransportConfigFields,
     #[serde(default)]
     pub ipc: IpcConfigFields,
+    #[serde(default = "default_stun_servers")]
+    pub stun_servers: Vec<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -98,6 +100,12 @@ fn default_heartbeat() -> u64 { 150 }
 fn default_max_conns() -> usize { 256 }
 fn default_idle() -> u64 { 30 }
 fn default_keepalive() -> u64 { 15 }
+fn default_stun_servers() -> Vec<String> {
+    vec![
+        "stun.l.google.com:19302".to_string(),
+        "stun1.l.google.com:19302".to_string(),
+    ]
+}
 
 impl Default for DaemonConfig {
     fn default() -> Self {
@@ -105,6 +113,7 @@ impl Default for DaemonConfig {
             dht: DhtConfigFields::default(),
             transport: TransportConfigFields::default(),
             ipc: IpcConfigFields::default(),
+            stun_servers: default_stun_servers(),
         }
     }
 }

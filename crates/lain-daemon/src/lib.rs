@@ -154,9 +154,23 @@ impl Daemon {
         let peer_id = self.peer_id();
         let public_key = self.public_key();
 
-        // 1. NAT 探测
+        // 1. NAT 探测 (resolve STUN hostnames to addresses)
+        let stun_addrs: Vec<std::net::SocketAddr> = {
+            let mut addrs = Vec::new();
+            for host in &self.config.stun_servers {
+                match tokio::net::lookup_host(host).await {
+                    Ok(mut iter) => {
+                        if let Some(addr) = iter.next() {
+                            addrs.push(addr);
+                        }
+                    }
+                    Err(e) => tracing::debug!("STUN lookup {host}: {e}"),
+                }
+            }
+            addrs
+        };
         let nat_result = {
-            let probe = NatProbe::new(vec![], 10);
+            let probe = NatProbe::new(stun_addrs, 10);
             probe.probe().await.map_err(|e| DaemonError::Dht(e.to_string()))?
         };
         tracing::info!("NAT: {:?}, IPv6 inbound: {}", nat_result.nat_type, nat_result.ipv6_inbound);
