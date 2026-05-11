@@ -360,7 +360,7 @@ impl Daemon {
 
         // 7. 生成 invite
         let _invite = lain_discovery::InviteCode::new(
-            peer_id, public_key, capabilities, endpoints.clone(),
+            peer_id, public_key, noise_pubkey, capabilities, endpoints.clone(),
             &|data| self.identity.sign(data),
         );
         tracing::info!("Invite: lain://{}", _invite.to_base62());
@@ -500,10 +500,10 @@ impl Daemon {
                                 let connected_ref = connected.clone();
                                 let conn_sem2 = conn_sem.clone();
                                 let pid = inv.peer_id;
-                                let pubkey = inv.ed25519_pk;
+                                let noise_pk = inv.noise_pk;
                                 let eps = inv.endpoints.clone();
                                 tokio::spawn(async move {
-                                    match t.connect_raw(&pubkey, &eps).await {
+                                    match t.connect_raw(&noise_pk, &eps).await {
                                         Ok(conn) => {
                                             // Acquire connection slot
                                             let permit = match conn_sem2.clone().acquire_owned().await {

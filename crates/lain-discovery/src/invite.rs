@@ -28,6 +28,7 @@ pub struct InviteCode {
     pub version: u8,
     pub peer_id: PeerId,
     pub ed25519_pk: [u8; 32],
+    pub noise_pk: [u8; 32],
     pub capabilities: Capabilities,
     pub mappable_port_start: u16,
     pub mappable_port_end: u16,
@@ -41,6 +42,7 @@ impl InviteCode {
     pub fn new(
         peer_id: PeerId,
         pubkey: [u8; 32],
+        noise_pk: [u8; 32],
         capabilities: Capabilities,
         endpoints: Vec<Endpoint>,
         sign_fn: &dyn Fn(&[u8]) -> [u8; 64],
@@ -54,6 +56,7 @@ impl InviteCode {
             version: lain_core::PROTOCOL_VERSION,
             peer_id,
             ed25519_pk: pubkey,
+            noise_pk,
             capabilities,
             mappable_port_start: 1024,
             mappable_port_end: 65535,
@@ -73,6 +76,7 @@ impl InviteCode {
         data.push(self.version);
         data.extend_from_slice(&self.peer_id.0);
         data.extend_from_slice(&self.ed25519_pk);
+        data.extend_from_slice(&self.noise_pk);
         data.push(self.capabilities.bits);
         data.extend_from_slice(&self.mappable_port_start.to_be_bytes());
         data.extend_from_slice(&self.mappable_port_end.to_be_bytes());
@@ -89,7 +93,7 @@ impl InviteCode {
     }
 
     fn decode_payload(data: &[u8]) -> Result<Self, DiscoveryError> {
-        if data.len() < 74 {
+        if data.len() < 106 {
             return Err(DiscoveryError::Decode("too short".into()));
         }
 
@@ -104,14 +108,16 @@ impl InviteCode {
         let mut pk = [0u8; 32];
         pk.copy_from_slice(&data[33..65]);
 
-        let capabilities = Capabilities { bits: data[65] };
+        let mut noise_pk = [0u8; 32];
+        noise_pk.copy_from_slice(&data[65..97]);
 
-        let mappable_port_start = u16::from_be_bytes([data[66], data[67]]);
-        let mappable_port_end = u16::from_be_bytes([data[68], data[69]]);
-        let port_delta_hint = data[70];
+        let capabilities = Capabilities { bits: data[97] };
 
-        let ep_count = data[71] as usize;
-        let mut offset = 72usize;
+        let mappable_port_start = u16::from_be_bytes([data[98], data[99]]);
+        let mappable_port_end = u16::from_be_bytes([data[100], data[101]]);
+        let port_delta_hint = data[102];
+        let ep_count = data[103] as usize;
+        let mut offset = 104usize;
         let mut endpoints = Vec::with_capacity(ep_count);
 
         for _ in 0..ep_count {
@@ -137,6 +143,7 @@ impl InviteCode {
             version,
             peer_id: PeerId(peer_id_bytes),
             ed25519_pk: pk,
+            noise_pk,
             capabilities,
             mappable_port_start,
             mappable_port_end,
@@ -157,7 +164,7 @@ impl InviteCode {
     pub fn from_base62(s: &str) -> Result<Self, DiscoveryError> {
         let data = decode_base62(s)
             .ok_or_else(|| DiscoveryError::Decode("invalid base62".into()))?;
-        if data.len() < 74 + 64 {
+        if data.len() < 106 + 64 {
             return Err(DiscoveryError::Decode("invite too short".into()));
         }
         Self::decode_payload(&data)
@@ -340,7 +347,7 @@ mod tests {
             ttl_seconds: 300,
         };
         let sign_fn = |_data: &[u8]| -> [u8; 64] { [3u8; 64] };
-        InviteCode::new(peer_id, pk, Capabilities::new(), vec![endpoint], &sign_fn)
+        InviteCode::new(peer_id, pk, pk, Capabilities::new(), vec![endpoint], &sign_fn)
     }
 
     #[test]
