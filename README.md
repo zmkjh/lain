@@ -13,7 +13,7 @@ IPv6 下更纯粹：每台设备有全球唯一地址，零 NAT，零 relay，�
 ## 安装
 
 ```bash
-git clone https://github.com/lain-p2p/lain
+git clone https://github.com/zmkjh/lain
 cd lain
 cargo build --release
 # Unix
