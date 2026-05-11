@@ -888,6 +888,7 @@ dependencies = [
  "bytes",
  "ed25519-dalek",
  "lain-core",
+ "lain-identity",
  "rand 0.8.6",
  "serde",
  "serde_json",

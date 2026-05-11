@@ -349,3 +349,215 @@ async fn test_peerid_edge_cases() {
     // Display should not panic
     let _s = format!("{zero}");
 }
+
+// ── Test 2: Relay end-to-end ──
+
+#[tokio::test]
+async fn test_relay_end_to_end() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
+    // Create 3 identities
+    let id_a = Identity::generate().ok().unwrap();
+    let id_b = Identity::generate().ok().unwrap();
+    let id_c = Identity::generate().ok().unwrap();
+
+    let (ns_a, np_a) = id_a.noise_keypair();
+    let (ns_b, np_b) = id_b.noise_keypair();
+    let (ns_c, np_c) = id_c.noise_keypair();
+
+    // Setup transports — B is the relay
+    let t_a = Transport::new(
+        TransportConfig { bind_addr: "127.0.0.1:0".parse().unwrap(), ..Default::default() },
+        ns_a, id_a.peer_id(), *id_a.public_key()).unwrap();
+    let t_b = Arc::new(Transport::new(
+        TransportConfig { bind_addr: "127.0.0.1:0".parse().unwrap(), ..Default::default() },
+        ns_b, id_b.peer_id(), *id_b.public_key()).unwrap());
+    let t_c = Transport::new(
+        TransportConfig { bind_addr: "127.0.0.1:0".parse().unwrap(), ..Default::default() },
+        ns_c, id_c.peer_id(), *id_c.public_key()).unwrap();
+
+    let b_addr: SocketAddr = format!("127.0.0.1:{}", t_b.local_addr().unwrap().port()).parse().unwrap();
+    let c_addr: SocketAddr = format!("127.0.0.1:{}", t_c.local_addr().unwrap().port()).parse().unwrap();
+
+    let b_ep = Endpoint::new(b_addr, EndpointKind::STUN);
+    let c_ep = Endpoint::new(c_addr, EndpointKind::STUN);
+
+    // C spawns relay echo: accept connection, for each incoming bi stream,
+    // read → open new stream and respond (bidirectional relay protocol)
+    let _c_handle = tokio::spawn(async move {
+        loop {
+            match t_c.accept_connection().await {
+                Ok((conn, _, _)) => {
+                    let c_conn = conn.clone();
+                    tokio::spawn(async move {
+                        loop {
+                            match c_conn.accept_bi().await {
+                                Ok((mut send, mut recv)) => {
+                                    let mut buf = vec![0u8; 4096];
+                                    let mut total = Vec::new();
+                                    loop {
+                                        match recv.read(&mut buf).await {
+                                            Ok(Some(n)) => { total.extend_from_slice(&buf[..n]); }
+                                            _ => break,
+                                        }
+                                    }
+                                    // Echo back by opening a new stream (relay pipe picks it up)
+                                    if let Ok((mut e_send, _)) = c_conn.open_bi().await {
+                                        let _ = e_send.write_all(&total).await;
+                                        let _ = e_send.finish();
+                                    }
+                                    drop(send); // don't respond on same stream
+                                }
+                                Err(_) => break,
+                            }
+                        }
+                    });
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    // B accepts A's connection (spawn BEFORE A connects)
+    let t_b_accept = t_b.clone();
+    let (b_conn_tx, mut b_conn_rx) = tokio::sync::mpsc::channel::<quinn::Connection>(1);
+    tokio::spawn(async move {
+        if let Ok((conn, _, _)) = t_b_accept.accept_connection().await {
+            b_conn_tx.send(conn).await.ok();
+        }
+    });
+
+    // A connects to relay B
+    let a_conn = t_a.connect_raw(&np_b, &[b_ep.clone()]).await
+        .expect("A should connect to relay B");
+
+    // Get B's side of the connection
+    let b_side_conn = b_conn_rx.recv().await.unwrap();
+
+    // B handles relay: connects to C and pipes A↔C
+    let t_b_relay = t_b.clone();
+    let relay_handle = tokio::spawn(async move {
+        t_b_relay.handle_relay_request(
+            b_side_conn,
+            id_c.peer_id(),
+            np_c,
+            &[c_ep],
+        ).await
+    });
+
+    // Give relay time to establish pipe
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // A opens a bi stream to send data through relay
+    let (mut a_send, _a_recv) = a_conn.open_bi().await
+        .expect("A should open bi stream through relay");
+    a_send.write_all(b"hello relay").await.unwrap();
+    a_send.finish().unwrap();
+
+    // A accepts a new bi stream — the relay forwards C's response back
+    let (_, mut a_response_recv) = a_conn.accept_bi().await
+        .expect("A should receive response from C through relay");
+    let echo = a_response_recv.read_to_end(65536).await.unwrap();
+    assert_eq!(echo, b"hello relay", "roundtrip through relay should work");
+
+    // Relaying is ongoing, close connection after test
+    drop(a_conn);
+    let _ = tokio::time::timeout(Duration::from_secs(5), relay_handle).await;
+}
+
+// ── Test 3: Concurrent connections ──
+
+#[tokio::test]
+async fn test_concurrent_connections() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
+    let id_a = Identity::generate().ok().unwrap();
+    let id_b = Identity::generate().ok().unwrap();
+    let (ns_a, np_a) = id_a.noise_keypair();
+    let (ns_b, np_b) = id_b.noise_keypair();
+
+    let t_b = Arc::new(Transport::new(
+        TransportConfig { bind_addr: "127.0.0.1:0".parse().unwrap(), ..Default::default() },
+        ns_b, id_b.peer_id(), *id_b.public_key()).unwrap());
+    let b_addr: SocketAddr = format!("127.0.0.1:{}", t_b.local_addr().unwrap().port()).parse().unwrap();
+    let b_ep = Endpoint::new(b_addr, EndpointKind::STUN);
+
+    // B accepts up to 10 connections, echoes on each
+    let t_b2 = t_b.clone();
+    let b_accept = tokio::spawn(async move {
+        let mut handles = Vec::new();
+        for _ in 0..10 {
+            match t_b2.accept_connection().await {
+                Ok((conn, _, _)) => {
+                    handles.push(tokio::spawn(async move {
+                        loop {
+                            match conn.accept_bi().await {
+                                Ok((mut send, mut recv)) => {
+                                    let data = recv.read_to_end(65536).await.unwrap_or_default();
+                                    let _ = send.write_all(&data).await;
+                                    let _ = send.finish();
+                                }
+                                Err(_) => break,
+                            }
+                        }
+                    }));
+                }
+                Err(_) => break,
+            }
+        }
+        handles
+    });
+
+    // Open 10 connections from A to B concurrently
+    let mut conns = Vec::new();
+    for _ in 0..10 {
+        let t_a = Transport::new(
+            TransportConfig { bind_addr: "127.0.0.1:0".parse().unwrap(), ..Default::default() },
+            ns_a, id_a.peer_id(), *id_a.public_key()).unwrap();
+        let conn = t_a.connect_raw(&np_b, &[b_ep.clone()]).await
+            .expect("concurrent connect should work");
+        conns.push((t_a, conn));
+    }
+
+    // Each connection sends data and verifies echo
+    let mut tasks = Vec::new();
+    for (_t_a, conn) in conns {
+        tasks.push(tokio::spawn(async move {
+            let (mut send, mut recv) = conn.open_bi().await.unwrap();
+            let msg = format!("msg-{}", rand::random::<u32>());
+            send.write_all(msg.as_bytes()).await.unwrap();
+            send.finish().unwrap();
+            let echo = recv.read_to_end(65536).await.unwrap();
+            assert_eq!(echo, msg.as_bytes(), "echo mismatch");
+        }));
+    }
+
+    for t in tasks {
+        t.await.unwrap();
+    }
+
+    // Clean up: B's accept task will end when connections close
+}
+
+// ── Test 4: Multiple transports bound to 0 produce distinct ports ──
+
+#[tokio::test]
+async fn test_multiple_transports_distinct_ports() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
+    let id = Identity::generate().ok().unwrap();
+    let (ns, _np) = id.noise_keypair();
+
+    let t1 = Transport::new(
+        TransportConfig { bind_addr: "127.0.0.1:0".parse().unwrap(), ..Default::default() },
+        ns, id.peer_id(), *id.public_key()).unwrap();
+    let t2 = Transport::new(
+        TransportConfig { bind_addr: "127.0.0.1:0".parse().unwrap(), ..Default::default() },
+        ns, id.peer_id(), *id.public_key()).unwrap();
+
+    let p1 = t1.local_addr().unwrap().port();
+    let p2 = t2.local_addr().unwrap().port();
+    assert_ne!(p1, p2, "two transports should get distinct ports");
+    assert!(p1 > 0);
+    assert!(p2 > 0);
+}

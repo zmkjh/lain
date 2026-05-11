@@ -487,10 +487,18 @@ impl DhtHandle {
                             return Err(DhtError::InvalidSignature { peer_id: msg.sender_id });
                         }
 
+                        // Parse endpoints from remaining payload
+                        let eps = if msg.payload.len() >= 102 {
+                            let ep_len = u16::from_be_bytes([msg.payload[100], msg.payload[101]]) as usize;
+                            msg_codec::parse_endpoints(&msg.payload[102..], ep_len)
+                        } else {
+                            vec![]
+                        };
+
                         let record = PeerRecord {
                             pubkey,
                             noise_pubkey,
-                            endpoints: vec![],
+                            endpoints: eps.clone(),
                             capabilities: Capabilities::new(),
                             ttl_remaining: effective_ttl,
                             expires_at: std::time::Instant::now() + std::time::Duration::from_secs(effective_ttl as u64),
@@ -499,7 +507,7 @@ impl DhtHandle {
                         let _ = self.event_tx.send(CoreDhtEvent::PeerDiscovered(key, PeerRecord {
                             pubkey,
                             noise_pubkey,
-                            endpoints: vec![],
+                            endpoints: eps,
                             capabilities: Capabilities::new(),
                             ttl_remaining: effective_ttl,
                             expires_at: std::time::Instant::now(),
@@ -642,3 +650,7 @@ impl crate::PeerRecord {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "handler_tests.rs"]
+mod handler_tests;

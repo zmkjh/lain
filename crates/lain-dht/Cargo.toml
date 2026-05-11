@@ -17,3 +17,6 @@ bincode.workspace = true
 rand.workspace = true
 ed25519-dalek.workspace = true
 sha2.workspace = true
+
+[dev-dependencies]
+lain-identity = { path = "../lain-identity" }

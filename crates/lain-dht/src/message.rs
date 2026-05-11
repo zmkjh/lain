@@ -281,6 +281,7 @@ pub fn encode_find_value_response_with_record(
     payload.push(1u8); // has_value = true
     payload.extend_from_slice(&record.ttl_remaining.to_be_bytes());
     payload.extend_from_slice(&record.pubkey);
+    payload.extend_from_slice(&record.noise_pubkey);
     let mut ep_data = Vec::new();
     for ep in &record.endpoints {
         encode_endpoint(&mut ep_data, ep);
@@ -370,29 +371,7 @@ pub fn parse_record_from_payload(payload: &[u8]) -> Option<PeerRecord> {
     let mut noise_pubkey = [0u8; 32];
     noise_pubkey.copy_from_slice(&payload[36..68]);
     let ep_len = u16::from_be_bytes([payload[68], payload[69]]) as usize;
-    let mut endpoints = Vec::with_capacity(ep_len.min(64));
-    let mut offset = 70usize;
-    for _ in 0..ep_len {
-        let addr = match decode_address(payload, &mut offset) {
-            Some(a) => a,
-            None => break,
-        };
-        if offset + 7 > payload.len() { break; }
-        let kind_byte = payload[offset]; offset += 1;
-        let priority = payload[offset]; offset += 1;
-        let kind = match kind_byte {
-            0 => EndpointKind::IPv6,
-            1 => EndpointKind::STUN,
-            2 => EndpointKind::LAN,
-            3 => EndpointKind::WebSocket,
-            4 => EndpointKind::Relay,
-            _ => EndpointKind::STUN,
-        };
-        let ttl_bytes = [payload[offset], payload[offset+1], payload[offset+2], payload[offset+3]];
-        let ttl = u32::from_be_bytes(ttl_bytes);
-        offset += 4;
-        endpoints.push(Endpoint { addr, kind, priority, ttl_seconds: ttl });
-    }
+    let endpoints = parse_endpoints(&payload[70..], ep_len);
 
     Some(PeerRecord {
         pubkey,
@@ -402,6 +381,34 @@ pub fn parse_record_from_payload(payload: &[u8]) -> Option<PeerRecord> {
         ttl_remaining,
         expires_at: std::time::Instant::now() + std::time::Duration::from_secs(ttl_remaining as u64),
     })
+}
+
+/// Parse endpoints from raw bytes with given byte-length budget.
+pub fn parse_endpoints(data: &[u8], ep_data_len: usize) -> Vec<Endpoint> {
+    let mut endpoints = Vec::with_capacity(4);
+    let ep_data_end = ep_data_len.min(data.len());
+    let mut offset = 0usize;
+    while offset + 7 <= ep_data_end {
+        let addr = match decode_address(data, &mut offset) {
+            Some(a) => a,
+            None => break,
+        };
+        if offset + 5 > ep_data_end { break; }
+        let kind_byte = data[offset]; offset += 1;
+        let kind = match kind_byte {
+            0 => EndpointKind::IPv6,
+            1 => EndpointKind::STUN,
+            2 => EndpointKind::LAN,
+            3 => EndpointKind::WebSocket,
+            4 => EndpointKind::Relay,
+            _ => EndpointKind::STUN,
+        };
+        let ttl_bytes = [data[offset], data[offset+1], data[offset+2], data[offset+3]];
+        let ttl = u32::from_be_bytes(ttl_bytes);
+        offset += 4;
+        endpoints.push(Endpoint { addr, kind, priority: 0, ttl_seconds: ttl });
+    }
+    endpoints
 }
 
 fn decode_address(data: &[u8], offset: &mut usize) -> Option<SocketAddr> {
@@ -440,5 +447,156 @@ fn decode_address(data: &[u8], offset: &mut usize) -> Option<SocketAddr> {
             Some(SocketAddr::new(std::net::IpAddr::V6(ip), port))
         }
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use lain_core::capabilities::Capabilities;
+    use lain_core::endpoint::{Endpoint, EndpointKind};
+    use lain_core::peer::PeerId;
+    use lain_core::dht::DhtMsgType;
+
+    #[test]
+    fn test_encode_decode_message_roundtrip_ping() {
+        let sender = PeerId([1u8; 32]);
+        let msg_id = [2u8; 16];
+        let encoded = encode_message(sender, msg_id, DhtMsgType::Ping, false, &[], None);
+        let decoded = decode_message(&encoded).expect("should decode");
+        assert_eq!(decoded.msg_type, DhtMsgType::Ping);
+        assert!(!decoded.is_response);
+        assert_eq!(decoded.sender_id, sender);
+        assert_eq!(decoded.message_id, msg_id);
+        assert!(decoded.payload.is_empty());
+    }
+
+    #[test]
+    fn test_encode_decode_message_roundtrip_find_node() {
+        let sender = PeerId([3u8; 32]);
+        let msg_id = [4u8; 16];
+        let payload = vec![5u8; 32];
+        let encoded = encode_message(sender, msg_id, DhtMsgType::FindNode, false, &payload, None);
+        let decoded = decode_message(&encoded).expect("should decode");
+        assert_eq!(decoded.msg_type, DhtMsgType::FindNode);
+        assert_eq!(decoded.payload, payload);
+    }
+
+    #[test]
+    fn test_encode_decode_message_with_signature() {
+        let sender = PeerId([6u8; 32]);
+        let msg_id = [7u8; 16];
+        let seed = [8u8; 32];
+        let payload = b"hello".to_vec();
+        let encoded = encode_message(sender, msg_id, DhtMsgType::FindValue, false, &payload, Some(&seed));
+        let decoded = decode_message(&encoded).expect("should decode");
+        assert_eq!(decoded.msg_type, DhtMsgType::FindValue);
+        assert!(decoded.signature.is_some());
+        assert!(!decoded.signature.unwrap().iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn test_encode_decode_message_response_flag() {
+        let sender = PeerId([9u8; 32]);
+        let msg_id = [10u8; 16];
+        let encoded = encode_message(sender, msg_id, DhtMsgType::Store, true, &[0u8], None);
+        let decoded = decode_message(&encoded).expect("should decode");
+        assert!(decoded.is_response);
+    }
+
+    #[test]
+    fn test_decode_message_too_short() {
+        assert!(decode_message(&[0u8; 10]).is_none());
+        assert!(decode_message(&[0u8; 52]).is_none());
+    }
+
+    #[test]
+    fn test_decode_message_wrong_version() {
+        let mut buf = vec![0u8; 53];
+        buf[0] = 0xFF; // wrong version
+        assert!(decode_message(&buf).is_none());
+    }
+
+    #[test]
+    fn test_encode_decode_store_payload_roundtrip() {
+        let sender = PeerId([11u8; 32]);
+        let key = [12u8; 32];
+        let ttl = 600;
+        let pubkey = [13u8; 32];
+        let noise_pubkey = [14u8; 32];
+        let endpoints = vec![
+            Endpoint::new("192.168.1.1:8080".parse().unwrap(), EndpointKind::LAN),
+            Endpoint::new("10.0.0.1:443".parse().unwrap(), EndpointKind::STUN),
+        ];
+
+        let raw = encode_store_request(sender, &key, ttl, &pubkey, &noise_pubkey, &endpoints);
+        let msg = decode_message(&raw).expect("should decode STORE");
+
+        assert_eq!(msg.msg_type, DhtMsgType::Store);
+        assert!(!msg.is_response);
+        assert_eq!(&msg.payload[..32], &key);
+        assert_eq!(u32::from_be_bytes([msg.payload[32], msg.payload[33], msg.payload[34], msg.payload[35]]), ttl);
+        assert_eq!(&msg.payload[36..68], &pubkey);
+        assert_eq!(&msg.payload[68..100], &noise_pubkey);
+    }
+
+    #[test]
+    fn test_parse_nodes_from_payload() {
+        let mut payload = vec![0u8; 1 + 32 + 7]; // count + 1 node
+        payload[0] = 1; // 1 node
+        payload[1..33].copy_from_slice(&[15u8; 32]); // node_id
+        payload[33] = 0; // IPv4
+        payload[34..38].copy_from_slice(&[192, 168, 1, 1]); // IP
+        payload[38..40].copy_from_slice(&8080u16.to_be_bytes()); // port
+
+        let nodes = parse_nodes_from_payload(&payload).expect("should parse");
+        assert_eq!(nodes.len(), 1);
+        assert_eq!(nodes[0].0, PeerId([15u8; 32]));
+        assert_eq!(nodes[0].1.to_string(), "192.168.1.1:8080");
+    }
+
+    #[test]
+    fn test_parse_nodes_from_empty_payload() {
+        let nodes = parse_nodes_from_payload(&[]).expect("should handle empty");
+        assert!(nodes.is_empty());
+    }
+
+    #[test]
+    fn test_peer_record_encode_decode_roundtrip() {
+        let pubkey = [16u8; 32];
+        let noise_pubkey = [17u8; 32];
+        let ttl: u32 = 1200;
+        let endpoints = vec![
+            Endpoint::new("10.0.0.1:9000".parse().unwrap(), EndpointKind::STUN),
+        ];
+
+        let record = PeerRecord {
+            pubkey,
+            noise_pubkey,
+            endpoints,
+            capabilities: Capabilities::new(),
+            ttl_remaining: ttl,
+            expires_at: std::time::Instant::now(),
+        };
+
+        let payload = encode_find_value_response_with_record(
+            PeerId([0u8; 32]), [0u8; 16], &record,
+        );
+
+        let msg = decode_message(&payload).expect("should decode");
+        assert!(msg.is_response);
+        assert_eq!(msg.msg_type, DhtMsgType::FindValue);
+        assert_eq!(msg.payload[0], 1); // has_value
+        let parsed = parse_record_from_payload(&msg.payload[1..]).expect("should parse record");
+        assert_eq!(parsed.pubkey, pubkey);
+        assert_eq!(parsed.noise_pubkey, noise_pubkey);
+        assert_eq!(parsed.ttl_remaining, ttl);
+        assert_eq!(parsed.endpoints.len(), 1);
+        assert_eq!(parsed.endpoints[0].addr.to_string(), "10.0.0.1:9000");
+    }
+
+    #[test]
+    fn test_parse_record_from_payload_rejects_too_short() {
+        assert!(parse_record_from_payload(&[0u8; 50]).is_none()); // < 70 bytes
     }
 }
