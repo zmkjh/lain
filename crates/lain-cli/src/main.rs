@@ -85,6 +85,7 @@ enum Command {
     Connect { invite: String },
     Tso { invite: String },
     Find { peer_id: String },
+    Disconnect { peer_id: String },
     Monitor,
     Shutdown,
     Status,
@@ -148,6 +149,12 @@ fn main() {
         Command::Connect { invite } => connect_feedback(&socket_path, &invite),
         Command::Tso { invite } => tso_connect(&socket_path, &invite),
         Command::Find { peer_id } => find_and_connect(&socket_path, &peer_id),
+        Command::Disconnect { peer_id } => {
+            match ipc_req(&socket_path, &format!(r#"{{"cmd":"Disconnect","peer_id":"{peer_id}"}}"#)) {
+                Some(_) => println!("disconnected from {peer_id}"),
+                None => eprintln!("daemon not running"),
+            }
+        }
         Command::Monitor => monitor_loop(&socket_path),
         Command::Shutdown => {
             match ipc_req(&socket_path, r#"{"cmd":"Shutdown"}"#) {
