@@ -863,6 +863,7 @@ dependencies = [
  "lain-discovery",
  "lain-identity",
  "lain-nat",
+ "lain-noise",
  "lain-transport",
  "libc",
  "quinn",
