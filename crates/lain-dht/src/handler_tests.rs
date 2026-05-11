@@ -164,3 +164,123 @@ async fn test_rate_limit_drops_excess() {
     let size = b.routing_table_size().await;
     assert!(size <= 50, "routing table should not overflow: got {size}");
 }
+
+#[tokio::test]
+async fn test_find_value_not_found_returns_nodes() {
+    let a = Arc::new(DhtHandle::new(make_id(18), [18u8; 32], make_config("127.0.0.1:0")).unwrap());
+    let b = Arc::new(DhtHandle::new(make_id(19), [19u8; 32], make_config("127.0.0.1:0")).unwrap());
+    spawn_recv_loop(a.clone());
+    spawn_recv_loop(b.clone());
+
+    let a_addr = a.socket().local_addr().unwrap();
+
+    // Bootstrap
+    b.socket().send_to(&msg_codec::encode_ping_request(b.peer_id, [10u8; 16]), a_addr).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // FIND_VALUE for a key that doesn't exist — should return k-closest nodes, not crash
+    let nonexistent = PeerId([0xFFu8; 32]);
+    b.socket().send_to(&msg_codec::encode_find_value_request(b.peer_id, [11u8; 16], &nonexistent.0), a_addr).await.unwrap();
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    // A should still be alive and functional
+    let a_size = a.routing_table_size().await;
+    assert!(a_size >= 1, "A should still have B in routing table after not-found query: got {a_size}");
+}
+
+#[tokio::test]
+async fn test_store_ttl_clamping() {
+    let a = Arc::new(DhtHandle::new(make_id(20), [20u8; 32], make_config("127.0.0.1:0")).unwrap());
+    let b = Arc::new(DhtHandle::new(make_id(21), [21u8; 32], make_config("127.0.0.1:0")).unwrap());
+    spawn_recv_loop(a.clone());
+    spawn_recv_loop(b.clone());
+
+    let a_addr = a.socket().local_addr().unwrap();
+
+    // Bootstrap
+    b.socket().send_to(&msg_codec::encode_ping_request(b.peer_id, [12u8; 16]), a_addr).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let dummy_id = Identity::generate().ok().unwrap();
+    let dummy_pk = *dummy_id.public_key();
+    let dummy_peer = dummy_id.peer_id();
+    let (_ns, np) = dummy_id.noise_keypair();
+    let ep = Endpoint::new("10.0.0.10:8000".parse().unwrap(), EndpointKind::STUN);
+
+    // Store with TTL=0 (should be clamped to default 300)
+    let store_zero = msg_codec::encode_store_request(b.peer_id, &dummy_peer.0, 0, &dummy_pk, &np, &[ep.clone()]);
+    b.socket().send_to(&store_zero, a_addr).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let stored = a.peer_records.read().await;
+    let rec = stored.get(&dummy_peer).unwrap();
+    // TTL=0 should have been clamped to 300, not stored as 0
+    assert!(rec.ttl_remaining >= 300, "TTL=0 should be clamped to >=300, got {}", rec.ttl_remaining);
+}
+
+#[tokio::test]
+async fn test_store_rejects_mismatched_pubkey() {
+    let a = Arc::new(DhtHandle::new(make_id(22), [22u8; 32], make_config("127.0.0.1:0")).unwrap());
+    let b = Arc::new(DhtHandle::new(make_id(23), [23u8; 32], make_config("127.0.0.1:0")).unwrap());
+    spawn_recv_loop(a.clone());
+    spawn_recv_loop(b.clone());
+
+    let a_addr = a.socket().local_addr().unwrap();
+
+    // Bootstrap
+    b.socket().send_to(&msg_codec::encode_ping_request(b.peer_id, [13u8; 16]), a_addr).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Use a key that doesn't match the pubkey (SHA256(pubkey) != key)
+    let fake_key = PeerId([24u8; 32]);
+    let fake_pubkey = [25u8; 32];
+    let fake_noise = [26u8; 32];
+    let ep = Endpoint::new("10.0.0.99:1".parse().unwrap(), EndpointKind::STUN);
+
+    let bad_store = msg_codec::encode_store_request(b.peer_id, &fake_key.0, 600, &fake_pubkey, &fake_noise, &[ep]);
+    b.socket().send_to(&bad_store, a_addr).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // A should NOT have stored the bad record
+    let stored = a.peer_records.read().await;
+    assert!(!stored.contains_key(&fake_key), "A should reject STORE with mismatched pubkey");
+}
+
+#[tokio::test]
+async fn test_save_and_load_routes() {
+    let a = Arc::new(DhtHandle::new(make_id(27), [27u8; 32], make_config("127.0.0.1:0")).unwrap());
+    let b = Arc::new(DhtHandle::new(make_id(28), [28u8; 32], make_config("127.0.0.1:0")).unwrap());
+    spawn_recv_loop(a.clone());
+    spawn_recv_loop(b.clone());
+
+    let a_addr = a.socket().local_addr().unwrap();
+
+    // Populate A's routing table with B
+    b.socket().send_to(&msg_codec::encode_ping_request(b.peer_id, [14u8; 16]), a_addr).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let initial_size = a.routing_table_size().await;
+    assert!(initial_size >= 1, "A should have B in routing table");
+
+    // Save routes
+    let tmp = std::env::temp_dir().join("lain_test_routes.json");
+    a.save_routes(&tmp).await.unwrap();
+    assert!(tmp.exists(), "routes file should exist after save");
+
+    // Create a fresh DHT and load
+    let c = Arc::new(DhtHandle::new(make_id(29), [29u8; 32], make_config("127.0.0.1:0")).unwrap());
+    let loaded = c.load_routes(&tmp).await.unwrap();
+    assert!(loaded >= 1, "should load at least 1 route from file, got {loaded}");
+
+    // Cleanup
+    let _ = std::fs::remove_file(&tmp);
+}
+
+#[tokio::test]
+async fn test_load_routes_nonexistent_file() {
+    let dht = DhtHandle::new(make_id(30), [30u8; 32], make_config("127.0.0.1:0")).unwrap();
+    let tmp = std::env::temp_dir().join("lain_test_nonexistent_routes.json");
+    // Should return Ok(0) for nonexistent file
+    let loaded = dht.load_routes(&tmp).await.unwrap();
+    assert_eq!(loaded, 0, "nonexistent file should load 0 routes");
+}

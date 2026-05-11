@@ -381,4 +381,29 @@ mod tests {
         let decoded = decode_base62(&encoded).unwrap();
         assert_eq!(&decoded[0..data.len()], data);
     }
+
+    #[test]
+    fn test_invite_multiple_endpoints() {
+        let peer_id = PeerId([1u8; 32]);
+        let pk = [2u8; 32];
+        let sign_fn = |_data: &[u8]| -> [u8; 64] { [3u8; 64] };
+        let endpoints = vec![
+            Endpoint { addr: "10.0.0.1:8080".parse().unwrap(), kind: EndpointKind::LAN, priority: 100, ttl_seconds: 300 },
+            Endpoint { addr: "1.2.3.4:9999".parse().unwrap(), kind: EndpointKind::STUN, priority: 80, ttl_seconds: 600 },
+        ];
+        let invite = InviteCode::new(peer_id, pk, pk, Capabilities::new(), endpoints, &sign_fn);
+        let b62 = invite.to_base62();
+        let decoded = InviteCode::from_base62(&b62).unwrap();
+        assert_eq!(decoded.endpoints.len(), 2);
+        assert!(decoded.endpoints.iter().any(|e| e.addr.port() == 8080));
+        assert!(decoded.endpoints.iter().any(|e| e.addr.port() == 9999));
+    }
+
+    #[test]
+    fn test_invite_from_base62_rejects_invalid() {
+        assert!(InviteCode::from_base62("!!!").is_err());
+        assert!(InviteCode::from_base62("").is_err());
+        // Too short for a valid invite
+        assert!(InviteCode::from_base62("abc").is_err());
+    }
 }

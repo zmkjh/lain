@@ -392,4 +392,85 @@ mod tests {
         let j = serde_json::to_string(&r).unwrap();
         assert!(j.contains("ok"));
     }
+
+    #[test]
+    fn test_deserialize_malformed_json() {
+        assert!(serde_json::from_str::<IpcRequest>("not json").is_err());
+        assert!(serde_json::from_str::<IpcRequest>("{").is_err());
+    }
+
+    #[test]
+    fn test_deserialize_unknown_command() {
+        let r = serde_json::from_str::<IpcRequest>(r#"{"cmd":"UnknownCmd"}"#);
+        assert!(r.is_err(), "unknown command should fail to deserialize");
+    }
+
+    #[test]
+    fn test_deserialize_missing_required_field() {
+        // Connect without invite should fail
+        let r = serde_json::from_str::<IpcRequest>(r#"{"cmd":"Connect"}"#);
+        assert!(r.is_err(), "Connect without invite should fail");
+    }
+
+    #[test]
+    fn test_deserialize_shutdown() {
+        let r: IpcRequest = serde_json::from_str(r#"{"cmd":"Shutdown"}"#).unwrap();
+        assert!(matches!(r, IpcRequest::Shutdown));
+    }
+
+    #[test]
+    fn test_deserialize_send() {
+        let r: IpcRequest = serde_json::from_str(r#"{"cmd":"Send","peer_id":"abc","data":"ZGF0YQ=="}"#).unwrap();
+        match r {
+            IpcRequest::Send { peer_id, data } => {
+                assert_eq!(peer_id, "abc");
+                assert!(!data.is_empty());
+            }
+            _ => panic!("expected Send"),
+        }
+    }
+
+    #[test]
+    fn test_deserialize_subscribe() {
+        let r: IpcRequest = serde_json::from_str(r#"{"cmd":"Subscribe"}"#).unwrap();
+        assert!(matches!(r, IpcRequest::Subscribe));
+    }
+
+    #[test]
+    fn test_deserialize_get_status() {
+        let r: IpcRequest = serde_json::from_str(r#"{"cmd":"ListPeers"}"#).unwrap();
+        assert!(matches!(r, IpcRequest::ListPeers));
+    }
+
+    #[test]
+    fn test_deserialize_get_whoami() {
+        let r: IpcRequest = serde_json::from_str(r#"{"cmd":"Whoami"}"#).unwrap();
+        assert!(matches!(r, IpcRequest::Whoami));
+    }
+
+    #[test]
+    fn test_deserialize_get_invite() {
+        let r: IpcRequest = serde_json::from_str(r#"{"cmd":"GetInvite"}"#).unwrap();
+        assert!(matches!(r, IpcRequest::GetInvite));
+    }
+
+    #[test]
+    fn test_response_error() {
+        let r = IpcResponse::Error { code: "ERR".into(), message: "fail".into() };
+        let j = serde_json::to_string(&r).unwrap();
+        assert!(j.contains("ERR"));
+        assert!(j.contains("fail"));
+    }
+
+    #[test]
+    fn test_response_event() {
+        let r = IpcResponse::Event {
+            event: "connected".into(),
+            peer_id: Some("p1".into()),
+            data: Some(serde_json::json!({"key": "val"})),
+        };
+        let j = serde_json::to_string(&r).unwrap();
+        assert!(j.contains("connected"));
+        assert!(j.contains("p1"));
+    }
 }
