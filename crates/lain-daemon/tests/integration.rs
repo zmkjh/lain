@@ -83,7 +83,7 @@ async fn test_node_spawn() {
 async fn test_bootstrap_and_find() {
     let (_seed_id, seed_dht, _seed_t) = spawn_node(None).await;
     let seed_addr = seed_dht.socket().local_addr().unwrap();
-    let (node_id, node_dht, _node_t) = spawn_node(Some(seed_addr)).await;
+    let (node_id, _node_dht, _node_t) = spawn_node(Some(seed_addr)).await;
 
     // Retry — DHT needs time to converge (find_peer has 5s internal timeout)
     for i in 0..8 {
@@ -125,7 +125,7 @@ async fn test_store_and_find() {
 #[tokio::test]
 async fn test_quic_connect() {
     let (_seed_id, _seed_dht, seed_t) = spawn_node(None).await;
-    let seed_port = seed_t.local_addr().unwrap().port();
+    let _seed_port = seed_t.local_addr().unwrap().port();
 
     // Recreate B with fixed address for connecting
     let identity_b = Identity::generate().ok().unwrap();
@@ -148,7 +148,7 @@ async fn test_quic_connect() {
 async fn test_rate_limit_survives_flood() {
     let (_seed_id, seed_dht, _seed_t) = spawn_node(None).await;
     let seed_addr = seed_dht.socket().local_addr().unwrap();
-    let (flood_id, _flood_dht, _flood_t) = spawn_node(Some(seed_addr)).await;
+    let (_flood_id, _flood_dht, _flood_t) = spawn_node(Some(seed_addr)).await;
 
     tokio::time::sleep(Duration::from_secs(2)).await;
 
@@ -163,7 +163,7 @@ async fn test_rate_limit_survives_flood() {
 
     // DHT should still be functional
     let size = seed_dht.routing_table_size().await;
-    assert!(size >= 0); // survived
+    assert!(size <= 50); // survived: routing table at most 50 entries
 }
 
 // ── Test 5: Pure QUIC connection (no Noise IK) ──
@@ -198,7 +198,7 @@ async fn test_pure_quic_connect() {
         if let Some(incoming) = server.accept().await {
             let conn = incoming.await.unwrap();
             let (mut send, mut recv) = conn.accept_bi().await.unwrap();
-            let mut buf = vec![0u8; 1024];
+            let _buf = vec![0u8; 1024];
             if let Ok(n) = recv.read_to_end(65536).await {
                 send.write_all(&n).await.unwrap();
                 send.finish().unwrap();
@@ -216,7 +216,7 @@ async fn test_pure_quic_connect() {
         quinn::crypto::rustls::QuicClientConfig::try_from(client_crypto).unwrap(),
     ));
 
-    let mut client = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+    let client = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
     let conn = client.connect_with(client_cfg, server_addr, "localhost").unwrap().await.unwrap();
 
     let (mut send, mut recv) = conn.open_bi().await.unwrap();
@@ -237,7 +237,7 @@ async fn test_lain_end_to_end() {
     let _ = tracing_subscriber::fmt::try_init();
     let id_a = Identity::generate().ok().unwrap();
     let id_b = Identity::generate().ok().unwrap();
-    let (ns_a, np_a) = id_a.noise_keypair();
+    let (ns_a, _np_a) = id_a.noise_keypair();
     let (ns_b, np_b) = id_b.noise_keypair();
 
     let t_a = Arc::new(Transport::new(
@@ -331,7 +331,7 @@ async fn test_malformed_messages_dont_crash() {
 
     // Verify DHT still works
     let size = dht.routing_table_size().await;
-    assert!(size >= 0); // no crash
+    assert!(size < 1000); // no crash; routing table bounded
 }
 
 // ── Test 7: PeerID zero and edge cases ──
@@ -361,7 +361,7 @@ async fn test_relay_end_to_end() {
     let id_b = Identity::generate().ok().unwrap();
     let id_c = Identity::generate().ok().unwrap();
 
-    let (ns_a, np_a) = id_a.noise_keypair();
+    let (ns_a, _np_a) = id_a.noise_keypair();
     let (ns_b, np_b) = id_b.noise_keypair();
     let (ns_c, np_c) = id_c.noise_keypair();
 
@@ -392,7 +392,7 @@ async fn test_relay_end_to_end() {
                     tokio::spawn(async move {
                         loop {
                             match c_conn.accept_bi().await {
-                                Ok((mut send, mut recv)) => {
+                                Ok((send, mut recv)) => {
                                     let mut buf = vec![0u8; 4096];
                                     let mut total = Vec::new();
                                     loop {
@@ -473,7 +473,7 @@ async fn test_concurrent_connections() {
 
     let id_a = Identity::generate().ok().unwrap();
     let id_b = Identity::generate().ok().unwrap();
-    let (ns_a, np_a) = id_a.noise_keypair();
+    let (ns_a, _np_a) = id_a.noise_keypair();
     let (ns_b, np_b) = id_b.noise_keypair();
 
     let t_b = Arc::new(Transport::new(
@@ -484,7 +484,7 @@ async fn test_concurrent_connections() {
 
     // B accepts up to 10 connections, echoes on each
     let t_b2 = t_b.clone();
-    let b_accept = tokio::spawn(async move {
+    let _b_accept = tokio::spawn(async move {
         let mut handles = Vec::new();
         for _ in 0..10 {
             match t_b2.accept_connection().await {

@@ -350,7 +350,7 @@ mod tests {
     #[test]
     fn test_full_handshake() {
         // Generate two independent keypairs
-        let (init_secret, init_public) = generate_keypair();
+        let (init_secret, _init_public) = generate_keypair();
         let (resp_secret, resp_public) = generate_keypair();
 
         // Initiator knows responder's public key
@@ -392,7 +392,7 @@ mod tests {
 
     #[test]
     fn test_noise_multi_message_exchange() {
-        let (init_secret, init_public) = generate_keypair();
+        let (init_secret, _init_public) = generate_keypair();
         let (resp_secret, resp_public) = generate_keypair();
 
         let init = NoiseHandshake::new_initiator(&init_secret, &resp_public).unwrap();
@@ -416,7 +416,7 @@ mod tests {
 
     #[test]
     fn test_noise_large_message() {
-        let (init_secret, init_public) = generate_keypair();
+        let (init_secret, _init_public) = generate_keypair();
         let (resp_secret, resp_public) = generate_keypair();
 
         let init = NoiseHandshake::new_initiator(&init_secret, &resp_public).unwrap();
@@ -434,7 +434,7 @@ mod tests {
 
     #[test]
     fn test_noise_empty_message() {
-        let (init_secret, init_public) = generate_keypair();
+        let (init_secret, _init_public) = generate_keypair();
         let (resp_secret, resp_public) = generate_keypair();
 
         let init = NoiseHandshake::new_initiator(&init_secret, &resp_public).unwrap();
