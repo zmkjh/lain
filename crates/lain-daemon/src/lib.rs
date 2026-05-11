@@ -260,7 +260,7 @@ impl Daemon {
                                                 tracing::info!("relay: {requester} -> {target}");
                                                 if let Ok(Some(record)) = d.find_peer(&target).await {
                                                     let result = t.handle_relay_request(
-                                                        c.clone(), target, record.pubkey, &record.endpoints,
+                                                        c.clone(), target, record.noise_pubkey, &record.endpoints,
                                                     ).await;
                                                     // Relay pipe ended — attempt migration
                                                     if result.is_err() {
@@ -482,7 +482,7 @@ impl Daemon {
                                 .and_then(|c| lain_discovery::InviteCode::from_base62(c).ok())
                                 .filter(|inv| {
                                     let expected = PeerId(sha2::Sha256::digest(&inv.ed25519_pk).into());
-                                    expected == inv.peer_id
+                                    expected == inv.peer_id && inv.noise_pk.iter().any(|&b| b != 0)
                                 });
                             if let Some(inv) = code {
                                 // Check if already connected
