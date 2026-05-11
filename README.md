@@ -74,10 +74,11 @@ $ lain shutdown
 | `lain whoami` | 查看自己的 PeerID |
 | `lain invite` | 生成邀请码 |
 | `lain connect <code>` | 连接到 peer |
-| `lain send <peer> <file>` | 发送文件 |
-| `lain monitor` | 监控事件流（连接、收数据） |
+| `lain monitor` | 监控事件流（诊断） |
 | `lain status` | 查看网络状态 |
 | `lain shutdown` | 停止 daemon |
+
+数据收发通过 IPC API 由应用程序实现（Python/JS 等），详见 DESIGN.md 附录 A.5。
 
 ## 原理
 

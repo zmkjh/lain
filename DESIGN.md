@@ -1994,11 +1994,12 @@ $ lain daemon -f         # 前台运行 (log to stdout)
 $ lain whoami            # 查看 PeerID
 $ lain invite            # 生成 invite 码
 $ lain connect <code>    # 连接到 peer (支持 lain:// 或裸 Base62)
-$ lain send <peer> <f>   # 发送文件给 peer
-$ lain monitor           # 订阅事件流
+$ lain monitor           # 订阅事件流（诊断用）
 $ lain status            # 查看网络状态
 $ lain shutdown          # 停止 daemon
 ```
+
+数据收发通过 IPC API 由应用程序实现，CLI 不做文件传输。
 
 ### A.5 IPC JSON 协议
 
