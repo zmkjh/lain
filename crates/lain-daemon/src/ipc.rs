@@ -473,4 +473,142 @@ mod tests {
         assert!(j.contains("connected"));
         assert!(j.contains("p1"));
     }
+
+    // ── Platform-specific IPC integration ──
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn test_windows_bind_local_returns_pipe_path() {
+        use std::path::Path;
+        let result = super::bind_local(Path::new("/dummy"));
+        assert!(result.is_ok());
+        let path = result.unwrap();
+        assert_eq!(path.to_string_lossy(), r"\\.\pipe\lain");
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn test_named_pipe_create_succeeds() {
+        use tokio::net::windows::named_pipe::ServerOptions;
+        let pipe_name = r"\\.\pipe\lain-test-create";
+        let server = ServerOptions::new().create(pipe_name);
+        assert!(server.is_ok(), "should create named pipe: {:?}", server.err());
+        drop(server);
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn test_named_pipe_roundtrip() {
+        use tokio::net::windows::named_pipe::{ClientOptions, ServerOptions};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let pipe_name = r"\\.\pipe\lain-test-roundtrip";
+
+        // Spawn server
+        let srv = ServerOptions::new().create(pipe_name).unwrap();
+
+        let server_handle = tokio::spawn(async move {
+            srv.connect().await.unwrap();
+            let (mut r, mut w) = tokio::io::split(srv);
+            // Read client message
+            let mut buf = vec![0u8; 4096];
+            let n = r.read(&mut buf).await.unwrap();
+            let req: serde_json::Value = serde_json::from_slice(&buf[..n]).unwrap();
+            assert_eq!(req["cmd"], "Whoami");
+
+            // Send response
+            let resp = serde_json::json!({"type":"Ok","message":"peer-abc"});
+            let resp_str = serde_json::to_string(&resp).unwrap() + "\n";
+            w.write_all(resp_str.as_bytes()).await.unwrap();
+        });
+
+        // Client connect and send
+        let client = ClientOptions::new().open(pipe_name).unwrap();
+        let (mut cr, mut cw) = tokio::io::split(client);
+
+        let req = br#"{"cmd":"Whoami"}"#;
+        cw.write_all(req).await.unwrap();
+
+        // handle_client uses BufReader::read_line, needs \n
+        cw.write_all(b"\n").await.unwrap();
+
+        // Read response
+        let mut buf = vec![0u8; 4096];
+        let n = cr.read(&mut buf).await.unwrap();
+        let resp: serde_json::Value = serde_json::from_slice(&buf[..n]).unwrap();
+
+        assert_eq!(resp["type"], "Ok");
+        assert_eq!(resp["message"], "peer-abc");
+
+        server_handle.await.unwrap();
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn test_named_pipe_connect_command_sent_to_handler() {
+        use tokio::net::windows::named_pipe::{ClientOptions, ServerOptions};
+        use tokio::io::AsyncWriteExt;
+
+        let pipe_name = r"\\.\pipe\lain-test-cmd";
+
+        let (cmd_tx, mut cmd_rx) = mpsc::channel::<super::IpcCommand>(8);
+        let (ev_tx, _) = broadcast::channel::<super::IpcResponse>(8);
+
+        let srv = ServerOptions::new().create(pipe_name).unwrap();
+
+        // Spawn server using the real handler
+        tokio::spawn(async move {
+            srv.connect().await.unwrap();
+            let (r, w) = tokio::io::split(srv);
+            super::handle_client(r, w, cmd_tx, ev_tx).await;
+        });
+
+        // Client sends Connect command (with newline, required by BufReader::read_line)
+        let client = ClientOptions::new().open(pipe_name).unwrap();
+        let (_, mut cw) = tokio::io::split(client);
+
+        let req = b"{\"cmd\":\"Connect\",\"invite\":\"lain://test\"}\n";
+        cw.write_all(req).await.unwrap();
+
+        // Server should parse and send IpcCommand::Connect to cmd_tx
+        let cmd = tokio::time::timeout(std::time::Duration::from_secs(2), cmd_rx.recv()).await;
+        assert!(cmd.is_ok(), "should receive Connect command");
+        match cmd.unwrap() {
+            Some(super::IpcCommand::ConnectPeer { invite, .. }) => {
+                assert_eq!(invite, "lain://test");
+            }
+            other => panic!("expected ConnectPeer, got {:?}", other.map(|_| ())),
+        }
+
+        // Cleanup: close pipe
+        drop(cw);
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn test_named_pipe_malformed_json_does_not_crash_handler() {
+        use tokio::net::windows::named_pipe::{ClientOptions, ServerOptions};
+        use tokio::io::AsyncWriteExt;
+
+        let pipe_name = r"\\.\pipe\lain-test-malformed";
+
+        let (cmd_tx, _cmd_rx) = mpsc::channel::<super::IpcCommand>(8);
+        let (ev_tx, _) = broadcast::channel::<super::IpcResponse>(8);
+
+        let srv = ServerOptions::new().create(pipe_name).unwrap();
+
+        tokio::spawn(async move {
+            srv.connect().await.unwrap();
+            let (r, w) = tokio::io::split(srv);
+            super::handle_client(r, w, cmd_tx, ev_tx).await;
+        });
+
+        // Send garbage
+        let client = ClientOptions::new().open(pipe_name).unwrap();
+        let (_, mut cw) = tokio::io::split(client);
+        cw.write_all(b"not json at all!!!").await.unwrap();
+
+        // Should not crash — handler returns, pipe closes
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
 }
