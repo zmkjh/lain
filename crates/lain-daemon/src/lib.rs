@@ -770,11 +770,28 @@ impl Daemon {
                                                     }
                                                 }
                                             }
-                                            // All relay attempts failed
+                                            // TSO fallback: try TCP simultaneous open
+                                            let tso_eps: Vec<SocketAddr> = eps.iter()
+                                                .filter(|ep| ep.kind == lain_core::endpoint::EndpointKind::TSO)
+                                                .map(|ep| ep.addr).collect();
+                                            if !tso_eps.is_empty() {
+                                                match t.ts_connect(&noise_pk, &tso_eps).await {
+                                                    Ok((_stream, _session, _peer)) => {
+                                                        let _ = ipc_ev.send(IpcResponse::Event {
+                                                            event: "peer_connected".into(),
+                                                            peer_id: Some(pid.to_string()),
+                                                            data: Some(serde_json::json!({"via": "tso"})),
+                                                        });
+                                                        return;
+                                                    }
+                                                    Err(e) => tracing::debug!("TSO to {pid}: {e}"),
+                                                }
+                                            }
+                                            // All paths exhausted
                                             let _ = ipc_ev.send(IpcResponse::Event {
                                                 event: "peer_error".into(),
                                                 peer_id: Some(pid.to_string()),
-                                                data: Some(serde_json::json!({"error": format!("{e} (relay unavailable)")})),
+                                                data: Some(serde_json::json!({"error": format!("{e} (all paths exhausted)")})),
                                             });
                                         }
                                     }
