@@ -358,12 +358,17 @@ impl Daemon {
             }
         };
 
-        // 7. 生成 invite
-        let _invite = lain_discovery::InviteCode::new(
+        // 7. Store invite state for on-demand regeneration
+        let invite_state = Arc::new(RwLock::new((
+            peer_id, public_key, noise_pubkey, capabilities, endpoints.clone(),
+        )));
+
+        // Log initial invite
+        let init_invite = lain_discovery::InviteCode::new(
             peer_id, public_key, noise_pubkey, capabilities, endpoints.clone(),
             &|data| self.identity.sign(data),
         );
-        tracing::info!("Invite: lain://{}", _invite.to_base62());
+        tracing::info!("Invite: lain://{}", init_invite.to_base62());
 
         // 7. 启动 IPC
         let uds_path = self.config.ipc.uds_path.as_deref()
@@ -639,9 +644,12 @@ impl Daemon {
                             let _ = reply.send(peer_id.to_string());
                         }
                         IpcCommand::GetInviteCode { reply } => {
-                            // _invite was printed to log at startup — save it
-                            let invite_str = _invite.to_base62();
-                            let _ = reply.send(format!("lain://{}", invite_str));
+                            let (pid, pk, npk, caps, eps) = invite_state.read().await.clone();
+                            let inv = lain_discovery::InviteCode::new(
+                                pid, pk, npk, caps, eps,
+                                &|data| self.identity.sign(data),
+                            );
+                            let _ = reply.send(format!("lain://{}", inv.to_base62()));
                         }
                     }
                 }
@@ -650,6 +658,10 @@ impl Daemon {
                     // Periodic save of peers.json (crash resilience)
                     let peers = known_peers.read().await;
                     save_peers(&peers, &self.identity);
+
+                    // Update invite with latest endpoints (NAT may have changed)
+                    let mut inv = invite_state.write().await;
+                    inv.4 = endpoints.clone();
 
                     // Dormant check: skip heartbeat if no active connections
                     let peer_count = connected.read().await.len();
