@@ -10,7 +10,8 @@
 git clone https://github.com/lain-p2p/lain
 cd lain
 cargo build --release
-sudo cp target/release/lain /usr/local/bin/
+sudo cp target/release/lain-cli /usr/local/bin/lain
+sudo cp target/release/lain-daemon /usr/local/bin/lain-daemon
 ```
 
 ## 快速开始
@@ -47,11 +48,8 @@ PeerID:    a1b2c3d4
 NAT:       Cone
 IPv6:      yes
 DHT nodes: 47
-Connected: 1
-
-$ lain monitor
-[connected] ffe4d9a8
-[data] from ffe4d9a8 (1024 bytes)
+Known:     12
+Connected: 3
 ```
 
 **停 daemon**
@@ -65,7 +63,7 @@ $ lain shutdown
 | 命令 | 功能 |
 |------|------|
 | `lain` 或 `lain daemon` | 启动守护进程 |
-| `lain daemon -f` | 前台运行（日志输出到终端） |
+| `lain -f daemon` | 前台运行（日志输出到终端） |
 | `lain whoami` | 查看自己的 PeerID |
 | `lain invite` | 生成邀请码 |
 | `lain connect <code>` | 连接到 peer |
@@ -93,6 +91,7 @@ A ←── 数据流 ──→ B 端到端加密通信
 
 数据收发不在 CLI 里——Lain 是基础设施，应用通过 IPC API 使用。
 
+**Unix 示例：**
 ```python
 import socket, json, base64
 
@@ -110,10 +109,20 @@ while True:
     ev = json.loads(s.recv(4096))
     if ev.get("event") == "data":
         raw = base64.b64decode(ev["data"]["bytes"])
+```
 
-# 发数据
-data = base64.b64encode(b"hello").decode()
-s.send(json.dumps({"cmd":"Send","peer_id":"...","data":data}).encode()+b"\n")
+**Windows 示例（Named Pipe）：**
+```python
+import json, base64, win32file
+
+handle = win32file.CreateFile(
+    r"\\.\pipe\lain",
+    win32file.GENERIC_READ | win32file.GENERIC_WRITE,
+    0, None, win32file.OPEN_EXISTING, 0, None)
+
+win32file.WriteFile(handle, b'{"cmd":"Whoami"}\n')
+_, data = win32file.ReadFile(handle, 4096)
+print(json.loads(data))
 ```
 
 IPC 协议详情见 DESIGN.md 附录 A.5。
@@ -135,13 +144,13 @@ IPC 协议详情见 DESIGN.md 附录 A.5。
 | `~/.lain/socket` | IPC 通信 socket（Unix） |
 | `\\.\pipe\lain` | IPC 通信 pipe（Windows） |
 | `~/.lain/peers.json` | 已知 peer 列表 |
-| `~/.lain/routes.bin` | DHT 路由表 |
+| `~/.lain/routes.json` | DHT 路由表 |
 
 ## 从源码构建
 
 ```bash
 cargo build --release    # 构建 daemon + CLI
-cargo test               # 运行全部测试（50+ 单元 + 9 集成）
+cargo test               # 运行全部测试（135+ 单元 + 集成）
 ```
 
 ## 许可

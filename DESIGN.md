@@ -231,7 +231,7 @@ fn spawn_protected(name: &str, fut: impl Future<Output = Result<()>> + Send + 's
 |------|------|
 | 单个 peer 连接断开 | 记录日志，触发重连，其余 peer 不受影响 |
 | DHT RPC 超时 | 重试 2 次，失败则标记该 peer STALE，继续使用其他路由 |
-| routes.bin 损坏 | WARN 日志，丢弃文件，从零 bootstrap |
+| routes.json 损坏 | WARN 日志，丢弃文件，从零 bootstrap |
 | OOM（内存不足） | 关闭空闲连接，拒绝新连接，发送 backpressure 信号给应用 |
 | QUIC socket 错误 | 关闭受影响的 connection，重建——不重启 daemon |
 | tokio runtime 崩溃 | 致命——daemon 退出，由 systemd/launchd 重启 |
@@ -261,7 +261,7 @@ async fn main() -> Result<()> {
     let identity = Identity::load_or_generate().await?;
     let nat_type = NatProber::probe(&config.nat).await?;
 
-    // 初始化 DHT（从 routes.bin 恢复 或 空启动）
+    // 初始化 DHT（从 routes.json 恢复 或 空启动）
     let dht = Dht::new(identity.peer_id(), config.dht);
     dht.bootstrap(config.bootstrap_seeds()).await?;
 
@@ -299,7 +299,7 @@ async fn main() -> Result<()> {
 
             // 信号
             _ = tokio::signal::ctrl_c() => {
-                dht.shutdown().await?;  // 序列化 routes.bin
+                dht.shutdown().await?;  // 序列化 routes.json
                 break;
             }
         }
@@ -365,7 +365,7 @@ Daemon 采用 Tokio async runtime。单个 UDP socket 承载所有 DHT/QUIC/STUN
 1. SIGTERM / IPC shutdown 命令
 2. 停止接受新连接
 3. 向所有直连 peer 发送 CLOSE 帧
-4. 序列化路由表 → `routes.bin`
+4. 序列化路由表 → `routes.json`
 5. 序列化 peers 列表 → `peers.json`
 6. 关闭所有 QUIC connection（drain，超时 5s）
 7. 退出进程
@@ -726,11 +726,11 @@ TTL 使用相对值而非绝对时间戳。发布方 STORE 时写入 `ttl_second
 
 ### 8.5 清理
 
-每 300s 遍历路由表：STALE/EXPIRED 标记 → EXPIRED 移除 → 全部 EXPIRED 则 DHT 标记为 dormant（保留 routes.bin 和 peers.json，释放连接资源，停止心跳）。收到新 peer 的 invite 或应用层触发时，从持久化路由表恢复并重新 bootstrap。
+每 300s 遍历路由表：STALE/EXPIRED 标记 → EXPIRED 移除 → 全部 EXPIRED 则 DHT 标记为 dormant（保留 routes.json 和 peers.json，释放连接资源，停止心跳）。收到新 peer 的 invite 或应用层触发时，从持久化路由表恢复并重新 bootstrap。
 
 **Dormant 状态**：停止心跳 STORE 和 bucket 刷新，保留路由表序列化文件。收到新 peer 的 invite 或应用层触发连接时，从持久化路由表恢复并重新 bootstrap。
 
-**全部节点离线**：DHT 无在线节点时，网络进入静默状态。重启的节点从 routes.bin + peers.json 尝试 bootstrap——如果持久化列表中的节点均未上线，bootstrap 失败，节点进入 DEGRADED。此时需要至少一个持有旧路由表的节点重新上线，或通过 invite 引入新节点。这是 P2P 网络的固有特性，不是 bug。
+**全部节点离线**：DHT 无在线节点时，网络进入静默状态。重启的节点从 routes.json + peers.json 尝试 bootstrap——如果持久化列表中的节点均未上线，bootstrap 失败，节点进入 DEGRADED。此时需要至少一个持有旧路由表的节点重新上线，或通过 invite 引入新节点。这是 P2P 网络的固有特性，不是 bug。
 
 ### 8.6 接口切换
 
@@ -789,7 +789,7 @@ insert_node(new):
 新节点加入 DHT 的入口。Bootstrap 来源按优先级：
 
 ```
-1. routes.bin + peers.json（重启恢复，最快）
+1. routes.json + peers.json（重启恢复，最快）
 2. invite code 中的 endpoint（新节点首次加入的唯一方式）
 3. 硬编码的 DHT bootstrap 节点（公共 lain 网络的可选固定入口，非必需）
 
@@ -1138,7 +1138,7 @@ RECONNECTING            (重连, 跳过邀请, 直接从 DHT 获取 endpoint)
 3. 重新执行穿透（跳过已确定的不可行路径，如对 S_APDF 跳过 STUN 打洞）
 4. 成功 → 对端发送 STREAM_RESUME 帧（stream 0），格式为 `[(stream_id: varint, last_seq: u64), ...]`。接收方比对已收到的数据，缺失部分由发起方重传。应用层 fd 保持不变，恢复对应用透明。
 5. 失败 → 指数退避重试，最大间隔 5 分钟。peer EXPIRED 则放弃，向上层应用发送 STREAM_LOST 通知。
-6. 重启后重连：daemon 从 peers.json 恢复已知 peer 列表，从 routes.bin 恢复 DHT 路由表，优先连接这些 peer 以快速重建 DHT 邻居关系。
+6. 重启后重连：daemon 从 peers.json 恢复已知 peer 列表，从 routes.json 恢复 DHT 路由表，优先连接这些 peer 以快速重建 DHT 邻居关系。
 
 ### 并发连接限制
 
@@ -1405,12 +1405,12 @@ INFO  NAT probed: Cone, ipv6=available
 ├── config.toml          # 可选配置
 ├── identity.json        # Ed25519 密钥对 (0600)
 ├── peers.json           # 已知 peer 公钥 + 最后连接地址
-├── routes.bin           # Kademlia 路由表序列化
+├── routes.json           # Kademlia 路由表序列化
 ├── cache/nat_type.json  # NAT 探测缓存
 └── logs/lain.log        # 可选日志文件
 ```
 
-#### routes.bin (DHT 路由表)
+#### routes.json (DHT 路由表)
 
 **写入时机**：
 - graceful shutdown 时全量写入
@@ -1549,7 +1549,7 @@ QUIC short-header 包的首字节为 `01xxxxxx`（与 DHT version=1 冲突）。
 
 **连接暂停与恢复**：应用进入后台 → daemon 收到 OS 通知 → 降低所有定时器频率（×3）→ 保持 DHT STORE（证明存活）→ 暂停 mDNS → 进入前台 → 恢复全部定时器 → 紧急 UPDATE DHT → 重建断开的连接。
 
-**后台保活**：Android 前台服务通知（必需）、iOS Background Task / VoIP push（如可用）。在 OS 强制杀死 daemon 后，下次启动从 routes.bin + peers.json 快速恢复。
+**后台保活**：Android 前台服务通知（必需）、iOS Background Task / VoIP push（如可用）。在 OS 强制杀死 daemon 后，下次启动从 routes.json + peers.json 快速恢复。
 
 ---
 
@@ -1598,7 +1598,7 @@ Level 4 — 最小存活: 仅 Relay 路径（所有直连不可用）
 | 威胁 | 严重度 | 对策 |
 |------|--------|------|
 | **DHT 投毒** (伪造 STORE) | 中 | STORE 必须 Ed25519 签名，FIND_VALUE 响应验证签名。 |
-| **DHT Sybil / Eclipse** | 中 | ① Liveness 门槛——攻击者必须持续运营在线节点（心跳、响应 PING），LIVE→STALE→EXPIRED 自动淘汰停止维护的 Sybil 节点。② peers.json 持久化真实 peer，不参与 bucket LRU 替换，Eclipse 不掉已连接过的 peer。③ 多源 bootstrap：routes.bin + peers.json + invite，不依赖单一入口。攻击者需要长期维护大量在线节点才能有效 Eclipse，成本远高于批量生成 PeerID。 |
+| **DHT Sybil / Eclipse** | 中 | ① Liveness 门槛——攻击者必须持续运营在线节点（心跳、响应 PING），LIVE→STALE→EXPIRED 自动淘汰停止维护的 Sybil 节点。② peers.json 持久化真实 peer，不参与 bucket LRU 替换，Eclipse 不掉已连接过的 peer。③ 多源 bootstrap：routes.json + peers.json + invite，不依赖单一入口。攻击者需要长期维护大量在线节点才能有效 Eclipse，成本远高于批量生成 PeerID。 |
 | **Eclipse 攻击** (隔离目标节点) | 中 | 多路径 bootstrap（invite seeds + peers.json + 持久化路由表）。定期从 seed 重新 FIND_NODE(self) 验证路由表一致性。 |
 | **重放攻击** (Invite) | 低 | Invite 含 timestamp，接收方拒绝超过 30 分钟的 invite。一次性使用。 |
 | **重放攻击** (DHT RPC) | 低 | message_id 为随机 16 字节，接收方 5 秒去重窗口。 |
@@ -1614,7 +1614,7 @@ Level 4 — 最小存活: 仅 Relay 路径（所有直连不可用）
 |------|------|---------|
 | Ed25519 私钥 | `identity.json` (磁盘) | 文件权限 0600。不加密存储（依赖 OS 用户隔离）。未来可选 passphrase 加密。 |
 | 应用层 payload | 网络传输 | Noise ChaChaPoly 加密 + QUIC TLS 1.3 双重加密。 |
-| DHT 路由表 | 内存 + `routes.bin` | 仅含 node_id + address，不含密钥材料。 |
+| DHT 路由表 | 内存 + `routes.json` | 仅含 node_id + address，不含密钥材料。 |
 | Invite code 传输 | out-of-band (用户控制) | Ed25519 签名防篡改。传输通道安全性由用户保证。 |
 
 ### 14.4 隐私考虑
@@ -1668,7 +1668,7 @@ Level 4 — 最小存活: 仅 Relay 路径（所有直连不可用）
 
 - **identity.json**：从 v1 起格式固定（Ed25519 密钥对 JSON），不随协议版本变更。
 - **peers.json**：JSON 格式，新增字段向后兼容（旧版本忽略未知字段）。
-- **routes.bin**：MessagePack 格式，版本号嵌入文件头。不兼容时丢弃重建（从 DHT 自然恢复）。
+- **routes.json**：MessagePack 格式，版本号嵌入文件头。不兼容时丢弃重建（从 DHT 自然恢复）。
 - **config.toml**：新增 key 有默认值，删除 key 被忽略。
 
 ---
@@ -1956,7 +1956,7 @@ A的app ──fd read/write──→ A的daemon ──QUIC──→ B的daemon �
 | §7 Relay 发现+转发 | ✅ | RELAY_NEEDED RPC, pipe_connections 双向桥接 |
 | §7.4 Relay 下线迁移 | ✅ | 管道断开后自动 DHT 查找新 relay 重连 |
 | §8 节点生命周期 | ✅ | LIVE/STALE/EXPIRED, Dormant, 自适应心跳 |
-| §9 Kademlia DHT | ✅ | 256 bucket, 6 RPC, Ed25519 签名+验证, routes.bin |
+| §9 Kademlia DHT | ✅ | 256 bucket, 6 RPC, Ed25519 签名+验证, routes.json |
 | §10 数据传输 | ✅ | QUIC+NoiseIK+HEADERS, STREAM_RESUME, keepalive |
 | §11 IPC | ✅ | UDS/NamedPipe/HTTP, JSON 行协议, fd 传递 |
 
@@ -1976,21 +1976,23 @@ A的app ──fd read/write──→ A的daemon ──QUIC──→ B的daemon �
 | invite 动态刷新 | 每次心跳更新端点，`lain invite` 实时反映当前地址 |
 | CLI 实时反馈 | `connect` 订阅事件 15s 内返回成功/失败 |
 | 跨平台 CLI | IpcStream 抽象：Unix→UnixStream, Windows→NamedPipe |
+| Windows Named Pipe IPC | 双向 JSON 行协议，`\\.\pipe\lain` |
 | 重复启动检测 | 启动时检查 IPC socket 是否已被监听 |
 | 静默 daemon | 默认日志写文件，`--foreground` 恢复终端输出 |
 | per-peer 限速 | DHT 20 msg/s 滑动窗口，10 分钟清理 |
 | 自适应心跳 | Symmetric NAT: 30s, Cone: 120s |
 | bucket 自动刷新 | 启动后对 256 桶递归 FIND_NODE |
-| peers.json 签名 | Ed25519 签名防篡改 |
+| peers.json 签名 | Ed25519 签名防篡改，每次心跳写入 |
 | Lain 帧协议 | 10 种帧类型，VarInt 编解码 |
 | mm_connections 限制 | Semaphore 限制活跃连接数 |
+| 端到端测试 | 135+ 自动化测试（单元+集成），Windows 真机验证通过 |
 
 ### A.4 CLI 命令
 
 ```
 $ lain                   # 启动 daemon (quiet mode, log to ~/.lain/daemon.log)
 $ lain daemon            # 同上
-$ lain daemon -f         # 前台运行 (log to stdout)
+$ lain -f daemon         # 前台运行 (log to stdout)
 $ lain whoami            # 查看 PeerID
 $ lain invite            # 生成 invite 码
 $ lain connect <code>    # 连接到 peer (支持 lain:// 或裸 Base62)

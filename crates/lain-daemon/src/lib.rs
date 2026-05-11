@@ -210,6 +210,13 @@ impl Daemon {
             tracing::info!("no bootstrap nodes configured, relying on mDNS LAN discovery");
         }
 
+        // Load saved routes from previous session (crash recovery)
+        if let Some(routes_path) = dirs_home().map(|d| d.join(".lain").join("routes.json")) {
+            if let Err(e) = dht.load_routes(&routes_path).await {
+                tracing::debug!("no saved routes to load ({}), starting fresh", e);
+            }
+        }
+
         // 5. STORE self
         let capabilities = Capabilities::new()
             .with(if nat_result.ipv6_inbound { Capabilities::IPV6_INBOUND } else { 0 })
@@ -661,6 +668,11 @@ impl Daemon {
                     // Periodic save of peers.json (crash resilience)
                     let peers = known_peers.read().await;
                     save_peers(&peers, &self.identity);
+
+                    // Also save DHT routes for crash recovery
+                    if let Some(routes_path) = dirs_home().map(|d| d.join(".lain").join("routes.json")) {
+                        let _ = dht_arc.save_routes(&routes_path).await;
+                    }
 
                     // Update invite with latest endpoints (NAT may have changed)
                     let mut inv = invite_state.write().await;
