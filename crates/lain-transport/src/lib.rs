@@ -290,7 +290,7 @@ impl Transport {
 
         let (mut stream, peer) = tokio::select! {
             Ok((s, p)) = accept_fut => (s, p),
-            _ = tokio::time::sleep(std::time::Duration::from_secs(30)) => {
+            _ = tokio::time::sleep(std::time::Duration::from_secs(102)) => {
                 return Err(TransportError::Connect("TSO timeout".into()));
             }
         };

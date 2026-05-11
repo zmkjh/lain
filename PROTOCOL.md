@@ -174,7 +174,7 @@ socket_addr 格式为 `IP:PORT`（如 `117.88.30.86:52606`）。交换后双方�
 ```
 [0]       addr_kind: 0=IPv4, 1=IPv6
 [1..]     address: IPv4(4 bytes IP + 2 bytes port) 或 IPv6(16 bytes IP + 2 bytes port)
-[kind]    endpoint_kind: 0=IPv6, 1=STUN, 2=LAN, 3=WebSocket, 4=Relay (1 byte)
+[kind]    endpoint_kind: 0=IPv6, 1=STUN, 2=LAN, 3=WebSocket, 4=Relay, 5=TSO (1 byte)
 [ttl]     ttl_seconds: u32 大端 (4 bytes)
 ```
 
@@ -250,7 +250,7 @@ encode_payload 布局：
 ```
 [0]       addr_kind: 0=IPv4, 1=IPv6
 [1..]     address: IPv4(4+2) 或 IPv6(16+2)
-[kind]    endpoint_kind: u8
+[kind]    endpoint_kind: 0=IPv6, 1=STUN, 2=LAN, 3=WebSocket, 4=Relay, 5=TSO (u8)
 [priority] priority: u8
 [ttl]     ttl_seconds: u32 大端
 ```

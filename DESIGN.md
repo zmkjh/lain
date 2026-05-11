@@ -837,7 +837,7 @@ Address:
 
 Endpoint:
   ─ addr:       Address
-  ─ kind:       u8     // 0=IPv6, 1=STUN, 2=LAN, 3=WS, 4=Relay
+  ─ kind:       u8     // 0=IPv6, 1=STUN, 2=LAN, 3=WS, 4=Relay, 5=TSO
   ─ ttl_seconds: u32
 
 PeerID:    [u8; 32]   // SHA256 hash

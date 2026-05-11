@@ -83,6 +83,7 @@ enum Command {
     Whoami,
     Invite,
     Connect { invite: String },
+    Tso { invite: String },
     Monitor,
     Shutdown,
     Status,
@@ -144,6 +145,7 @@ fn main() {
             }
         }
         Command::Connect { invite } => connect_feedback(&socket_path, &invite),
+        Command::Tso { invite } => tso_connect(&socket_path, &invite),
         Command::Monitor => monitor_loop(&socket_path),
         Command::Shutdown => {
             match ipc_req(&socket_path, r#"{"cmd":"Shutdown"}"#) {
@@ -255,6 +257,15 @@ fn connect_feedback(socket_path: &PathBuf, invite: &str) {
         if reader.read_line(&mut line).is_err() { break; }
         if start.elapsed().as_secs() > 15 {
             println!("timeout — check 'lain status'");
+            // Suggest TSO exchange for NAT-incompatible pairs
+            match ipc_req(socket_path, r#"{"cmd":"GetInvite"}"#) {
+                Some(v) => {
+                    let my_inv = v.get("message").and_then(|m| m.as_str()).unwrap_or("?");
+                    println!("\nYour invite: {my_inv}");
+                    println!("Share this with your peer, then BOTH run:\n  lain tso <other-peer-invite>\nwithin 30 seconds.");
+                }
+                None => {}
+            }
             break;
         }
         if let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) {
@@ -268,6 +279,64 @@ fn connect_feedback(socket_path: &PathBuf, invite: &str) {
                     "peer_error" => {
                         let err = v.get("data").and_then(|d| d.get("error")).and_then(|e| e.as_str()).unwrap_or("?");
                         println!("connection failed: {err}");
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+}
+
+fn tso_connect(socket_path: &PathBuf, invite: &str) {
+    let owned;
+    let invite = if !invite.starts_with("lain://") {
+        owned = format!("lain://{invite}");
+        &owned
+    } else { invite };
+
+    // Tell daemon to do TSO via IPC
+    let mut stream = match IpcStream::connect(socket_path) {
+        Ok(s) => s,
+        Err(e) => { eprintln!("cannot connect to daemon: {e}"); return; }
+    };
+    let req = serde_json::json!({"cmd":"Tso","invite":invite}).to_string() + "\n";
+    stream.write_all(req.as_bytes()).ok();
+    let mut reader = BufReader::new(stream);
+    let mut line = String::new();
+    reader.read_line(&mut line).ok();
+
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) {
+        if v.get("type").and_then(|t| t.as_str()) == Some("Error") {
+            let msg = v.get("message").and_then(|m| m.as_str()).unwrap_or("?");
+            eprintln!("TSO error: {msg}");
+            return;
+        }
+    }
+
+    println!("TSO mode — trying simultaneous TCP open (102s)...");
+    reader.get_mut().write_all(b"{\"cmd\":\"Subscribe\"}\n").ok();
+    line.clear();
+    let start = std::time::Instant::now();
+    loop {
+        line.clear();
+        if reader.read_line(&mut line).is_err() { break; }
+        if start.elapsed().as_secs() > 110 {
+            println!("TSO timeout — both peers must run 'lain tso' within 102 seconds");
+            break;
+        }
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) {
+            if let Some(ev) = v.get("event").and_then(|e| e.as_str()) {
+                match ev {
+                    "peer_connected" => {
+                        let pid = v.get("peer_id").and_then(|p| p.as_str()).unwrap_or("?");
+                        let via = v.get("data").and_then(|d| d.get("via")).and_then(|v| v.as_str()).unwrap_or("TSO");
+                        println!("connected to {pid} via {via}");
+                        break;
+                    }
+                    "peer_error" => {
+                        let err = v.get("data").and_then(|d| d.get("error")).and_then(|e| e.as_str()).unwrap_or("?");
+                        println!("TSO failed: {err}");
                         break;
                     }
                     _ => {}

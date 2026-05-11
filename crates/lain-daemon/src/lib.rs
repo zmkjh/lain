@@ -786,6 +786,46 @@ impl Daemon {
                                 });
                             }
                         }
+                        IpcCommand::TsoPeer { invite } => {
+                            tracing::info!("IPC: TSO via {invite}");
+                            let code = invite.strip_prefix("lain://")
+                                .and_then(|c| lain_discovery::InviteCode::from_base62(c).ok());
+                            if let Some(inv) = code {
+                                let t = transport.clone();
+                                let ipc_ev = _ipc_ev_tx.clone();
+                                let pid = inv.peer_id;
+                                let noise_pk = inv.noise_pk;
+                                let tso_eps: Vec<SocketAddr> = inv.endpoints.iter()
+                                    .filter(|e| e.kind == lain_core::endpoint::EndpointKind::TSO)
+                                    .map(|e| e.addr)
+                                    .collect();
+                                tokio::spawn(async move {
+                                    match t.ts_connect(&noise_pk, &tso_eps).await {
+                                        Ok((_stream, _session, peer)) => {
+                                            let _ = ipc_ev.send(IpcResponse::Event {
+                                                event: "peer_connected".into(),
+                                                peer_id: Some(pid.to_string()),
+                                                data: Some(serde_json::json!({"via": "TSO"})),
+                                            });
+                                            tracing::info!("TSO connected: {pid} via {peer}");
+                                        }
+                                        Err(e) => {
+                                            let _ = ipc_ev.send(IpcResponse::Event {
+                                                event: "peer_error".into(),
+                                                peer_id: Some(pid.to_string()),
+                                                data: Some(serde_json::json!({"error": format!("TSO: {e}")})),
+                                            });
+                                        }
+                                    }
+                                });
+                            } else {
+                                let _ = _ipc_ev_tx.send(IpcResponse::Event {
+                                    event: "peer_error".into(),
+                                    peer_id: None,
+                                    data: Some(serde_json::json!({"error": "invalid invite code"})),
+                                });
+                            }
+                        }
                         IpcCommand::DisconnectPeer { peer_id } => {
                             tracing::info!("IPC: disconnect {peer_id}");
                             known_peers.write().await.remove(&peer_id);
