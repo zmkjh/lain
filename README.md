@@ -76,6 +76,8 @@ daemon shutting down
 | `lain whoami` | 查看自己的 PeerID |
 | `lain invite` | 生成邀请码 |
 | `lain connect <code>` | 连接到 peer |
+| `lain tso <code>` | TCP 同时打开（APDF NAT 备选） |
+| `lain find <peer_id>` | DHT 发现并自动连接 |
 | `lain monitor` | 监控事件流（连接、数据通知） |
 | `lain status` | 查看网络状态 |
 | `lain shutdown` | 停止 daemon |

@@ -826,6 +826,49 @@ impl Daemon {
                                 });
                             }
                         }
+                        IpcCommand::FindPeer { peer_id } => {
+                            tracing::info!("IPC: find {peer_id}");
+                            let dht = dht_arc.clone();
+                            let t = transport.clone();
+                            let ipc_ev = _ipc_ev_tx.clone();
+                            let connected_ref = connected.clone();
+                            let conn_sem2 = conn_sem.clone();
+                            tokio::spawn(async move {
+                                if let Ok(pid) = PeerId::from_hex(&peer_id) {
+                                    match dht.find_peer(&pid).await {
+                                        Ok(Some(record)) => {
+                                            tracing::info!("found {pid} via DHT, connecting...");
+                                            match t.connect_raw(&record.noise_pubkey, &record.endpoints).await {
+                                                Ok(conn) => {
+                                                    connected_ref.write().await.insert(pid, (conn.clone(), {
+                                                        conn_sem2.acquire_owned().await.unwrap()
+                                                    }));
+                                                    let _ = ipc_ev.send(IpcResponse::Event {
+                                                        event: "peer_connected".into(),
+                                                        peer_id: Some(pid.to_string()),
+                                                        data: Some(serde_json::json!({"via": "dht"})),
+                                                    });
+                                                }
+                                                Err(e) => {
+                                                    let _ = ipc_ev.send(IpcResponse::Event {
+                                                        event: "peer_error".into(),
+                                                        peer_id: Some(pid.to_string()),
+                                                        data: Some(serde_json::json!({"error": e.to_string()})),
+                                                    });
+                                                }
+                                            }
+                                        }
+                                        _ => {
+                                            let _ = ipc_ev.send(IpcResponse::Event {
+                                                event: "peer_error".into(),
+                                                peer_id: Some(peer_id.clone()),
+                                                data: Some(serde_json::json!({"error": "peer not found in DHT"})),
+                                            });
+                                        }
+                                    }
+                                }
+                            });
+                        }
                         IpcCommand::DisconnectPeer { peer_id } => {
                             tracing::info!("IPC: disconnect {peer_id}");
                             known_peers.write().await.remove(&peer_id);
@@ -914,13 +957,8 @@ impl Daemon {
                     let mut inv = invite_state.write().await;
                     inv.4 = endpoints.clone();
 
-                    // Dormant check: skip heartbeat if no active connections
-                    let peer_count = connected.read().await.len();
-                    if peer_count == 0 {
-                        // All peers expired/disconnected — skip this heartbeat
-                        // routes.bin is still maintained for future reconnection
-                        continue;
-                    }
+                    // Always propagate STORE to maintain DHT presence (even idle)
+                    // so other peers can discover this node via find_peer.
                     if let Err(e) = dht_arc.store_self(
                         &public_key, &noise_pubkey, &endpoints, capabilities,
                     ).await {

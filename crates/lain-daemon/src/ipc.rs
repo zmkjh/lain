@@ -21,6 +21,7 @@ pub enum IpcError {
 pub enum IpcRequest {
     Connect { peer_id: Option<String>, invite: String },
     Tso { invite: String },
+    FindPeer { peer_id: String },
     Disconnect { peer_id: String },
     Accept { connection_id: u64 },
     Reject { connection_id: u64 },
@@ -54,6 +55,7 @@ pub enum IpcResponse {
 pub enum IpcCommand {
     ConnectPeer { peer_id: Option<PeerId>, invite: String },
     TsoPeer { invite: String },
+    FindPeer { peer_id: String },
     DisconnectPeer { peer_id: PeerId },
     AcceptConnection { connection_id: u64 },
     RejectConnection { connection_id: u64 },
@@ -316,6 +318,10 @@ async fn dispatch(
         IpcRequest::Tso { invite } => {
             send_or_warn(cmd_tx, IpcCommand::TsoPeer { invite: invite.clone() }, "tso");
             IpcResponse::Ok { message: Some(format!("tso: {invite}")), data: None }
+        }
+        IpcRequest::FindPeer { peer_id } => {
+            send_or_warn(cmd_tx, IpcCommand::FindPeer { peer_id: peer_id.clone() }, "find");
+            IpcResponse::Ok { message: Some(format!("finding: {peer_id}")), data: None }
         }
         IpcRequest::Disconnect { peer_id } => {
             if let Ok(pid) = PeerId::from_hex(&peer_id) {
