@@ -175,6 +175,22 @@ impl Daemon {
 
         tracing::info!("IPC ready at {:?}", uds_path);
 
+        // VPN/TUN detection: warn if virtual adapters may interfere with STUN
+        if let Ok(ifaces) = if_addrs::get_if_addrs() {
+            for iface in &ifaces {
+                let name_lower = iface.name.to_lowercase();
+                if name_lower.contains("vpn") || name_lower.contains("tun")
+                    || name_lower.contains("tap") || name_lower.contains("virtual")
+                    || name_lower.contains("wintun") || name_lower.contains("wireguard")
+                    || name_lower.contains("openvpn") || name_lower.contains("nord")
+                    || name_lower.contains("proton") || name_lower.contains("surf")
+                {
+                    tracing::warn!("VPN/TUN interface '{}' detected — STUN may return wrong public IP.\
+                        Consider disabling VPN for accurate NAT detection.", iface.name);
+                }
+            }
+        }
+
         // 1. NAT 探测 (resolve STUN hostnames to addresses)
         let stun_addrs: Vec<std::net::SocketAddr> = {
             let mut addrs = Vec::new();
