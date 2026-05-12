@@ -358,7 +358,7 @@ impl Daemon {
 
         // TSO TCP ports: bind N sockets for birthday-attack-style TSO,
         // increasing probability of TCP simultaneous open through APDF NAT.
-        const TSO_PORTS: u16 = 16;
+        const TSO_PORTS: u16 = 24;
         for _ in 0..TSO_PORTS {
             let tso_listener = tokio::net::TcpListener::bind(bind_addr).await
                 .map_err(|e| DaemonError::Config(format!("TSO bind: {e}")))?;
