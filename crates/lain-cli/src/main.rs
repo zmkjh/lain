@@ -429,7 +429,6 @@ fn monitor_loop(socket_path: &PathBuf) {
             let peer = v.get("peer_id").and_then(|p| p.as_str()).unwrap_or("-");
             match event {
                 "peer_connected" => println!("[connected] {peer}"),
-                "incoming_connection" => println!("[incoming] {peer}"),
                 "data" => {
                     if let Some(data_field) = v.get("data") {
                         if let Some(b64) = data_field.get("bytes").and_then(|b| b.as_str()) {

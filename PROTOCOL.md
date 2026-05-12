@@ -346,16 +346,7 @@ RelayConnect payload: [requester_peer_id: 32 bytes] [target_peer_id: 32 bytes]
 ← {"type":"Ok","message":"subscribed"}
 ← {"type":"Event","event":"peer_connected","peer_id":"..."}
 ← {"type":"Event","event":"data","peer_id":"...","data":{"bytes":"aGVsbG8="}}
-← {"type":"Event","event":"incoming_connection","peer_id":"...","data":{"connection_id":1}}
 ← {"type":"Event","event":"peer_disconnected","peer_id":"..."}
-```
-
-#### Accept / Reject — 响应入站连接
-
-```json
-→ {"cmd":"Accept","connection_id":1}
-→ {"cmd":"Reject","connection_id":1}
-← {"type":"Ok","message":"accepted"}
 ```
 
 #### Disconnect — 断开连接
@@ -377,7 +368,6 @@ RelayConnect payload: [requester_peer_id: 32 bytes] [target_peer_id: 32 bytes]
 ```json
 ← {"type":"Event","event":"peer_connected","peer_id":"a1b2c3d4"}
 ← {"type":"Event","event":"data","peer_id":"a1b2c3d4","data":{"bytes":"aGVsbG8="}}
-← {"type":"Event","event":"incoming_connection","peer_id":"a1b2c3d4","data":{"connection_id":1}}
 ← {"type":"Event","event":"peer_disconnected","peer_id":"a1b2c3d4"}
 ← {"type":"Error","code":"ERR","message":"reason"}
 ← {"type":"Ok","message":"optional message","data":{...}}

@@ -131,7 +131,6 @@ TSO 专为 CGNAT（中国移动/校园网对称 NAT）设计——双方各用 8
 | `peer_disconnected` | 手动断开或连接丢失 |
 | `peer_error` | 连接失败，含 error 详情 |
 | `data` | 收到数据，`data.bytes` 为 base64 编码 |
-| `incoming_connection` | 入站连接请求，含 `connection_id` |
 
 ## 应用开发
 
