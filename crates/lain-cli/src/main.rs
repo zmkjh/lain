@@ -10,7 +10,7 @@ use std::path::PathBuf;
 enum IpcStream {
     #[cfg(unix)]
     Unix(std::os::unix::net::UnixStream),
-    #[cfg(windows)]
+    #[cfg(target_os = "windows")]
     Pipe(std::fs::File),
 }
 
@@ -18,7 +18,7 @@ impl IpcStream {
     fn connect(path: &PathBuf) -> std::io::Result<Self> {
         #[cfg(unix)]
         { std::os::unix::net::UnixStream::connect(path).map(IpcStream::Unix) }
-        #[cfg(windows)]
+        #[cfg(target_os = "windows")]
         {
             use std::os::windows::fs::OpenOptionsExt;
             let file = std::fs::OpenOptions::new()
@@ -69,13 +69,15 @@ struct Cli {
 fn ipc_socket(path: &str) -> PathBuf {
     if !path.is_empty() { return PathBuf::from(path); }
     #[cfg(unix)] { dirs_home().map(|d| d.join(".lain").join("socket")).unwrap_or_else(|| PathBuf::from("/tmp/lain.socket")) }
-    #[cfg(windows)] { r"\\.\pipe\lain".into() }
+    #[cfg(target_os = "windows")] { r"\\.\pipe\lain".into() }
 }
 
-#[cfg(unix)]
 fn dirs_home() -> Option<PathBuf> {
     if let Ok(h) = std::env::var("LAIN_HOME") { return Some(PathBuf::from(h)); }
-    if let Ok(h) = std::env::var("HOME") { return Some(PathBuf::from(h)); }
+    #[cfg(unix)]
+    { if let Ok(h) = std::env::var("HOME") { return Some(PathBuf::from(h)); } }
+    #[cfg(target_os = "windows")]
+    { if let Ok(h) = std::env::var("USERPROFILE") { return Some(PathBuf::from(h)); } }
     None
 }
 
@@ -101,15 +103,16 @@ fn main() {
     if cli.foreground {
         tracing_subscriber::fmt::init();
     } else {
-        // Log to file
+        // Log to file in Lain config directory
         let log_path = {
             let mut d = if let Ok(h) = std::env::var("LAIN_HOME") {
                 PathBuf::from(h)
-            } else if let Ok(h) = std::env::var("HOME") {
-                PathBuf::from(h).join(".lain")
+            } else if let Some(h) = dirs_home() {
+                h.join(".lain")
             } else {
                 PathBuf::from(".")
             };
+            std::fs::create_dir_all(&d).ok();
             d.push("daemon.log");
             d
         };
