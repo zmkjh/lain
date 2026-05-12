@@ -189,17 +189,21 @@ fn run_daemon(foreground: bool) {
             .stderr(std::process::Stdio::null())
             .spawn() {
             Ok(_child) => {
-                // Let the daemon start first, then print info from IPC
-                std::thread::sleep(std::time::Duration::from_secs(2));
-                match ipc_req(&socket_path, r#"{"cmd":"Whoami"}"#) {
-                    Some(v) => {
-                        let pid = v.get("message").and_then(|m| m.as_str()).unwrap_or("?");
-                        println!("Lain daemon started");
-                        println!("PeerID: {pid}");
-                        println!("Logs: ~/.lain/daemon.log");
+                // Retry IPC until daemon is ready (may be doing NAT probe)
+                for _ in 0..10 {
+                    std::thread::sleep(std::time::Duration::from_secs(1));
+                    match ipc_req(&socket_path, r#"{"cmd":"Whoami"}"#) {
+                        Some(v) => {
+                            let pid = v.get("message").and_then(|m| m.as_str()).unwrap_or("?");
+                            println!("Lain daemon started");
+                            println!("PeerID: {pid}");
+                            println!("Logs: ~/.lain/daemon.log");
+                            return;
+                        }
+                        None => continue,
                     }
-                    None => eprintln!("daemon failed to start"),
                 }
+                eprintln!("daemon failed to start (timeout)");
             }
             Err(e) => eprintln!("cannot start daemon: {e}"),
         }
