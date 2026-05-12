@@ -984,6 +984,15 @@ impl Daemon {
                                     })
                                 });
                             if let Some(inv) = code {
+                                if inv.is_expired() {
+                                    tracing::warn!("TSO invite expired for {}", inv.peer_id);
+                                    let _ = _ipc_ev_tx.send(IpcResponse::Event {
+                                        event: "peer_error".into(),
+                                        peer_id: Some(inv.peer_id.to_string()),
+                                        data: Some(serde_json::json!({"error": "invite expired"})),
+                                    });
+                                    continue;
+                                }
                                 let t = transport.clone();
                                 let ipc_ev = _ipc_ev_tx.clone();
                                 let connected_ref = connected.clone();
