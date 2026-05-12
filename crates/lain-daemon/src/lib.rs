@@ -344,50 +344,31 @@ impl Daemon {
             }
             let tso_noise_secret = _noise_secret;
             let tso_peer_id = peer_id;
-            let tso_noise_pk = noise_pubkey;
             tokio::spawn(async move {
                 use tokio::io::{AsyncReadExt, AsyncWriteExt};
                 use lain_noise::{NoiseHandshake, encode_handshake_frame, parse_frame_header};
                 loop {
                     match tso_listener.accept().await {
                         Ok((mut stream, _)) => {
-                            // Full TSO handshake: exchange PeerIDs → Noise IK
+                            // TSO accept: we are the passive side — always act as responder.
+                            // The peer who initiated TSO has our pubkey from the invite
+                            // and will act as initiator in their ts_connect call.
                             stream.write_all(&tso_peer_id.0).await.ok();
                             let mut their_id = [0u8; 32];
                             if stream.read_exact(&mut their_id).await.is_err() { continue; }
-                            let we_initiate = tso_peer_id.0 < their_id;
-                            let noise_result = if we_initiate {
-                                NoiseHandshake::new_initiator(&tso_noise_secret, &tso_noise_pk)
-                            } else {
-                                NoiseHandshake::new_responder(&tso_noise_secret)
-                            };
-                            if let Ok(mut noise) = noise_result {
-                                if we_initiate {
-                                    let ik1 = noise.write_message(&[]).ok();
-                                    if let Some(ik1) = ik1 {
-                                        stream.write_all(&encode_handshake_frame(0, &ik1)).await.ok();
-                                        let mut buf = vec![0u8; 4096];
-                                        if let Ok(n) = stream.read(&mut buf).await {
-                                            if let Ok(header) = parse_frame_header(&buf[..n]) {
-                                                let _ = noise.read_message(&buf[8..8+header.payload_len.min(n-8)]).ok();
-                                            }
-                                        }
-                                    }
-                                } else {
-                                    let mut buf = vec![0u8; 4096];
-                                    if let Ok(n) = stream.read(&mut buf).await {
-                                        if let Ok(header) = parse_frame_header(&buf[..n]) {
-                                            if noise.read_message(&buf[8..8+header.payload_len.min(n-8)]).is_ok() {
-                                                if let Ok(ik2) = noise.write_message(&[]) {
-                                                    stream.write_all(&encode_handshake_frame(0, &ik2)).await.ok();
-                                                }
+                            if let Ok(mut noise) = NoiseHandshake::new_responder(&tso_noise_secret) {
+                                let mut buf = vec![0u8; 4096];
+                                if let Ok(n) = stream.read(&mut buf).await {
+                                    if let Ok(header) = parse_frame_header(&buf[..n]) {
+                                        if noise.read_message(&buf[8..8+header.payload_len.min(n-8)]).is_ok() {
+                                            if let Ok(ik2) = noise.write_message(&[]) {
+                                                stream.write_all(&encode_handshake_frame(0, &ik2)).await.ok();
+                                                let _session = noise.into_transport();
+                                                tracing::info!("TSO accepted from peer");
                                             }
                                         }
                                     }
                                 }
-                                let _session = noise.into_transport();
-                                // Connected via TSO on this stream
-                                tracing::info!("TSO accepted from peer");
                             }
                         }
                         Err(_) => break,
