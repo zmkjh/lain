@@ -3,7 +3,7 @@
 **零服务器 P2P 网络基础设施。** 无需 bootstrap 节点、无需 DNS、无需 TLS 证书。PeerID 即身份，Invite 即入口，DHT 即拓扑。
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-[![Tests](https://img.shields.io/badge/tests-135-brightgreen.svg)](https://github.com/zmkjh/lain/actions)
+[![Tests](https://img.shields.io/badge/tests-152-brightgreen.svg)](https://github.com/zmkjh/lain/actions)
 ![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-lightgrey)
 
 ## 核心创新
@@ -176,11 +176,30 @@ IPC 协议完整规范见 [PROTOCOL.md §8](PROTOCOL.md#8-ipc-api)。
 
 ```bash
 cargo build --release    # 生产构建
-cargo test               # 135 自动化测试 (0 warning)
+cargo test               # 152 自动化测试 (0 warning)
 ```
 
-135 个测试覆盖全部协议层：identity、noise、nat、dht、discovery、transport、daemon + 12 个端到端集成测试（含 relay、TSO、并发）。
+152 个测试覆盖全部协议层：identity、noise、nat（含全部 NAT 类型分类）、dht（全部消息类型）、discovery、transport（QUIC/TSO/relay/并发）、daemon + 13 个端到端集成测试。
 
 ## 许可证
 
 MIT © 2026 zmkjh
+
+## 最近更新 (2026-05)
+
+### Bug 修复
+- **IPC 事件通知**：修复 Subscribe 命令从不转发事件到客户端的问题（cli `lain monitor` / `lain connect` 现在可正常收到 `peer_connected` 等通知）
+- **Invite 签名验证**：ConnectPeer 和 TsoPeer 现在验证 Ed25519 签名（之前只检查 PeerId 但不验证签名，MITM 可替换 noise_pk 和 endpoints）
+- **TSO 噪声密钥**：ts_connect 现在从 `noise_secret` 正确派生 X25519 公钥
+- **DHT 签名验证**：peers.json 现在验证 Ed25519 签名后再加载
+- **DHT 随机性**：`random_id_in_bucket` 真正随机化后缀位
+- **DHT 查询丢失**：`spawn_cleanup` 不再清空 `pending_queries`（之前每 10 分钟丢弃所有进行中的 find_peer 请求）
+- **STUN CHANGE-REQUEST**：修复 message length 字段始终为 0 的问题
+- **IPC listener 健壮性**：Unix/Windows/HTTP listener 现在在瞬态 accept 错误时 continue 而不是 exit
+
+### 测试增强
+- NAT 类型检测：mock STUN 服务器覆盖 Cone / APDFSymmetric / ADFSymmetric 全部分类
+- TSO 端到端：TCP 同时打开 + Noise IK 握手 + 交叉会话加密验证
+- accept_connection：响应端 Noise IK 完整测试
+- DHT：AddrReflect / RelayNeeded 消息收发
+- DHT：`spawn_bucket_refresh` 后台维护任务
