@@ -840,7 +840,15 @@ impl Daemon {
                                                 .filter(|ep| ep.kind == lain_core::endpoint::EndpointKind::TSO)
                                                 .map(|ep| ep.addr).collect();
                                             if !tso_eps.is_empty() {
-                                    match t.ts_connect(&pid, &tso_eps, nat_port_delta, nat_rtt_ms).await {
+                                            // Merge peer's port_delta_hint from invite with our probe
+                                            let peer_delta = if inv.port_delta_hint > 0 { Some(inv.port_delta_hint as u16) } else { None };
+                                            let effective_delta = match (nat_port_delta, peer_delta) {
+                                                (Some(1), _) | (_, Some(1)) => Some(1u16),
+                                                (Some(d), _) => Some(d),
+                                                (_, Some(d)) => Some(d),
+                                                (None, None) => None,
+                                            };
+                                    match t.ts_connect(&pid, &tso_eps, effective_delta, nat_rtt_ms).await {
                                                         Ok((_stream, _session, _peer)) => {
                                                             let _ = ipc_ev.send(IpcResponse::Event {
                                                                 event: "peer_connected".into(),
@@ -906,8 +914,15 @@ impl Daemon {
                                     .collect();
                                 let nat_port_delta = nat_result.port_delta;
                                 let nat_rtt_ms = nat_result.stun_rtt_ms;
+                                let peer_delta = if inv.port_delta_hint > 0 { Some(inv.port_delta_hint as u16) } else { None };
+                                let effective_delta = match (nat_port_delta, peer_delta) {
+                                    (Some(1), _) | (_, Some(1)) => Some(1u16),
+                                    (Some(d), _) => Some(d),
+                                    (_, Some(d)) => Some(d),
+                                    (None, None) => None,
+                                };
                                 tokio::spawn(async move {
-                                                match t.ts_connect(&pid, &tso_eps, nat_port_delta, nat_rtt_ms).await {
+                                                match t.ts_connect(&pid, &tso_eps, effective_delta, nat_rtt_ms).await {
                                                     Ok((_stream, _session, peer)) => {
                                                         let _ = ipc_ev.send(IpcResponse::Event {
                                                             event: "peer_connected".into(),
