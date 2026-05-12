@@ -171,7 +171,7 @@ async fn listen_local(
                 let ev = ev_tx.clone();
                 tokio::spawn(handle_client(r, w, tx, ev));
             }
-            Err(e) => { tracing::error!("NamedPipe connect: {e}"); break; }
+            Err(e) => { tracing::error!("NamedPipe connect: {e}"); continue; }
         }
     }
 }
@@ -198,7 +198,7 @@ async fn listen_local(
                 let ev = ev_tx.clone();
                 tokio::spawn(handle_client(r, w, tx, ev));
             }
-            Err(e) => { tracing::error!("UDS accept: {e}"); break; }
+            Err(e) => { tracing::error!("UDS accept: {e}"); continue; }
         }
     }
 }
@@ -208,20 +208,20 @@ async fn listen_local(
 async fn serve_http(
     listener: tokio::net::TcpListener,
     cmd_tx: mpsc::Sender<IpcCommand>,
-    ev_tx: broadcast::Sender<IpcResponse>,
+    _ev_tx: broadcast::Sender<IpcResponse>,
 ) {
     loop {
         match listener.accept().await {
             Ok((stream, _)) => {
                 let (r, w) = tokio::io::split(stream);
                 let tx = cmd_tx.clone();
-                let ev = ev_tx.clone();
-                tokio::spawn(handle_http_client(r, w, tx, ev));
+                tokio::spawn(handle_http_client(r, w, tx));
             }
-            Err(e) => { tracing::error!("HTTP accept: {e}"); break; }
+            Err(e) => { tracing::error!("HTTP accept: {e}"); continue; }
         }
     }
 }
+
 
 // ── Client handlers ──
 
@@ -233,17 +233,36 @@ async fn handle_client<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
 ) {
     let mut buf = BufReader::new(reader);
     let mut line = String::new();
+    let mut ev_rx = ev_tx.subscribe();
+
     loop {
         line.clear();
-        match buf.read_line(&mut line).await {
-            Ok(0) => break,
-            Ok(_) => {
-                let resp = dispatch(&line, &cmd_tx, &ev_tx).await;
-                let mut json = serde_json::to_string(&resp).unwrap_or_default();
-                json.push('\n');
-                writer.write_all(json.as_bytes()).await.ok();
+        tokio::select! {
+            read_result = buf.read_line(&mut line) => {
+                match read_result {
+                    Ok(0) => break,
+                    Ok(_) => {
+                        let resp = dispatch(&line, &cmd_tx).await;
+                        let mut json = serde_json::to_string(&resp).unwrap_or_default();
+                        json.push('\n');
+                        writer.write_all(json.as_bytes()).await.ok();
+                    }
+                    Err(_) => break,
+                }
             }
-            Err(_) => break,
+            event_result = ev_rx.recv() => {
+                match event_result {
+                    Ok(event) => {
+                        let mut json = serde_json::to_string(&event).unwrap_or_default();
+                        json.push('\n');
+                        if writer.write_all(json.as_bytes()).await.is_err() { break; }
+                    }
+                    Err(broadcast::error::RecvError::Lagged(n)) => {
+                        tracing::debug!("IPC event lagged by {n}");
+                    }
+                    Err(broadcast::error::RecvError::Closed) => break,
+                }
+            }
         }
     }
 }
@@ -252,7 +271,6 @@ async fn handle_http_client<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     reader: R,
     mut writer: W,
     cmd_tx: mpsc::Sender<IpcCommand>,
-    ev_tx: broadcast::Sender<IpcResponse>,
 ) {
     let mut buf = BufReader::new(reader);
     let mut line = String::new();
@@ -277,7 +295,7 @@ async fn handle_http_client<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     }
 
     let req_str = String::from_utf8_lossy(&body);
-    let resp = dispatch(&req_str, &cmd_tx, &ev_tx).await;
+    let resp = dispatch(&req_str, &cmd_tx).await;
     let json = serde_json::to_string(&resp).unwrap_or_default();
     let http = format!(
         "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
@@ -303,7 +321,6 @@ fn send_or_warn(tx: &mpsc::Sender<IpcCommand>, cmd: IpcCommand, label: &str) {
 async fn dispatch(
     line: &str,
     cmd_tx: &mpsc::Sender<IpcCommand>,
-    _ev_tx: &broadcast::Sender<IpcResponse>,
 ) -> IpcResponse {
     let req: IpcRequest = match serde_json::from_str(line.trim()) {
         Ok(r) => r,
