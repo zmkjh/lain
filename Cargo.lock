@@ -966,6 +966,7 @@ dependencies = [
  "lain-nat",
  "lain-noise",
  "quinn",
+ "rand 0.8.6",
  "rcgen",
  "rustls",
  "sha1_smol",

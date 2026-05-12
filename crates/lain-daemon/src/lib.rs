@@ -359,8 +359,8 @@ impl Daemon {
         // TSO TCP ports: register N consecutive ports in invite so peer
         // knows where to connect. Actual TCP simultaneous open happens in
         // ts_connect (both sides bind+connect from same port range).
-        const TSO_PORTS: u16 = 24;
-        const TSO_BASE: u16 = 42000;
+        const TSO_PORTS: u16 = 8;
+        const TSO_BASE: u16 = 50000;
         for i in 0..TSO_PORTS {
             let tso_port = TSO_BASE + i;
             if let Some(stun) = nat_result.mapped_addr {

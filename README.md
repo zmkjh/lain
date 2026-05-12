@@ -114,12 +114,12 @@ lain connect / lain find
   │    DHT 查找 relay 节点 → 连接 relay → 管道转发
   │
   ├─ ③ TSO（TCP Simultaneous Open）
-  │    24 端口并发 Birthday Attack，每轮 150ms 超时 × 100ms 间隔，102s 窗口
+  │    8 端口 (50000-50007) 并发 Birthday Attack，400ms 超时 + jitter，102s 窗口
   │
   └─ ④ 失败（所有路径不通）
 ```
 
-TSO 专为 APDF Symmetric NAT（中国移动宽带）设计——双方各开 24 个 TCP 端口同时并发互连，24×24=576 对组合提升穿透概率。
+TSO 专为 CGNAT（中国移动/校园网对称 NAT）设计——双方各用 8 个端口同时 bind+connect，IANA ephemeral 附近 (50000-50007)，400ms RTT 容忍，jitter 避免限速。
 
 ## IPC 事件
 

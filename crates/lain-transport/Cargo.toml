@@ -20,6 +20,7 @@ rcgen.workspace = true
 sha2.workspace = true
 ed25519-dalek.workspace = true
 x25519-dalek.workspace = true
+rand.workspace = true
 tokio-tungstenite.workspace = true
 sha1_smol.workspace = true
 
