@@ -29,6 +29,7 @@ cargo build --release
 
 ```bash
 $ lain daemon
+Starting daemon (NAT probe + DHT bootstrap may take a few seconds)...
 Lain daemon started
 PeerID: f8df8b59c08df278
 Logs: ~/.lain/daemon.log

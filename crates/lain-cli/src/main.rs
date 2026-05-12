@@ -189,8 +189,9 @@ fn run_daemon(foreground: bool) {
             .stderr(std::process::Stdio::null())
             .spawn() {
             Ok(_child) => {
-                // Retry IPC until daemon is ready (may be doing NAT probe)
-                for _ in 0..10 {
+                println!("Starting daemon (NAT probe + DHT bootstrap may take a few seconds)...");
+                // Retry IPC until daemon is ready
+                for i in 0..10 {
                     std::thread::sleep(std::time::Duration::from_secs(1));
                     match ipc_req(&socket_path, r#"{"cmd":"Whoami"}"#) {
                         Some(v) => {
