@@ -20,8 +20,10 @@ impl IpcStream {
         { std::os::unix::net::UnixStream::connect(path).map(IpcStream::Unix) }
         #[cfg(windows)]
         {
+            use std::os::windows::fs::OpenOptionsExt;
             let file = std::fs::OpenOptions::new()
                 .read(true).write(true)
+                .custom_flags(0x40000000) // FILE_FLAG_OVERLAPPED — non-blocking
                 .open(path)?;
             Ok(IpcStream::Pipe(file))
         }
@@ -174,8 +176,8 @@ fn main() {
 fn run_daemon(foreground: bool) {
     if !foreground {
         let socket_path = ipc_socket("");
-        // Check if daemon is already running before spawning
-        if ipc_req(&socket_path, r#"{"cmd":"Whoami"}"#).is_some() {
+        // Check if daemon is already running
+        if IpcStream::connect(&socket_path).is_ok() {
             eprintln!("daemon is already running");
             return;
         }
