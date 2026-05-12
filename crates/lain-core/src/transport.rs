@@ -32,6 +32,7 @@ pub enum PathType {
     STUN = 1,
     Relay = 2,
     WebSocket = 3,
+    TSO = 4,
 }
 
 /// 传输层接口

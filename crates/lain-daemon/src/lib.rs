@@ -849,7 +849,32 @@ impl Daemon {
                                                 (None, None) => None,
                                             };
                                     match t.ts_connect(&pid, &tso_eps, effective_delta, nat_rtt_ms).await {
-                                                        Ok((_stream, _session, _peer)) => {
+                                                        Ok(tso) => {
+                                                            let tso = std::sync::Arc::new(tso);
+                                                            lain_transport::TsoStream::spawn_keepalive(tso.clone(), 15);
+                                                            let ipc_ev2 = ipc_ev.clone();
+                                                            let pid2 = pid;
+                                                            tokio::spawn(async move {
+                                                                loop {
+                                                                    match tso.recv().await {
+                                                                        Ok(data) => {
+                                                                            use base64::Engine;
+                                                                            let b64 = base64::engine::general_purpose::STANDARD.encode(&data);
+                                                                            let _ = ipc_ev2.send(IpcResponse::Event {
+                                                                                event: "data".into(),
+                                                                                peer_id: Some(pid2.to_string()),
+                                                                                data: Some(serde_json::json!({"bytes": b64})),
+                                                                            });
+                                                                        }
+                                                                        Err(_) => break,
+                                                                    }
+                                                                }
+                                                                let _ = ipc_ev2.send(IpcResponse::Event {
+                                                                    event: "peer_disconnected".into(),
+                                                                    peer_id: Some(pid2.to_string()),
+                                                                    data: None,
+                                                                });
+                                                            });
                                                             let _ = ipc_ev.send(IpcResponse::Event {
                                                                 event: "peer_connected".into(),
                                                                 peer_id: Some(pid.to_string()),
@@ -923,18 +948,43 @@ impl Daemon {
                                 };
                                 tokio::spawn(async move {
                                                 match t.ts_connect(&pid, &tso_eps, effective_delta, nat_rtt_ms).await {
-                                                    Ok((_stream, _session, peer)) => {
+                                                    Ok(tso) => {
+                                                        let tso = std::sync::Arc::new(tso);
+                                                        lain_transport::TsoStream::spawn_keepalive(tso.clone(), 15);
+                                                        let ipc_ev2 = ipc_ev.clone();
+                                                        let pid2 = pid;
+                                                        tokio::spawn(async move {
+                                                            loop {
+                                                                match tso.recv().await {
+                                                                    Ok(data) => {
+                                                                        use base64::Engine;
+                                                                        let b64 = base64::engine::general_purpose::STANDARD.encode(&data);
+                                                                        let _ = ipc_ev2.send(IpcResponse::Event {
+                                                                            event: "data".into(),
+                                                                            peer_id: Some(pid2.to_string()),
+                                                                            data: Some(serde_json::json!({"bytes": b64})),
+                                                                        });
+                                                                    }
+                                                                    Err(_) => break,
+                                                                }
+                                                            }
+                                                            let _ = ipc_ev2.send(IpcResponse::Event {
+                                                                event: "peer_disconnected".into(),
+                                                                peer_id: Some(pid2.to_string()),
+                                                                data: None,
+                                                            });
+                                                        });
                                                         let _ = ipc_ev.send(IpcResponse::Event {
                                                             event: "peer_connected".into(),
                                                             peer_id: Some(pid.to_string()),
                                                             data: Some(serde_json::json!({"via": "TSO"})),
                                                         });
-                                            tracing::info!("TSO connected: {pid} via {peer}");
-                                        }
-                                        Err(e) => {
-                                            let _ = ipc_ev.send(IpcResponse::Event {
-                                                event: "peer_error".into(),
-                                                peer_id: Some(pid.to_string()),
+                                                        tracing::info!("TSO connected: {pid}");
+                                                    }
+                                                    Err(e) => {
+                                                        let _ = ipc_ev.send(IpcResponse::Event {
+                                                            event: "peer_error".into(),
+                                                            peer_id: Some(pid.to_string()),
                                                 data: Some(serde_json::json!({"error": format!("TSO: {e}")})),
                                             });
                                         }
@@ -1005,7 +1055,32 @@ impl Daemon {
                                                     let tso_eps: Vec<_> = eps.iter().filter(|ep| ep.kind == lain_core::endpoint::EndpointKind::TSO).map(|ep| ep.addr).collect();
                                                     if !tso_eps.is_empty() {
                                                 match t.ts_connect(&pid, &tso_eps, nat_port_delta, nat_rtt_ms).await {
-                                                            Ok((_stream, _session, _peer)) => {
+                                                            Ok(tso) => {
+                                                                let tso = std::sync::Arc::new(tso);
+                                                                lain_transport::TsoStream::spawn_keepalive(tso.clone(), 15);
+                                                                let ipc_ev2 = ipc_ev.clone();
+                                                                let pid2 = pid;
+                                                                tokio::spawn(async move {
+                                                                    loop {
+                                                                        match tso.recv().await {
+                                                                            Ok(data) => {
+                                                                                use base64::Engine;
+                                                                                let b64 = base64::engine::general_purpose::STANDARD.encode(&data);
+                                                                                let _ = ipc_ev2.send(IpcResponse::Event {
+                                                                                    event: "data".into(),
+                                                                                    peer_id: Some(pid2.to_string()),
+                                                                                    data: Some(serde_json::json!({"bytes": b64})),
+                                                                                });
+                                                                            }
+                                                                            Err(_) => break,
+                                                                        }
+                                                                    }
+                                                                    let _ = ipc_ev2.send(IpcResponse::Event {
+                                                                        event: "peer_disconnected".into(),
+                                                                        peer_id: Some(pid2.to_string()),
+                                                                        data: None,
+                                                                    });
+                                                                });
                                                                 let _ = ipc_ev.send(IpcResponse::Event {
                                                                     event: "peer_connected".into(),
                                                                     peer_id: Some(pid.to_string()),

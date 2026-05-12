@@ -55,6 +55,94 @@ struct PeerConnection {
     _noise: lain_noise::NoiseSession,
 }
 
+/// TSO data-plane: framed encryption over a single TCP stream.
+/// Handles message boundaries, Noise encrypt/decrypt, and keepalive pings.
+pub struct TsoStream {
+    stream: tokio::sync::Mutex<tokio::net::TcpStream>,
+    noise: tokio::sync::Mutex<lain_noise::NoiseSession>,
+    peer_id: PeerId,
+}
+
+impl TsoStream {
+    pub fn new(
+        stream: tokio::net::TcpStream,
+        noise: lain_noise::NoiseSession,
+        peer_id: PeerId,
+    ) -> Self {
+        Self {
+            stream: tokio::sync::Mutex::new(stream),
+            noise: tokio::sync::Mutex::new(noise),
+            peer_id,
+        }
+    }
+
+    pub fn peer_id(&self) -> PeerId {
+        self.peer_id
+    }
+
+    /// Read one framed message from the TCP stream and decrypt it.
+    pub async fn recv(&self) -> Result<Vec<u8>, TransportError> {
+        use tokio::io::AsyncReadExt;
+        let mut stream = self.stream.lock().await;
+        let mut noise = self.noise.lock().await;
+
+        // Read enough for a frame header: 8 bytes (MAGIC+VERSION+step+3byte_len)
+        let mut header = [0u8; 8];
+        stream.read_exact(&mut header).await
+            .map_err(|e| TransportError::Io(format!("TSO read header: {e}")))?;
+
+        let payload_len = ((header[5] as usize) << 16)
+            | ((header[6] as usize) << 8)
+            | (header[7] as usize);
+
+        let mut payload = vec![0u8; payload_len];
+        if payload_len > 0 {
+            stream.read_exact(&mut payload).await
+                .map_err(|e| TransportError::Io(format!("TSO read payload: {e}")))?;
+        }
+
+        noise.decrypt(&payload)
+            .map_err(|e| TransportError::Noise(format!("TSO decrypt: {e}")))
+    }
+
+    /// Encrypt data, prepend frame header, write to TCP stream.
+    pub async fn send(&self, data: &[u8]) -> Result<(), TransportError> {
+        use tokio::io::AsyncWriteExt;
+        let mut stream = self.stream.lock().await;
+        let mut noise = self.noise.lock().await;
+
+        let ct = noise.encrypt(data)
+            .map_err(|e| TransportError::Noise(format!("TSO encrypt: {e}")))?;
+
+        let frame = encode_handshake_frame(0, &ct);
+        stream.write_all(&frame).await
+            .map_err(|e| TransportError::Io(format!("TSO write: {e}")))?;
+
+        Ok(())
+    }
+
+    /// Send a keepalive PING frame to maintain NAT mapping.
+    pub async fn keepalive(&self) -> Result<(), TransportError> {
+        let ping = frame::encode_frame(1, frame::FrameType::Ping, &[]);
+        self.send(&ping).await
+    }
+
+    /// Spawn a background keepalive task.
+    pub fn spawn_keepalive(this: std::sync::Arc<Self>, interval_secs: u64) {
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(
+                std::time::Duration::from_secs(interval_secs),
+            );
+            loop {
+                interval.tick().await;
+                if this.keepalive().await.is_err() {
+                    break;
+                }
+            }
+        });
+    }
+}
+
 #[derive(Debug)]
 struct NoVerify;
 
@@ -281,7 +369,7 @@ impl Transport {
         tso_endpoints: &[SocketAddr],
         port_delta: Option<u16>,
         stun_rtt_ms: Option<u64>,
-    ) -> Result<(tokio::net::TcpStream, lain_noise::NoiseSession, SocketAddr), TransportError> {
+    ) -> Result<TsoStream, TransportError> {
         use tokio::net::TcpSocket;
         use tokio::net::TcpStream;
 
@@ -333,7 +421,7 @@ impl Transport {
 
             if let Some(stream) = rx.recv().await {
                 tracing::info!("TSO established");
-                return self.ts_handshake(stream).await;
+                return self.ts_handshake(stream, *_peer_id).await;
             }
 
             let jitter = if jitter_max.as_millis() > 0 {
@@ -353,7 +441,8 @@ impl Transport {
     async fn ts_handshake(
         &self,
         mut stream: tokio::net::TcpStream,
-    ) -> Result<(tokio::net::TcpStream, lain_noise::NoiseSession, SocketAddr), TransportError> {
+        peer_id: PeerId,
+    ) -> Result<TsoStream, TransportError> {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let our_noise_pk = {
             let secret = x25519_dalek::StaticSecret::from(self.noise_secret);
@@ -409,7 +498,7 @@ impl Transport {
         }
         let session = noise.into_transport()
             .map_err(|e| TransportError::Noise(format!("TSO transport: {e}")))?;
-        Ok((stream, session, "0.0.0.0:0".parse().unwrap_or_else(|_| "0.0.0.0:0".parse().unwrap())))
+        Ok(TsoStream::new(stream, session, peer_id))
     }
 
     /// 接受原始 QUIC 连接（包含 Noise IK + HEADERS）
