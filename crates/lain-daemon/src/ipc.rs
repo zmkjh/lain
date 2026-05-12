@@ -359,12 +359,15 @@ async fn dispatch(
             IpcResponse::Ok { message: Some("shutting down".into()), data: None }
         }
         IpcRequest::Send { peer_id, data } => {
-            if let Ok(pid) = PeerId::from_hex(&peer_id) {
-                // Decode base64
-                if let Ok(bytes) = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, &data) {
-                    send_or_warn(cmd_tx, IpcCommand::SendToPeer { peer_id: pid, data: bytes }, "send");
-                }
-            }
+            let pid = match PeerId::from_hex(&peer_id) {
+                Ok(p) => p,
+                Err(_) => return IpcResponse::Error { code: "INVALID_ID".into(), message: format!("invalid PeerID: {peer_id}") },
+            };
+            let bytes = match base64::Engine::decode(&base64::engine::general_purpose::STANDARD, &data) {
+                Ok(b) => b,
+                Err(e) => return IpcResponse::Error { code: "INVALID_DATA".into(), message: format!("base64 decode: {e}") },
+            };
+            send_or_warn(cmd_tx, IpcCommand::SendToPeer { peer_id: pid, data: bytes }, "send");
             IpcResponse::Ok { message: Some("sent".into()), data: None }
         }
     }
