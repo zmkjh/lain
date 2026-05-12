@@ -561,3 +561,118 @@ async fn test_multiple_transports_distinct_ports() {
     assert!(p1 > 0);
     assert!(p2 > 0);
 }
+
+// ── Test 5: TSO (TCP Simultaneous Open) ──
+
+#[tokio::test]
+async fn test_tso_handshake_and_exchange() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
+    let id_a = Identity::generate().ok().unwrap();
+    let id_b = Identity::generate().ok().unwrap();
+    let (ns_a, _np_a) = id_a.noise_keypair();
+    let (ns_b, np_b) = id_b.noise_keypair();
+
+    // Transport A will call ts_connect
+    let t_a = Transport::new(
+        TransportConfig { bind_addr: "127.0.0.1:0".parse().unwrap(), ..Default::default() },
+        ns_a, id_a.peer_id(), *id_a.public_key(),
+    ).unwrap();
+
+    let peer_b = id_b.peer_id();
+    let (addr_tx, addr_rx) = tokio::sync::oneshot::channel::<SocketAddr>();
+    let (ct_tx, ct_rx) = tokio::sync::oneshot::channel::<Vec<u8>>();
+
+    // Spawn TSO listener (same protocol as daemon's TSO listener)
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let tso_addr = listener.local_addr().unwrap();
+    addr_tx.send(tso_addr).ok();
+
+    tokio::spawn(async move {
+        loop {
+            let (mut stream, _) = match listener.accept().await {
+                Ok(c) => c,
+                Err(_) => continue,
+            };
+
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            use lain_noise::{NoiseHandshake, encode_handshake_frame, parse_frame_header};
+
+            // Exchange [PeerID:32 + noise_pk:32]
+            let mut our_info = [0u8; 64];
+            our_info[..32].copy_from_slice(&peer_b.0);
+            our_info[32..].copy_from_slice(&np_b);
+            if stream.write_all(&our_info).await.is_err() { continue; }
+
+            let mut their_info = [0u8; 64];
+            if stream.read_exact(&mut their_info).await.is_err() { continue; }
+            let their_id = PeerId(their_info[..32].try_into().unwrap());
+            let we_initiate = peer_b.0 < their_id.0;
+
+            let their_pk: &[u8; 32] = their_info[32..].try_into().unwrap();
+            let mut noise = if we_initiate {
+                match NoiseHandshake::new_initiator(&ns_b, their_pk) {
+                    Ok(n) => n,
+                    Err(_) => continue,
+                }
+            } else {
+                match NoiseHandshake::new_responder(&ns_b) {
+                    Ok(n) => n,
+                    Err(_) => continue,
+                }
+            };
+
+            // Noise IK handshake
+            if we_initiate {
+                if let Ok(ik1) = noise.write_message(&[]) {
+                    stream.write_all(&encode_handshake_frame(0, &ik1)).await.ok();
+                    let mut buf = vec![0u8; 4096];
+                    if let Ok(n) = stream.read(&mut buf).await {
+                        if let Ok(h) = parse_frame_header(&buf[..n]) {
+                            noise.read_message(&buf[8..8 + h.payload_len.min(n - 8)]).ok();
+                        }
+                    }
+                }
+            } else {
+                let mut buf = vec![0u8; 4096];
+                if let Ok(n) = stream.read(&mut buf).await {
+                    if let Ok(h) = parse_frame_header(&buf[..n]) {
+                        if noise.read_message(&buf[8..8 + h.payload_len.min(n - 8)]).is_ok() {
+                            if let Ok(ik2) = noise.write_message(&[]) {
+                                stream.write_all(&encode_handshake_frame(0, &ik2)).await.ok();
+                            }
+                        }
+                    }
+                }
+            }
+
+            match noise.into_transport() {
+                Ok(mut session) => {
+                    // Encrypt known plaintext — client will decrypt to verify shared key
+                    let ct = session.encrypt(b"hello tso").unwrap_or_default();
+                    ct_tx.send(ct).ok();
+                }
+                Err(_) => continue,
+            }
+            break;
+        }
+    });
+
+    let tso_addr = addr_rx.await.unwrap();
+
+    // ─── Client side: call ts_connect ───
+    let result = t_a.ts_connect(&id_b.peer_id(), &[tso_addr]).await;
+    assert!(result.is_ok(), "TSO connect must succeed: {:?}", result.err());
+
+    let (_stream, mut client_session, _peer) = result.unwrap();
+
+    // Verify server's ciphertext decrypts on client (proves handshake completed)
+    let server_ct = tokio::time::timeout(Duration::from_secs(5), ct_rx).await
+        .expect("server should send encrypted data")
+        .unwrap_or_default();
+    assert!(!server_ct.is_empty(), "server must produce non-empty ciphertext");
+
+    let plain = client_session.decrypt(&server_ct)
+        .expect("client must decrypt server's message");
+    assert_eq!(&plain[..], b"hello tso", "TSO cross-session encryption");
+}
