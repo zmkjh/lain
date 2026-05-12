@@ -953,4 +953,69 @@ mod tests {
         assert_eq!(derived_pk, noise_pubkey,
             "X25519 public key derived from noise_secret must match noise_keypair output");
     }
+
+    #[tokio::test]
+    async fn test_accept_connection_completes_noise_ik() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+
+        let id_a = Identity::generate().ok().unwrap();
+        let id_b = Identity::generate().ok().unwrap();
+        let (ns_a, _np_a) = id_a.noise_keypair();
+        let (ns_b, np_b) = id_b.noise_keypair();
+
+        let t_a = Transport::new(
+            TransportConfig { bind_addr: "127.0.0.1:0".parse().unwrap(), ..Default::default() },
+            ns_a, id_a.peer_id(), *id_a.public_key(),
+        ).unwrap();
+        let t_b = Arc::new(Transport::new(
+            TransportConfig { bind_addr: "127.0.0.1:0".parse().unwrap(), ..Default::default() },
+            ns_b, id_b.peer_id(), *id_b.public_key(),
+        ).unwrap());
+
+        let b_port = t_b.local_addr().unwrap().port();
+        let b_ep = Endpoint::new(
+            format!("127.0.0.1:{b_port}").parse().unwrap(),
+            EndpointKind::STUN,
+        );
+
+        // B accept loop
+        let t_b2 = t_b.clone();
+        let (conn_tx, mut conn_rx) = tokio::sync::mpsc::channel::<quinn::Connection>(1);
+        tokio::spawn(async move {
+            match t_b2.accept_connection().await {
+                Ok((conn, peer_id, noise_pk)) => {
+                    // PeerId is placeholder [0u8; 32] from accept_connection
+                    assert!(peer_id.0.iter().all(|&b| b == 0),
+                        "accept_connection returns zero placeholder PeerId");
+                    assert!(noise_pk.iter().any(|&b| b != 0),
+                        "Noise remote pubkey should be non-zero");
+                    conn_tx.send(conn).await.ok();
+                }
+                Err(e) => panic!("accept_connection failed: {e}"),
+            }
+        });
+
+        // A connects to B
+        let conn_a = t_a.connect_raw(&np_b, &[b_ep]).await
+            .expect("connect_raw should succeed");
+
+        let conn_b = tokio::time::timeout(
+            std::time::Duration::from_secs(5), conn_rx.recv(),
+        ).await.unwrap().unwrap();
+
+        // Verify both sides can open bi streams and exchange data
+        let (mut a_send, mut a_recv) = conn_a.open_bi().await.unwrap();
+        a_send.write_all(b"hello accept").await.unwrap();
+        a_send.finish().unwrap();
+
+        let (mut b_send, mut b_recv) = conn_b.accept_bi().await.unwrap();
+        let data = b_recv.read_to_end(65536).await.unwrap();
+        assert_eq!(&data, b"hello accept", "data roundtrip through accept_connection");
+
+        b_send.write_all(b"echo").await.unwrap();
+        b_send.finish().unwrap();
+
+        let echo = a_recv.read_to_end(65536).await.unwrap();
+        assert_eq!(&echo, b"echo");
+    }
 }

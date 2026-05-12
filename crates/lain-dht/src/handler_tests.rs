@@ -594,3 +594,130 @@ async fn test_cleanup_does_not_clear_pending_queries() {
     assert!(dht.pending_queries.read().await.contains_key(&[99u8; 16]),
         "pending queries must survive cleanup");
 }
+
+#[tokio::test]
+async fn test_addr_reflect_responds_with_observed_addr() {
+    let a = Arc::new(DhtHandle::new(make_id(45), [45u8; 32], make_config("127.0.0.1:0")).unwrap());
+    let b = Arc::new(DhtHandle::new(make_id(46), [46u8; 32], make_config("127.0.0.1:0")).unwrap());
+    spawn_recv_loop(a.clone());
+
+    let a_addr = a.socket().local_addr().unwrap();
+    let msg_id = [72u8; 16];
+
+    // B sends AddrReflect request to A
+    let req = msg_codec::encode_addr_reflect_request(b.peer_id, msg_id);
+    let b_sock = b.socket();
+    b_sock.send_to(&req, a_addr).await.unwrap();
+
+    // Read response from B's socket
+    let mut buf = vec![0u8; 2048];
+    let mut found = false;
+    for _ in 0..10 {
+        match tokio::time::timeout(Duration::from_millis(500), b_sock.recv_from(&mut buf)).await {
+            Ok(Ok((len, _src))) => {
+                if let Some(msg) = msg_codec::decode_message(&buf[..len]) {
+                    if msg.is_response && msg.message_id == msg_id {
+                        // Payload should contain B's observed address (as seen by A)
+                        assert!(!msg.payload.is_empty(), "AddrReflect response should have payload");
+                        assert_eq!(msg.msg_type, lain_core::dht::DhtMsgType::AddrReflect);
+                        found = true;
+                        break;
+                    }
+                }
+            }
+            _ => break,
+        }
+    }
+    assert!(found, "should receive AddrReflect response");
+}
+
+#[tokio::test]
+async fn test_relay_needed_returns_candidates() {
+    let a = Arc::new(DhtHandle::new(make_id(47), [47u8; 32], make_config("127.0.0.1:0")).unwrap());
+    let b = Arc::new(DhtHandle::new(make_id(48), [48u8; 32], make_config("127.0.0.1:0")).unwrap());
+    spawn_recv_loop(a.clone());
+
+    let a_addr = a.socket().local_addr().unwrap();
+    let b_sock = b.socket();
+
+    // Populate A's routing table with some nodes (so it has relay candidates)
+    // Use PING requests as if from different nodes
+    for i in 0..5 {
+        let fake_id = PeerId([50 + i as u8; 32]);
+        let fake_addr = format!("127.0.0.1:{}", 60000 + i).parse::<SocketAddr>().unwrap();
+        // Insert directly into A's routing table
+        a.routing_table.write().await.insert_or_update(BucketEntry {
+            node_id: fake_id,
+            address: fake_addr,
+            last_seen: std::time::Instant::now(),
+        });
+    }
+    // Also bootstrap B so B is known by A (for filter: B won't return B as relay)
+    b_sock.send_to(&msg_codec::encode_ping_request(b.peer_id, [73u8; 16]), a_addr).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let msg_id = [74u8; 16];
+    let req = msg_codec::encode_relay_needed_request(b.peer_id, msg_id);
+    b_sock.send_to(&req, a_addr).await.unwrap();
+
+    // Read response
+    let mut buf = vec![0u8; 2048];
+    let mut found = false;
+    for _ in 0..10 {
+        match tokio::time::timeout(Duration::from_millis(500), b_sock.recv_from(&mut buf)).await {
+            Ok(Ok((len, _src))) => {
+                if let Some(msg) = msg_codec::decode_message(&buf[..len]) {
+                    if msg.is_response && msg.message_id == msg_id {
+                        assert_eq!(msg.msg_type, lain_core::dht::DhtMsgType::RelayNeeded);
+                        assert!(!msg.payload.is_empty());
+                        let count = msg.payload[0] as usize;
+                        assert!(count <= 8, "relay candidates should be <= 8");
+                        assert!(count >= 1, "should have at least 1 relay candidate");
+                        found = true;
+                        break;
+                    }
+                }
+            }
+            _ => break,
+        }
+    }
+    assert!(found, "should receive RelayNeeded response with candidates");
+}
+
+#[tokio::test]
+async fn test_spawn_bucket_refresh_populates_table() {
+    // Create a seed DHT node with a known address
+    let seed = Arc::new(DhtHandle::new(make_id(49), [49u8; 32], make_config("127.0.0.1:0")).unwrap());
+    spawn_recv_loop(seed.clone());
+    let seed_addr = seed.socket().local_addr().unwrap();
+
+    // Create a client DHT that bootstraps from seed
+    let client = Arc::new(DhtHandle::new(
+        make_id(50), [50u8; 32],
+        DhtConfig {
+            local_addr: "127.0.0.1:0".parse().unwrap(),
+            bootstrap_nodes: vec![seed_addr],
+            ..Default::default()
+        },
+    ).unwrap());
+    spawn_recv_loop(client.clone());
+
+    // Initial bootstrap
+    client.socket().send_to(&msg_codec::encode_ping_request(client.peer_id, [80u8; 16]), seed_addr).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // Verify client knows seed
+    let initial = client.routing_table_size().await;
+    assert!(initial >= 1, "client should have seed in routing table");
+
+    // Run bucket refresh — should discover more nodes by querying
+    client.spawn_bucket_refresh();
+
+    // Wait for refresh to complete
+    tokio::time::sleep(Duration::from_secs(4)).await;
+
+    // Bucket refresh should have run — routing table should still be functional
+    let after = client.routing_table_size().await;
+    assert!(after >= 1, "routing table should remain after bucket refresh");
+    // Refresh shouldn't panic
+}

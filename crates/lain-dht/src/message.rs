@@ -336,6 +336,16 @@ pub fn encode_relay_needed_response(
     encode_message(sender_id, message_id, DhtMsgType::RelayNeeded, true, &payload, None)
 }
 
+/// ADDR_REFLECT request
+pub fn encode_addr_reflect_request(sender_id: PeerId, message_id: [u8; 16]) -> Vec<u8> {
+    encode_message(sender_id, message_id, DhtMsgType::AddrReflect, false, &[], None)
+}
+
+/// RELAY_NEEDED request
+pub fn encode_relay_needed_request(sender_id: PeerId, message_id: [u8; 16]) -> Vec<u8> {
+    encode_message(sender_id, message_id, DhtMsgType::RelayNeeded, false, &[], None)
+}
+
 /// Parse node list from payload (common pattern in PING/FIND_NODE responses)
 /// Returns Vec of (PeedId, SocketAddr)
 pub fn parse_nodes_from_payload(payload: &[u8]) -> Option<Vec<(PeerId, SocketAddr)>> {
