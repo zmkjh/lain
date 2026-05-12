@@ -259,6 +259,8 @@ fn read_line_timeout(reader: &mut BufReader<IpcStream>, timeout_secs: u64) -> st
         }
     }
 }
+
+fn ipc_req(socket_path: &PathBuf, json: &str) -> Option<serde_json::Value> {
     let mut stream = IpcStream::connect(socket_path).ok()?;
     let req = json.to_string() + "\n";
     stream.write_all(req.as_bytes()).ok()?;
