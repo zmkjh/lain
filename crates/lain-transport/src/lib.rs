@@ -627,18 +627,17 @@ impl Transport {
         let _session = noise.into_transport()
             .map_err(|e| TransportError::Noise(format!("transport: {e}")))?;
 
-        // Receive HEADERS on stream 1, send response
+        // Receive HEADERS on stream 1, send response (synchronous — prevents
+        // race between this and caller's accept_bi for relay/DHT_ADDR parsing).
         let conn2 = conn.clone();
-        tokio::spawn(async move {
-            if let Ok((mut hd_send, mut hd_recv)) = conn2.accept_bi().await {
-                let mut buf = vec![0u8; 1024];
-                if let Ok(Some(_n)) = hd_recv.read(&mut buf).await {
-                    let resp = frame::encode_frame(1, FrameType::Headers, b"{}");
-                    hd_send.write_all(&resp).await.ok();
-                    hd_send.finish().ok();
-                }
+        if let Ok((mut hd_send, mut hd_recv)) = conn2.accept_bi().await {
+            let mut buf = vec![0u8; 1024];
+            if let Ok(Some(_n)) = hd_recv.read(&mut buf).await {
+                let resp = frame::encode_frame(1, FrameType::Headers, b"{}");
+                hd_send.write_all(&resp).await.ok();
+                hd_send.finish().ok();
             }
-        });
+        }
 
         // NOTE: Noise IK uses X25519 keys, but PeerID = SHA256(Ed25519 public key).
         // The correct PeerID is obtained later via DHT bridge exchange (DHT_ADDR).
