@@ -327,7 +327,7 @@ RelayConnect payload: [requester_peer_id: 32 bytes] [target_peer_id: 32 bytes]
 
 ```json
 → {"cmd":"ListPeers"}
-← {"type":"Ok","data":{"peer_id":"...","nat_type":"APDFSymmetric","ipv6":true,"dht_nodes":0,"known_peers":1,"connected_peers":1,"peers":["..."]}}
+← {"type":"Ok","data":{"peer_id":"...","nat_type":"APDFSymmetric","ipv6":true,"ipv6_addr":"2001:db8::1","port_delta":1,"stun_rtt_ms":45,"dht_nodes":3,"known_peers":5,"connected_peers":2,"peers":["..."]}}
 ```
 
 #### Send — 发送数据到已连接 peer

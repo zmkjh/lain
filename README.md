@@ -69,7 +69,9 @@ $ lain disconnect f8df8b59c08df278
 $ lain status
 PeerID:    f8df8b59c08df278
 NAT:       APDFSymmetric
-IPv6:      yes
+IPv6:      2001:db8::1
+Port:      port-preserving (delta=1)
+STUN RTT:  45ms
 DHT nodes: 3
 Known:     5
 Connected: 2
