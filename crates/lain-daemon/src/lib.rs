@@ -1239,7 +1239,7 @@ impl Daemon {
                                 data: None,
                             });
                         }
-                        IpcCommand::SendToPeer { peer_id, data } => {
+                        IpcCommand::SendToPeer { peer_id, data, reply } => {
                             let cons = connected.read().await;
                             match cons.get(&peer_id) {
                                 Some(ActiveConnection::Quic(conn, _)) => {
@@ -1248,24 +1248,48 @@ impl Daemon {
                                         Ok((mut send, _recv)) => {
                                             if let Err(e) = send.write_all(&msg).await {
                                                 tracing::warn!("send to {peer_id}: {e}");
+                                                let _ = reply.send(IpcResponse::Error {
+                                                    code: "SEND_FAILED".into(),
+                                                    message: format!("write: {e}"),
+                                                });
                                             } else {
                                                 let _ = send.finish();
                                                 tracing::debug!("sent {}b to {peer_id}", data.len());
+                                                let _ = reply.send(IpcResponse::Ok {
+                                                    message: Some("sent".into()), data: None,
+                                                });
                                             }
                                         }
-                                        Err(e) => tracing::warn!("open stream to {peer_id}: {e}"),
+                                        Err(e) => {
+                                            tracing::warn!("open stream to {peer_id}: {e}");
+                                            let _ = reply.send(IpcResponse::Error {
+                                                code: "SEND_FAILED".into(),
+                                                message: format!("open: {e}"),
+                                            });
+                                        }
                                     }
                                 }
                                 Some(ActiveConnection::Tso(tso)) => {
                                     let msg = frame::encode_frame(2, FrameType::Data, &data);
                                     if let Err(e) = tso.send(&msg).await {
                                         tracing::warn!("TSO send to {peer_id}: {e}");
+                                        let _ = reply.send(IpcResponse::Error {
+                                            code: "SEND_FAILED".into(),
+                                            message: format!("TSO: {e}"),
+                                        });
                                     } else {
                                         tracing::debug!("TSO sent {}b to {peer_id}", data.len());
+                                        let _ = reply.send(IpcResponse::Ok {
+                                            message: Some("sent".into()), data: None,
+                                        });
                                     }
                                 }
                                 None => {
                                     tracing::warn!("no active connection to {peer_id}");
+                                    let _ = reply.send(IpcResponse::Error {
+                                        code: "NOT_CONNECTED".into(),
+                                        message: format!("no active connection to {peer_id}"),
+                                    });
                                 }
                             };
                         }

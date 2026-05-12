@@ -56,7 +56,7 @@ pub enum IpcCommand {
     FindPeer { peer_id: String },
     DisconnectPeer { peer_id: PeerId },
     Shutdown,
-    SendToPeer { peer_id: PeerId, data: Vec<u8> },
+    SendToPeer { peer_id: PeerId, data: Vec<u8>, reply: tokio::sync::oneshot::Sender<IpcResponse> },
     GetStatus { reply: tokio::sync::oneshot::Sender<serde_json::Value> },
     GetWhoami { reply: tokio::sync::oneshot::Sender<String> },
     GetInviteCode { reply: tokio::sync::oneshot::Sender<String> },
@@ -370,8 +370,12 @@ async fn dispatch(
                 Ok(b) => b,
                 Err(e) => return IpcResponse::Error { code: "INVALID_DATA".into(), message: format!("base64 decode: {e}") },
             };
-            send_or_warn(cmd_tx, IpcCommand::SendToPeer { peer_id: pid, data: bytes }, "send");
-            IpcResponse::Ok { message: Some("sent".into()), data: None }
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            send_or_warn(cmd_tx, IpcCommand::SendToPeer { peer_id: pid, data: bytes, reply: tx }, "send");
+            match rx.await {
+                Ok(resp) => resp,
+                Err(_) => IpcResponse::Error { code: "TIMEOUT".into(), message: "daemon busy".into() },
+            }
         }
     }
 }

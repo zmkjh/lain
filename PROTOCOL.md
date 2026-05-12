@@ -333,10 +333,17 @@ RelayConnect payload: [requester_peer_id: 32 bytes] [target_peer_id: 32 bytes]
 #### Send — 发送数据到已连接 peer
 
 `data` 字段为 Base64 编码的字节。`peer_id` 必须为 64 位十六进制 PeerID。
+Send 是同步操作——daemon 确认数据已提交后返回响应。
 
 ```json
 → {"cmd":"Send","peer_id":"a1b2c3d4","data":"aGVsbG8="}
 ← {"type":"Ok","message":"sent"}
+
+→ {"cmd":"Send","peer_id":"a1b2c3d4","data":"aGVsbG8="}
+← {"type":"Error","code":"NOT_CONNECTED","message":"no active connection to a1b2c3d4"}
+
+→ {"cmd":"Send","peer_id":"a1b2c3d4","data":"aGVsbG8="}
+← {"type":"Error","code":"SEND_FAILED","message":"open: ..."}
 
 → {"cmd":"Send","peer_id":"invalid","data":"aGVsbG8="}
 ← {"type":"Error","code":"INVALID_ID","message":"invalid PeerID: invalid"}
@@ -344,9 +351,6 @@ RelayConnect payload: [requester_peer_id: 32 bytes] [target_peer_id: 32 bytes]
 → {"cmd":"Send","peer_id":"a1b2c3d4","data":"!!base64??"}
 ← {"type":"Error","code":"INVALID_DATA","message":"base64 decode: ..."}
 ```
-
-> 💡 `Send` 是 fire-and-forget 异步操作。"sent" 仅表示数据已提交，不保证 peer 已收到。
-> 如果 peer 离线，daemon 内部记录 warn 但不向 IPC 返回错误。
 
 #### Subscribe — 订阅事件流
 
