@@ -1309,16 +1309,17 @@ impl Daemon {
                             let rt_size = dht_arc.routing_table_size().await;
                             let known = known_peers.read().await.len();
                             let active = connected.read().await.len();
-        let peers: Vec<String> = connected.read().await.keys()
-            .map(|p| p.to_string())
-            .collect();
                             let peers: Vec<String> = connected.read().await.keys()
                                 .map(|p| p.to_string())
                                 .collect();
+                            let ipv6_addr_str = ipv6_addr.map(|a| a.ip().to_string());
                             let _ = reply.send(serde_json::json!({
                                 "peer_id": peer_id.to_string(),
                                 "nat_type": format!("{:?}", nat_result.nat_type),
                                 "ipv6": nat_result.ipv6_inbound,
+                                "ipv6_addr": ipv6_addr_str,
+                                "port_delta": nat_result.port_delta,
+                                "stun_rtt_ms": nat_result.stun_rtt_ms,
                                 "dht_nodes": rt_size,
                                 "known_peers": known,
                                 "connected_peers": active,

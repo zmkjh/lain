@@ -455,7 +455,10 @@ fn print_status(v: &serde_json::Value) {
     let data = v.get("data").and_then(|d| d.as_object());
     let pid = data.and_then(|d| d.get("peer_id")).and_then(|p| p.as_str()).unwrap_or("?");
     let nat = data.and_then(|d| d.get("nat_type")).and_then(|p| p.as_str()).unwrap_or("?");
-    let ipv6 = data.and_then(|d| d.get("ipv6")).and_then(|p| p.as_bool()).unwrap_or(false);
+    let ipv6_avail = data.and_then(|d| d.get("ipv6")).and_then(|p| p.as_bool()).unwrap_or(false);
+    let ipv6_addr = data.and_then(|d| d.get("ipv6_addr")).and_then(|p| p.as_str()).unwrap_or("none");
+    let port_delta = data.and_then(|d| d.get("port_delta")).and_then(|p| p.as_u64());
+    let rtt = data.and_then(|d| d.get("stun_rtt_ms")).and_then(|p| p.as_u64());
     let dht = data.and_then(|d| d.get("dht_nodes")).and_then(|p| p.as_u64()).unwrap_or(0);
     let known = data.and_then(|d| d.get("known_peers")).and_then(|p| p.as_u64()).unwrap_or(0);
     let active = data.and_then(|d| d.get("connected_peers")).and_then(|p| p.as_u64()).unwrap_or(0);
@@ -464,7 +467,16 @@ fn print_status(v: &serde_json::Value) {
 
     println!("PeerID:    {pid}");
     println!("NAT:       {nat}");
-    println!("IPv6:      {}", if ipv6 { "yes" } else { "no" });
+    if ipv6_avail {
+        println!("IPv6:      {ipv6_addr}");
+    } else {
+        println!("IPv6:      no");
+    }
+    if let Some(d) = port_delta {
+        let kind = if d == 1 { "port-preserving" } else if d > 1 { "fixed-offset" } else { "unknown" };
+        println!("Port:      {kind} (delta={d})");
+    }
+    if let Some(r) = rtt { println!("STUN RTT:  {r}ms"); }
     println!("DHT nodes: {dht}");
     println!("Known:     {known}");
     println!("Connected: {active}");
