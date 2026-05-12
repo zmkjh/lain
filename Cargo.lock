@@ -820,7 +820,7 @@ dependencies = [
 
 [[package]]
 name = "lain-cli"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "base64",
  "clap",
@@ -837,7 +837,7 @@ dependencies = [
 
 [[package]]
 name = "lain-core"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "async-trait",
  "bytes",
@@ -852,7 +852,7 @@ dependencies = [
 
 [[package]]
 name = "lain-daemon"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "base64",
  "ed25519-dalek",
@@ -883,7 +883,7 @@ dependencies = [
 
 [[package]]
 name = "lain-dht"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "async-trait",
  "bincode",
@@ -902,7 +902,7 @@ dependencies = [
 
 [[package]]
 name = "lain-discovery"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "lain-core",
  "lain-dht",
@@ -914,7 +914,7 @@ dependencies = [
 
 [[package]]
 name = "lain-identity"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "ed25519-dalek",
  "lain-core",
@@ -930,7 +930,7 @@ dependencies = [
 
 [[package]]
 name = "lain-nat"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "async-trait",
  "bytes",
@@ -943,7 +943,7 @@ dependencies = [
 
 [[package]]
 name = "lain-noise"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "lain-core",
  "rand 0.8.6",
@@ -955,7 +955,7 @@ dependencies = [
 
 [[package]]
 name = "lain-transport"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "async-trait",
  "bytes",
