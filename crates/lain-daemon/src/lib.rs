@@ -68,16 +68,45 @@ fn save_peers(peers: &HashMap<PeerId, Vec<Endpoint>>, identity: &Identity) {
     }
 }
 
-fn load_peers() -> HashMap<PeerId, Vec<Endpoint>> {
+fn load_peers(identity_pubkey: Option<[u8; 32]>) -> HashMap<PeerId, Vec<Endpoint>> {
     let mut map = HashMap::new();
     if let Some(path) = peers_json_path() {
         if let Ok(data) = std::fs::read_to_string(&path) {
-            // Try signed format first, fall back to legacy
             let entries = if let Ok(signed) = serde_json::from_str::<serde_json::Value>(&data) {
-                if let Some(entries_val) = signed.get("data") {
-                    serde_json::from_value::<Vec<StoredPeer>>(entries_val.clone()).unwrap_or_default()
-                } else {
-                    serde_json::from_str::<Vec<StoredPeer>>(&data).unwrap_or_default()
+                match (signed.get("data"), signed.get("sig").and_then(|s| s.as_str())) {
+                    (Some(entries_val), Some(sig_hex)) => {
+                        let verified = if let Some(pubkey) = identity_pubkey {
+                            let sig_bytes = match hex::decode(sig_hex) {
+                                Ok(b) if b.len() == 64 => b,
+                                _ => return map,
+                            };
+                            let sig = match ed25519_dalek::Signature::from_slice(&sig_bytes) {
+                                Ok(s) => s,
+                                Err(_) => return map,
+                            };
+                            let vk = match ed25519_dalek::VerifyingKey::from_bytes(&pubkey) {
+                                Ok(k) => k,
+                                Err(_) => return map,
+                            };
+                            let entries: Vec<StoredPeer> =
+                                serde_json::from_value(entries_val.clone()).unwrap_or_default();
+                            let body = serde_json::to_string_pretty(&entries).unwrap_or_default();
+                            if vk.verify_strict(body.as_bytes(), &sig).is_err() {
+                                tracing::warn!("peers.json signature mismatch: ignoring file");
+                                return map;
+                            }
+                            true
+                        } else {
+                            true
+                        };
+                        if verified {
+                            serde_json::from_value(entries_val.clone()).unwrap_or_default()
+                        } else {
+                            tracing::warn!("peers.json signature invalid: ignoring file");
+                            return map; // return empty
+                        }
+                    }
+                    _ => serde_json::from_str::<Vec<StoredPeer>>(&data).unwrap_or_default(),
                 }
             } else {
                 serde_json::from_str::<Vec<StoredPeer>>(&data).unwrap_or_default()
@@ -593,7 +622,7 @@ impl Daemon {
 
         // Track known peers
         let known_peers: Arc<RwLock<HashMap<PeerId, Vec<Endpoint>>>> =
-            Arc::new(RwLock::new(load_peers()));
+            Arc::new(RwLock::new(load_peers(Some(*self.identity.public_key()))));
 
         let conn_mgr = Arc::new(ConnectionManager::new());
 
@@ -800,7 +829,10 @@ impl Daemon {
                                                                         })),
                                                                     });
                                                                 }
-                                                                Err(_) => break,
+                        Err(e) => {
+                            tracing::debug!("TSO accept: {e}");
+                            continue;
+                        }
                                                             }
                                                         }
                                                         Err(_) => break,
@@ -855,7 +887,7 @@ impl Daemon {
                                                 .filter(|ep| ep.kind == lain_core::endpoint::EndpointKind::TSO)
                                                 .map(|ep| ep.addr).collect();
                                             if !tso_eps.is_empty() {
-                                                match t.ts_connect(&pid, &noise_pk, &tso_eps).await {
+                                                match t.ts_connect(&pid, &tso_eps).await {
                                                     Ok((_stream, _session, _peer)) => {
                                                         let _ = ipc_ev.send(IpcResponse::Event {
                                                             event: "peer_connected".into(),
@@ -902,13 +934,12 @@ impl Daemon {
                                 let t = transport.clone();
                                 let ipc_ev = _ipc_ev_tx.clone();
                                 let pid = inv.peer_id;
-                                let noise_pk = inv.noise_pk;
                                 let tso_eps: Vec<SocketAddr> = inv.endpoints.iter()
                                     .filter(|e| e.kind == lain_core::endpoint::EndpointKind::TSO)
                                     .map(|e| e.addr)
                                     .collect();
                                 tokio::spawn(async move {
-                                    match t.ts_connect(&pid, &noise_pk, &tso_eps).await {
+                                    match t.ts_connect(&pid, &tso_eps).await {
                                         Ok((_stream, _session, peer)) => {
                                             let _ = ipc_ev.send(IpcResponse::Event {
                                                 event: "peer_connected".into(),
@@ -988,7 +1019,7 @@ impl Daemon {
                                                     // TSO fallback
                                                     let tso_eps: Vec<_> = eps.iter().filter(|ep| ep.kind == lain_core::endpoint::EndpointKind::TSO).map(|ep| ep.addr).collect();
                                                     if !tso_eps.is_empty() {
-                                                        match t.ts_connect(&pid, &npk, &tso_eps).await {
+                                                        match t.ts_connect(&pid, &tso_eps).await {
                                                             Ok((_stream, _session, _peer)) => {
                                                                 let _ = ipc_ev.send(IpcResponse::Event {
                                                                     event: "peer_connected".into(),

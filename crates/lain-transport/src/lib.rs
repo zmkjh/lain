@@ -280,7 +280,6 @@ impl Transport {
     pub async fn ts_connect(
         &self,
         _peer_id: &PeerId,
-        our_noise_pk: &[u8; 32],
         tso_endpoints: &[SocketAddr],
     ) -> Result<(tokio::net::TcpStream, lain_noise::NoiseSession, SocketAddr), TransportError> {
         use tokio::net::TcpStream;
@@ -307,9 +306,14 @@ impl Transport {
         tracing::info!("TSO established");
         // Exchange [PeerID:32 + noise_pk:32] to determine Noise IK role
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let our_noise_pk = {
+            let secret = x25519_dalek::StaticSecret::from(self.noise_secret);
+            let public = x25519_dalek::PublicKey::from(&secret);
+            public.to_bytes()
+        };
         let mut our_info = [0u8; 64];
         our_info[..32].copy_from_slice(&self.peer_id.0);
-        our_info[32..].copy_from_slice(our_noise_pk);
+        our_info[32..].copy_from_slice(&our_noise_pk);
         stream.write_all(&our_info).await
             .map_err(|e| TransportError::Io(format!("TSO send id: {e}")))?;
         let mut their_info = [0u8; 64];
@@ -481,7 +485,7 @@ impl Transport {
             .map_err(|e| TransportError::Io(format!("send ik2: {e}")))?;
         let _ = send.finish();
 
-        let remote_pk = noise.remote_pubkey().unwrap_or([0u8; 32]);
+        let remote_noise_pk = noise.remote_pubkey().unwrap_or([0u8; 32]);
         let _session = noise.into_transport()
             .map_err(|e| TransportError::Noise(format!("transport: {e}")))?;
 
@@ -498,11 +502,14 @@ impl Transport {
             }
         });
 
-        let remote_peer_id = PeerId::from_pubkey(&remote_pk);
+        // NOTE: Noise IK uses X25519 keys, but PeerID = SHA256(Ed25519 public key).
+        // The correct PeerID is obtained later via DHT bridge exchange (DHT_ADDR).
+        // Return a placeholder; callers must not rely on this value.
+        let remote_peer_id = PeerId([0u8; 32]);
 
         tracing::info!("incoming connection from {remote_peer_id}");
 
-        Ok((conn, remote_peer_id, remote_pk))
+        Ok((conn, remote_peer_id, remote_noise_pk))
     }
 
     async fn connect_internal(

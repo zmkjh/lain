@@ -199,9 +199,17 @@ impl DhtHandle {
     fn random_id_in_bucket(&self, bucket_idx: usize) -> PeerId {
         let mut id = self.peer_id.0;
         if bucket_idx < 256 {
+            // Randomize all bits less significant than bucket_idx
+            for b in 0..bucket_idx {
+                let byte_idx = 31 - b / 8;
+                let bit_idx = b % 8;
+                if rand::random::<bool>() {
+                    id[byte_idx] ^= 1u8 << bit_idx;
+                }
+            }
+            // Flip the defining bit for this bucket
             let byte_idx = 31 - bucket_idx / 8;
             let bit_idx = bucket_idx % 8;
-            // Flip the bit at bucket_idx to create a target in that bucket
             id[byte_idx] ^= 1u8 << bit_idx;
         }
         PeerId(id)
@@ -398,7 +406,6 @@ impl DhtHandle {
                 if before != records.len() {
                     tracing::debug!("DHT cleanup: removed {} expired", before - records.len());
                 }
-                this.pending_queries.write().await.clear();
                 this.peer_ratelimit.write().await.clear();
             }
         });
@@ -621,7 +628,7 @@ impl DhtHandle {
                 let payload = &msg.payload;
                 if !payload.is_empty() && payload[0] == 1 {
                     if let Some(record) = msg_codec::parse_record_from_payload(&payload[1..]) {
-                        let peer_id = PeerId(msg.sender_id.0);
+                        let peer_id = PeerId(sha2::Sha256::digest(&record.pubkey).into());
                         let _ = self.event_tx.send(CoreDhtEvent::PeerDiscovered(
                             peer_id,
                             record.into_core(&peer_id),

@@ -855,6 +855,7 @@ name = "lain-daemon"
 version = "0.1.0"
 dependencies = [
  "base64",
+ "ed25519-dalek",
  "futures",
  "hex",
  "if-addrs",
@@ -973,6 +974,7 @@ dependencies = [
  "tokio",
  "tokio-tungstenite",
  "tracing",
+ "x25519-dalek",
 ]
 
 [[package]]

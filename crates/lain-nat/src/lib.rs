@@ -139,6 +139,8 @@ impl NatProbe {
         let mut packet = if change_request {
             // With CHANGE-REQUEST attribute (type 0x0003, length 4)
             let mut p = vec![0u8; 28];
+            p[2] = 0x00; // message length = 8
+            p[3] = 0x08;
             p[20] = 0x00; // CHANGE-REQUEST
             p[21] = 0x03;
             p[22] = 0x00; // length
