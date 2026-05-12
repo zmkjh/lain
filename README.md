@@ -119,7 +119,22 @@ lain connect / lain find
   └─ ④ 失败（所有路径不通）
 ```
 
-TSO 专为 CGNAT（中国移动/校园网对称 NAT）设计——双方各用 8 个端口同时 bind+connect，IANA ephemeral 附近 (50000-50007)，400ms RTT 容忍，jitter 避免限速。
+TSO 是 Lain 专门针对 CGNAT（中国移动/校园网对称 NAT）的最后一层穿透手段。
+
+**原理**：TCP Simultaneous Open — 双方各用 `TcpSocket.bind(5000X).connect(对端 5000X)` 从同一端口发起连接。出站 SYN 在各自 NAT 上创建映射，对端 SYN 交叉抵达，完成握手。无需 TcpListener，纯 bind+connect。
+
+**自适应参数**：
+| NAT 类型 | 内部端口数 | 超时 | 间隔 |
+|---|---|---|---|
+| 端口保持型（探测 delta=1） | 4 | 依 RTT | 200ms |
+| 随机端口型（未知） | 8 | 依 RTT | 300ms |
+| RTT < 100ms | — | 200ms | — |
+| RTT < 300ms | — | 400ms | — |
+| RTT > 300ms | — | 600ms | — |
+
+**使用条件**：双方必须在 102s 内同时运行 `lain tso <对端 invite>`。8×8=64 对组合并发，±50ms jitter 避免 CGNAT 限速。
+
+**端口范围**：50000-50007（IANA ephemeral 49K-65K 内，CGNAT 可识别）。
 
 ## IPC 事件
 
