@@ -495,7 +495,6 @@ impl Daemon {
         let transport_accept = transport.clone();
         let dht_accept = dht_for_mdns.clone();
         let public_dht_accept = public_dht_addr;
-        let connected_accept = connected.clone();
         let ipc_ev_accept = _ipc_ev_tx.clone();
         let peer_id_accept = peer_id;
         tokio::spawn(async move {
@@ -553,7 +552,6 @@ impl Daemon {
                             }
                         });
                         // Spawn reader loop for subsequent data streams
-                        let _connected_a = connected_accept.clone();
                         let ipc_ev_a = ipc_ev_accept.clone();
                         let pid_a = _peer_id;
                         tokio::spawn(async move {
