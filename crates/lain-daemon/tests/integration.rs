@@ -9,6 +9,7 @@ use std::time::Duration;
 
 use lain_core::capabilities::Capabilities;
 use lain_core::endpoint::{Endpoint, EndpointKind};
+use lain_core::frame::{self, FrameType};
 use lain_core::identity::IdentityProvider;
 use lain_core::peer::PeerId;
 use lain_identity::Identity;
@@ -674,4 +675,261 @@ async fn test_tso_handshake_and_exchange() {
         .expect("server should send encrypted data")
         .unwrap_or_default();
     assert!(!server_ct.is_empty(), "server must produce non-empty ciphertext");
+}
+
+// ── Test 6: QUIC direct + reader loop (data plane end-to-end) ──
+
+#[tokio::test]
+async fn test_quic_direct_reader_receives_data() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
+    let id_a = Identity::generate().ok().unwrap();
+    let id_b = Identity::generate().ok().unwrap();
+    let (ns_a, _np_a) = id_a.noise_keypair();
+    let (ns_b, np_b) = id_b.noise_keypair();
+
+    let t_a = Transport::new(
+        TransportConfig { bind_addr: "127.0.0.1:0".parse().unwrap(), ..Default::default() },
+        ns_a, id_a.peer_id(), *id_a.public_key()).unwrap();
+    let t_b = Arc::new(Transport::new(
+        TransportConfig { bind_addr: "127.0.0.1:0".parse().unwrap(), ..Default::default() },
+        ns_b, id_b.peer_id(), *id_b.public_key()).unwrap());
+
+    let b_addr: SocketAddr = format!("127.0.0.1:{}", t_b.local_addr().unwrap().port()).parse().unwrap();
+
+    // B: accept → spawn reader loop (mimics daemon accept path)
+    let t_b2 = t_b.clone();
+    let (b_data_tx, mut b_data_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(4);
+    tokio::spawn(async move {
+        match t_b2.accept_connection().await {
+            Ok((conn, _, _)) => {
+                // Reader loop: accept_bi → read_to_end → channel
+                tokio::spawn(async move {
+                    loop {
+                        match conn.accept_bi().await {
+                            Ok((_send, mut recv)) => {
+                                match recv.read_to_end(65536).await {
+                                    Ok(data) => {
+                                        if b_data_tx.send(data).await.is_err() { break; }
+                                    }
+                                    Err(_) => break,
+                                }
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                });
+            }
+            Err(_) => {}
+        }
+    });
+
+    // Give B's accept loop time to start
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    // A: connect → open bi stream → send data
+    let conn = t_a.connect_raw(&np_b, &[Endpoint::new(b_addr, EndpointKind::STUN)])
+        .await.expect("connect_raw should succeed");
+
+    let (mut s, _) = conn.open_bi().await.unwrap();
+    s.write_all(b"reader test").await.unwrap();
+    s.finish().unwrap();
+
+    // B's reader loop should receive the data
+    let data = tokio::time::timeout(Duration::from_secs(5), b_data_rx.recv()).await
+        .unwrap().unwrap();
+    assert_eq!(&data, b"reader test");
+}
+
+// ── Test 7: TSO data plane (TsoStream recv/send/keepalive) ──
+
+#[tokio::test]
+async fn test_tso_data_plane_send_recv() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
+    let id_a = Identity::generate().ok().unwrap();
+    let id_b = Identity::generate().ok().unwrap();
+    let (ns_a, _np_a) = id_a.noise_keypair();
+    let (ns_b, np_b) = id_b.noise_keypair();
+
+    let t_a = Transport::new(
+        TransportConfig { bind_addr: "127.0.0.1:0".parse().unwrap(), ..Default::default() },
+        ns_a, id_a.peer_id(), *id_a.public_key()).unwrap();
+
+    let peer_b = id_b.peer_id();
+    let (addr_tx, addr_rx) = tokio::sync::oneshot::channel::<SocketAddr>();
+
+    // B: spawn mock TSO listener → handshake → TsoStream → reader loop
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let tso_addr = listener.local_addr().unwrap();
+    addr_tx.send(tso_addr).ok();
+
+    let (b_data_tx, mut b_data_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(4);
+    let ns_b2 = ns_b;
+    let np_b2 = np_b;
+
+    tokio::spawn(async move {
+        loop {
+            let (mut stream, _) = match listener.accept().await { Ok(c) => c, Err(_) => break };
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            use lain_noise::{NoiseHandshake, encode_handshake_frame, parse_frame_header};
+
+            let mut our_info = [0u8; 64];
+            our_info[..32].copy_from_slice(&peer_b.0);
+            our_info[32..].copy_from_slice(&np_b2);
+            if stream.write_all(&our_info).await.is_err() { continue; }
+
+            let mut their_info = [0u8; 64];
+            if stream.read_exact(&mut their_info).await.is_err() { continue; }
+            let their_id = PeerId(their_info[..32].try_into().unwrap());
+            let their_pk: &[u8; 32] = their_info[32..].try_into().unwrap();
+            let we_initiate = peer_b.0 < their_id.0;
+
+            let mut noise = if we_initiate {
+                match NoiseHandshake::new_initiator(&ns_b2, their_pk) { Ok(n) => n, Err(_) => continue }
+            } else {
+                match NoiseHandshake::new_responder(&ns_b2) { Ok(n) => n, Err(_) => continue }
+            };
+
+            if we_initiate {
+                if let Ok(ik1) = noise.write_message(&[]) {
+                    stream.write_all(&encode_handshake_frame(0, &ik1)).await.ok();
+                    let mut buf = vec![0u8; 4096];
+                    if let Ok(n) = stream.read(&mut buf).await {
+                        if let Ok(h) = parse_frame_header(&buf[..n]) {
+                            noise.read_message(&buf[8..8 + h.payload_len.min(n - 8)]).ok();
+                        }
+                    }
+                }
+            } else {
+                let mut buf = vec![0u8; 4096];
+                if let Ok(n) = stream.read(&mut buf).await {
+                    if let Ok(h) = parse_frame_header(&buf[..n]) {
+                        if noise.read_message(&buf[8..8 + h.payload_len.min(n - 8)]).is_ok() {
+                            if let Ok(ik2) = noise.write_message(&[]) {
+                                stream.write_all(&encode_handshake_frame(0, &ik2)).await.ok();
+                            }
+                        }
+                    }
+                }
+            }
+
+            let session = match noise.into_transport() { Ok(s) => s, Err(_) => continue };
+            let tso = std::sync::Arc::new(lain_transport::TsoStream::new(stream, session, peer_b));
+
+            // Reader loop: recv → channel
+            let tx = b_data_tx.clone();
+            tokio::spawn(async move {
+                loop {
+                    match tso.recv().await {
+                        Ok(data) => { if tx.send(data).await.is_err() { break; } }
+                        Err(_) => break,
+                    }
+                }
+            });
+            break;
+        }
+    });
+
+    let tso_addr = addr_rx.await.unwrap();
+
+    // A: ts_connect → TsoStream → send data
+    let tso = t_a.ts_connect(&id_b.peer_id(), &[tso_addr], None, None).await
+        .expect("ts_connect should succeed");
+
+    // Send framed data through TsoStream
+    let msg = frame::encode_frame(2, FrameType::Data, b"tso data plane");
+    tso.send(&msg).await.expect("tso send should work");
+
+    // B's reader loop receives
+    let data = tokio::time::timeout(Duration::from_secs(5), b_data_rx.recv()).await
+        .unwrap().unwrap();
+    assert!(!data.is_empty(), "TSO reader should receive data");
+}
+                                    Err(_) => break,
+                                }
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                });
+            }
+            Err(_) => {}
+        }
+    });
+
+    // Relay: accept A → connect to B → pipe
+    let t_relay2 = t_relay.clone();
+    let b_ep = Endpoint::new(b_addr, EndpointKind::STUN);
+    let relay_ep = Endpoint::new(relay_addr, EndpointKind::STUN);
+    let b_pid = id_b.peer_id();
+    let a_pid = id_a.peer_id();
+    tokio::spawn(async move {
+        match t_relay2.accept_connection().await {
+            Ok((a_conn, _, _)) => {
+                if let Ok((_send, mut recv)) = a_conn.accept_bi().await {
+                    let mut buf = vec![0u8; 2048];
+                    if let Ok(Some(n)) = recv.read(&mut buf).await {
+                        if let Some((_, ft, _, hdr_len)) = frame::decode_frame_header(&buf[..n]) {
+                            if ft == FrameType::RelayConnect {
+                                let _ = t_relay.handle_relay_request(
+                                    a_conn, b_pid, np_b, &[b_ep.clone()],
+                                ).await;
+                            }
+                        }
+                    }
+                }
+            }
+            Err(_) => {}
+        }
+    });
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // A: connect to relay → send RelayConnect frame → spawn reader loop
+    let t_a = Transport::new(
+        TransportConfig { bind_addr: "127.0.0.1:0".parse().unwrap(), ..Default::default() },
+        ns_a, id_a.peer_id(), *id_a.public_key()).unwrap();
+
+    let relay_conn = t_a.connect_raw(&np_relay, &[relay_ep]).await
+        .expect("A should connect to relay");
+
+    // Send RelayConnect frame
+    let mut rl = Vec::with_capacity(64);
+    rl.extend_from_slice(&a_pid.0);
+    rl.extend_from_slice(&b_pid.0);
+    let rl_frame = frame::encode_frame(1, FrameType::RelayConnect, &rl);
+    if let Ok((mut s, _)) = relay_conn.open_bi().await {
+        s.write_all(&rl_frame).await.ok();
+        s.finish().ok();
+    }
+
+    // Spawn reader loop on relay_conn (mimics fixed daemon code)
+    let rc = relay_conn.clone();
+    let (a_data_tx, mut a_data_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(4);
+    tokio::spawn(async move {
+        loop {
+            match rc.accept_bi().await {
+                Ok((_send, mut recv)) => {
+                    match recv.read_to_end(65536).await {
+                        Ok(data) => { if a_data_tx.send(data).await.is_err() { break; } }
+                        Err(_) => break,
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    // Wait for relay to connect to B and establish pipe
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    // A sends data through relay → B's reader receives
+    let (mut s, _) = relay_conn.open_bi().await.unwrap();
+    s.write_all(b"relay data plane").await.unwrap();
+    s.finish().unwrap();
+
+    let data = tokio::time::timeout(Duration::from_secs(15), b_data_rx.recv()).await
+        .unwrap().unwrap();
+    assert_eq!(&data, b"relay data plane", "Relay data must reach target through pipe");
 }
