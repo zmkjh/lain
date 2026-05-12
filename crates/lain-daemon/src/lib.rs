@@ -257,6 +257,12 @@ impl Daemon {
 
         // Only bind IPv6 when we have a routable global address
         let bind_addr = if ipv6_addr.is_some() {
+            "[::]:0".parse::<SocketAddr>()
+                .map_err(|e: std::net::AddrParseError| DaemonError::Config(e.to_string()))?
+        } else {
+            "0.0.0.0:0".parse::<SocketAddr>()
+                .map_err(|e: std::net::AddrParseError| DaemonError::Config(e.to_string()))?
+        };
 
         // 3. 身份噪声密钥对
         let (_noise_secret, noise_pubkey) = self.identity.noise_keypair();
