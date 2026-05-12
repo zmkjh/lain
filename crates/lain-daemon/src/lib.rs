@@ -705,6 +705,15 @@ impl Daemon {
                                 .filter(|inv| {
                                     let expected = PeerId(sha2::Sha256::digest(&inv.ed25519_pk).into());
                                     expected == inv.peer_id && inv.noise_pk.iter().any(|&b| b != 0)
+                                    && inv.verify(&|pk: &[u8; 32], data: &[u8], sig: &[u8; 64]| {
+                                        use ed25519_dalek::{VerifyingKey, Signature};
+                                        let vk = VerifyingKey::from_bytes(pk);
+                                        let s = Signature::from_slice(sig);
+                                        match (vk, s) {
+                                            (Ok(vk), Ok(s)) => vk.verify_strict(data, &s).is_ok(),
+                                            _ => false,
+                                        }
+                                    })
                                 });
                             if let Some(inv) = code {
                                 if inv.is_expired() {
@@ -929,7 +938,20 @@ impl Daemon {
                         IpcCommand::TsoPeer { invite } => {
                             tracing::info!("IPC: TSO via {invite}");
                             let code = invite.strip_prefix("lain://")
-                                .and_then(|c| lain_discovery::InviteCode::from_base62(c).ok());
+                                .and_then(|c| lain_discovery::InviteCode::from_base62(c).ok())
+                                .filter(|inv| {
+                                    let expected = PeerId(sha2::Sha256::digest(&inv.ed25519_pk).into());
+                                    expected == inv.peer_id && inv.noise_pk.iter().any(|&b| b != 0)
+                                    && inv.verify(&|pk: &[u8; 32], data: &[u8], sig: &[u8; 64]| {
+                                        use ed25519_dalek::{VerifyingKey, Signature};
+                                        let vk = VerifyingKey::from_bytes(pk);
+                                        let s = Signature::from_slice(sig);
+                                        match (vk, s) {
+                                            (Ok(vk), Ok(s)) => vk.verify_strict(data, &s).is_ok(),
+                                            _ => false,
+                                        }
+                                    })
+                                });
                             if let Some(inv) = code {
                                 let t = transport.clone();
                                 let ipc_ev = _ipc_ev_tx.clone();
