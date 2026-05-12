@@ -36,7 +36,6 @@ use self::iface_watcher::InterfaceWatcher;
 #[derive(Serialize, Deserialize, Clone, Debug)]
 struct StoredPeer {
     peer_id_hex: String,
-    pubkey_hex: String,
     endpoints: Vec<String>,
 }
 
@@ -50,7 +49,6 @@ fn save_peers(peers: &HashMap<PeerId, Vec<Endpoint>>, identity: &Identity) {
     if let Some(path) = peers_json_path() {
         let entries: Vec<StoredPeer> = peers.iter().map(|(pid, eps)| StoredPeer {
             peer_id_hex: pid.to_hex(),
-            pubkey_hex: String::new(),
             endpoints: eps.iter().map(|e| e.addr.to_string()).collect(),
         }).collect();
         if let Ok(json) = serde_json::to_string_pretty(&entries) {
@@ -1446,7 +1444,6 @@ mod tests {
         // Create a stored peer list (same format as save_peers writes)
         let entries = vec![StoredPeer {
             peer_id_hex: pid.to_hex(),
-            pubkey_hex: String::new(),
             endpoints: vec!["127.0.0.1:8080".to_string()],
         }];
 
@@ -1475,7 +1472,6 @@ mod tests {
         // Legacy format: just the array, no signature wrapper
         let entries = vec![StoredPeer {
             peer_id_hex: pid.to_hex(),
-            pubkey_hex: String::new(),
             endpoints: vec!["10.0.0.1:443".to_string()],
         }];
         let json = serde_json::to_string(&entries).unwrap();
@@ -1493,7 +1489,6 @@ mod tests {
 
         let entries = vec![StoredPeer {
             peer_id_hex: pid.to_hex(),
-            pubkey_hex: String::new(),
             endpoints: vec!["127.0.0.1:9999".to_string()],
         }];
 
@@ -1540,7 +1535,6 @@ mod tests {
 
         let entries = vec![StoredPeer {
             peer_id_hex: pid.to_hex(),
-            pubkey_hex: String::new(),
             endpoints: vec!["10.0.0.1:443".to_string()],
         }];
         let json = serde_json::to_string(&entries).unwrap();
