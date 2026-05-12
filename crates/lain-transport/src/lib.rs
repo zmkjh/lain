@@ -273,10 +273,68 @@ impl Transport {
     }
 
     /// TCP Simultaneous Open: both sides bind TCP and connect simultaneously.
-    /// Used as fallback when UDP hole punch fails (APDF Symmetric NAT).
-    /// Birthday-attack style: tries all endpoints concurrently per round,
-    /// first to connect wins. 102s deadline with 100ms inter-round sleep.
+    /// Uses local TSO ports (set via set_tso_ports) as source so outgoing SYN
+    /// creates NAT hole for the listener on the same port.
+    /// Birthday-attack style: concurrent per round, first to connect wins.
     pub async fn ts_connect(
+        &self,
+        _peer_id: &PeerId,
+        tso_endpoints: &[SocketAddr],
+        local_tso_ports: &[u16],
+    ) -> Result<(tokio::net::TcpStream, lain_noise::NoiseSession, SocketAddr), TransportError> {
+        use tokio::net::TcpSocket;
+        use tokio::net::TcpStream;
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(102);
+        let per_attempt_timeout = std::time::Duration::from_millis(150);
+        let inter_round_sleep = std::time::Duration::from_millis(100);
+
+        if local_tso_ports.is_empty() {
+            return self.ts_connect_fallback(_peer_id, tso_endpoints).await;
+        }
+
+        let bind_ip = self.config.bind_addr.ip();
+
+        while std::time::Instant::now() < deadline {
+            let (tx, mut rx) = tokio::sync::mpsc::channel::<TcpStream>(1);
+
+            for &local_port in local_tso_ports {
+                for &remote_ep in tso_endpoints {
+                    let tx = tx.clone();
+                    let local_addr = std::net::SocketAddr::new(bind_ip, local_port);
+                    tokio::spawn(async move {
+                        match TcpSocket::new_v4() {
+                            Ok(socket) => {
+                                socket.set_reuseaddr(true).ok();
+                                if socket.bind(local_addr).is_ok() {
+                                    match tokio::time::timeout(
+                                        per_attempt_timeout,
+                                        socket.connect(remote_ep),
+                                    ).await {
+                                        Ok(Ok(s)) => { tx.send(s).await.ok(); }
+                                        _ => {}
+                                    }
+                                }
+                            }
+                            Err(_) => {}
+                        }
+                    });
+                }
+            }
+            drop(tx);
+
+            if let Some(stream) = rx.recv().await {
+                tracing::info!("TSO established");
+                return self.ts_handshake(stream).await;
+            }
+            tokio::time::sleep(inter_round_sleep).await;
+        }
+
+        Err(TransportError::Connect("TSO timeout".into()))
+    }
+
+    /// Fallback when no TSO ports configured: random source port (legacy behavior)
+    async fn ts_connect_fallback(
         &self,
         _peer_id: &PeerId,
         tso_endpoints: &[SocketAddr],
@@ -288,9 +346,7 @@ impl Transport {
         let inter_round_sleep = std::time::Duration::from_millis(100);
 
         while std::time::Instant::now() < deadline {
-            // Spawn all endpoint connects concurrently — first to succeed wins
             let (tx, mut rx) = tokio::sync::mpsc::channel::<TcpStream>(1);
-
             for ep in tso_endpoints {
                 let tx = tx.clone();
                 let addr = *ep;
@@ -301,17 +357,28 @@ impl Transport {
                     }
                 });
             }
-            drop(tx); // close when all spawned tasks drop their clones
-
-            if let Some(mut stream) = rx.recv().await {
+            drop(tx);
+            if let Some(stream) = rx.recv().await {
                 tracing::info!("TSO established");
-                // Exchange [PeerID:32 + noise_pk:32] to determine Noise IK role
-                use tokio::io::{AsyncReadExt, AsyncWriteExt};
-                let our_noise_pk = {
-                    let secret = x25519_dalek::StaticSecret::from(self.noise_secret);
-                    let public = x25519_dalek::PublicKey::from(&secret);
-                    public.to_bytes()
-                };
+                return self.ts_handshake(stream).await;
+            }
+            tokio::time::sleep(inter_round_sleep).await;
+        }
+
+        Err(TransportError::Connect("TSO timeout".into()))
+    }
+
+    /// Complete Noise IK handshake over an established TSO TCP stream
+    async fn ts_handshake(
+        &self,
+        mut stream: tokio::net::TcpStream,
+    ) -> Result<(tokio::net::TcpStream, lain_noise::NoiseSession, SocketAddr), TransportError> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let our_noise_pk = {
+            let secret = x25519_dalek::StaticSecret::from(self.noise_secret);
+            let public = x25519_dalek::PublicKey::from(&secret);
+            public.to_bytes()
+        };
         let mut our_info = [0u8; 64];
         our_info[..32].copy_from_slice(&self.peer_id.0);
         our_info[32..].copy_from_slice(&our_noise_pk);
@@ -321,7 +388,7 @@ impl Transport {
         stream.read_exact(&mut their_info).await
             .map_err(|e| TransportError::Io(format!("TSO recv id: {e}")))?;
         let their_id = PeerId(their_info[..32].try_into().unwrap_or([0u8; 32]));
-        let their_pk: &[u8; 32] = &their_info[32..].try_into().unwrap();
+        let their_pk: &[u8; 32] = their_info[32..].try_into().unwrap();
         let we_are_initiator = self.peer_id.0 < their_id.0;
 
         let mut noise = if we_are_initiator {
@@ -361,12 +428,7 @@ impl Transport {
         }
         let session = noise.into_transport()
             .map_err(|e| TransportError::Noise(format!("TSO transport: {e}")))?;
-        return Ok((stream, session, "0.0.0.0:0".parse().unwrap_or_else(|_| "0.0.0.0:0".parse().unwrap())));
-            }
-            tokio::time::sleep(inter_round_sleep).await;
-        }
-
-        Err(TransportError::Connect("TSO timeout".into()))
+        Ok((stream, session, "0.0.0.0:0".parse().unwrap_or_else(|_| "0.0.0.0:0".parse().unwrap())))
     }
 
     /// 接受原始 QUIC 连接（包含 Noise IK + HEADERS）
