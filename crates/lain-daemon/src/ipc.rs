@@ -322,10 +322,13 @@ async fn dispatch(
             IpcResponse::Ok { message: Some(format!("finding: {peer_id}")), data: None }
         }
         IpcRequest::Disconnect { peer_id } => {
-            if let Ok(pid) = PeerId::from_hex(&peer_id) {
-                send_or_warn(cmd_tx, IpcCommand::DisconnectPeer { peer_id: pid }, "disconnect");
+            match PeerId::from_hex(&peer_id) {
+                Ok(pid) => {
+                    send_or_warn(cmd_tx, IpcCommand::DisconnectPeer { peer_id: pid }, "disconnect");
+                    IpcResponse::Ok { message: Some("disconnecting".into()), data: None }
+                }
+                Err(_) => IpcResponse::Error { code: "INVALID_ID".into(), message: format!("invalid PeerID: {peer_id}") },
             }
-            IpcResponse::Ok { message: Some("disconnecting".into()), data: None }
         }
         IpcRequest::ListPeers => {
             let (tx, rx) = tokio::sync::oneshot::channel();
