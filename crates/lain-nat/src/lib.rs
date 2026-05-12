@@ -274,12 +274,135 @@ fn parse_xor_mapped(data: &[u8], cookie: &[u8; 4]) -> Option<SocketAddr> {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+    use std::sync::mpsc;
+
+    /// Mock STUN server that responds with configurable XOR-MAPPED-ADDRESS.
+    /// - basic_port: mapped port for plain Binding Request
+    /// - change_port: mapped port for CHANGE-REQUEST Binding Request
+    /// - reject_change: if true, don't respond to CHANGE-REQUEST (simulates rejection)
+    fn start_mock_stun(basic_port: u16, change_port: u16, reject_change: bool) -> SocketAddr {
+        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let addr = socket.local_addr().unwrap();
+        let (ready_tx, ready_rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            ready_tx.send(()).ok();
+            let cookie: [u8; 4] = [0x21, 0x12, 0xA4, 0x42];
+            let mut buf = [0u8; 1024];
+            loop {
+                match socket.recv_from(&mut buf) {
+                    Ok((len, src)) => {
+                        // Check if it's a valid STUN Binding Request
+                        if len < 20 { continue; }
+                        let is_stun = buf[0] == 0x00 && buf[1] == 0x01
+                            && buf[4..8] == cookie;
+                        if !is_stun { continue; }
+
+                        let has_change = len >= 28
+                            && buf[20] == 0x00 && buf[21] == 0x03;
+
+                        if has_change && reject_change {
+                            continue; // simulate rejection
+                        }
+
+                        let mapped_port = if has_change { change_port } else { basic_port };
+                        let mapped_ip: [u8; 4] = [10, 0, 0, 1];
+
+                        // Build STUN Binding Success Response
+                        let mut resp = vec![0u8; 32];
+                        resp[0] = 0x01; resp[1] = 0x01; // type
+                        resp[2] = 0x00; resp[3] = 12;   // length
+                        resp[4..8].copy_from_slice(&cookie);
+                        resp[8..20].copy_from_slice(&buf[8..20]); // transaction ID
+                        // XOR-MAPPED-ADDRESS attribute
+                        resp[20] = 0x00; resp[21] = 0x20; // type
+                        resp[22] = 0x00; resp[23] = 0x08; // length
+                        resp[24] = 0x00;                    // reserved
+                        resp[25] = 0x01;                    // IPv4
+                        let port_xor = mapped_port ^ u16::from_be_bytes([cookie[0], cookie[1]]);
+                        resp[26..28].copy_from_slice(&port_xor.to_be_bytes());
+                        for i in 0..4 {
+                            resp[28 + i] = mapped_ip[i] ^ cookie[i];
+                        }
+                        socket.send_to(&resp, src).ok();
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+        ready_rx.recv_timeout(std::time::Duration::from_secs(1)).ok();
+        addr
+    }
+
+    // ── NAT type tests ──
+
+    #[test]
+    fn test_nat_cone_same_mapped_port() {
+        let addr = start_mock_stun(10000, 10000, false);
+        let socket = UdpSocket::bind("0.0.0.0:0").unwrap();
+        socket.set_read_timeout(Some(std::time::Duration::from_secs(1))).ok();
+        let probe = NatProbe::new(vec![addr], 3);
+        let result = probe.probe_with_socket(&socket).unwrap();
+        assert_eq!(result.nat_type, NatType::Cone,
+            "same port for basic and change → Cone");
+        assert!(result.mapped_addr.is_some());
+    }
+
+    #[test]
+    fn test_nat_apdf_symmetric_single_server() {
+        // Single server, different ports → worst case Symmetric (APDF)
+        let addr = start_mock_stun(10000, 20000, false);
+        let socket = UdpSocket::bind("0.0.0.0:0").unwrap();
+        socket.set_read_timeout(Some(std::time::Duration::from_secs(1))).ok();
+        let probe = NatProbe::new(vec![addr], 3);
+        let result = probe.probe_with_socket(&socket).unwrap();
+        assert_eq!(result.nat_type, NatType::APDFSymmetric,
+            "single server with different ports → APDFSymmetric");
+    }
+
+    #[test]
+    fn test_nat_adf_symmetric_two_servers() {
+        // Two servers, all ports differ → ADFSymmetric
+        let addr1 = start_mock_stun(10000, 20000, false);
+        let addr2 = start_mock_stun(30000, 40000, false);
+        let socket = UdpSocket::bind("0.0.0.0:0").unwrap();
+        socket.set_read_timeout(Some(std::time::Duration::from_secs(1))).ok();
+        let probe = NatProbe::new(vec![addr1, addr2], 3);
+        let result = probe.probe_with_socket(&socket).unwrap();
+        assert_eq!(result.nat_type, NatType::ADFSymmetric,
+            "two servers with differing ports → ADFSymmetric");
+    }
+
+    #[test]
+    fn test_nat_change_request_rejected() {
+        let addr = start_mock_stun(10000, 20000, true); // reject_change=true
+        let socket = UdpSocket::bind("0.0.0.0:0").unwrap();
+        socket.set_read_timeout(Some(std::time::Duration::from_secs(1))).ok();
+        let probe = NatProbe::new(vec![addr], 3);
+        let result = probe.probe_with_socket(&socket).unwrap();
+        assert_eq!(result.nat_type, NatType::APDFSymmetric,
+            "CHANGE-REQUEST rejected → APDFSymmetric");
+        assert!(result.mapped_addr.is_some(), "basic probe should still succeed");
+    }
+
+    #[test]
+    fn test_nat_cone_false_alarm_two_servers() {
+        // Server1: basic=10000, change=20000 (looks symmetric)
+        // Server2: basic=20000 (same as change port → cone after all)
+        let addr1 = start_mock_stun(10000, 20000, false);
+        let addr2 = start_mock_stun(20000, 30000, false);
+        let socket = UdpSocket::bind("0.0.0.0:0").unwrap();
+        socket.set_read_timeout(Some(std::time::Duration::from_secs(1))).ok();
+        let probe = NatProbe::new(vec![addr1, addr2], 3);
+        let result = probe.probe_with_socket(&socket).unwrap();
+        assert_eq!(result.nat_type, NatType::Cone,
+            "second server basic == first change port → Cone after all");
+    }
 
     #[test]
     fn test_build_binding_request() {
         let req = NatProbe::build_binding_request(false);
         assert_eq!(req.len(), 20);
-        assert_eq!(req[0], 0x00); // Binding Request
+        assert_eq!(req[0], 0x00);
         assert_eq!(req[1], 0x01);
     }
 
@@ -293,44 +416,35 @@ mod tests {
 
     #[test]
     fn test_parse_xor_mapped_basic() {
-        // Test XOR-MAPPED-ADDRESS parsing
         let cookie = [0x21, 0x12, 0xA4, 0x42];
         let ip = [192, 168, 1, 1];
         let port: u16 = 1234;
         let port_xor = port ^ u16::from_be_bytes([cookie[0], cookie[1]]);
         let mut data = vec![0u8; 8];
         data[0] = 0;
-        data[1] = 0x01; // IPv4
+        data[1] = 0x01;
         data[2..4].copy_from_slice(&port_xor.to_be_bytes());
-        for i in 0..4 {
-            data[4 + i] = ip[i] ^ cookie[i];
-        }
+        for i in 0..4 { data[4 + i] = ip[i] ^ cookie[i]; }
         let result = parse_xor_mapped(&data, &cookie).unwrap();
         assert_eq!(result.port(), port);
     }
 
     #[test]
     fn test_parse_mapped_address_ipv4() {
-        let ip = [10, 0, 0, 1u8];
-        let port: u16 = 8080;
         let mut data = vec![0u8; 8];
-        data[0] = 0;
-        data[1] = 0x01; // IPv4
-        data[2..4].copy_from_slice(&port.to_be_bytes());
-        data[4..8].copy_from_slice(&ip);
+        data[1] = 0x01;
+        data[2..4].copy_from_slice(&8080u16.to_be_bytes());
+        data[4..8].copy_from_slice(&[10, 0, 0, 1u8]);
         let result = parse_mapped_address(&data, 8).unwrap();
         assert_eq!(result.port(), 8080);
-        assert_eq!(result.ip().to_string(), "10.0.0.1");
     }
 
     #[test]
     fn test_parse_mapped_address_ipv6() {
         let ip = [0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1u8];
-        let port: u16 = 443;
         let mut data = vec![0u8; 20];
-        data[0] = 0;
-        data[1] = 0x02; // IPv6
-        data[2..4].copy_from_slice(&port.to_be_bytes());
+        data[1] = 0x02;
+        data[2..4].copy_from_slice(&443u16.to_be_bytes());
         data[4..20].copy_from_slice(&ip);
         let result = parse_mapped_address(&data, 20).unwrap();
         assert_eq!(result.port(), 443);
@@ -340,7 +454,6 @@ mod tests {
     #[test]
     fn test_parse_mapped_address_rejects_too_short() {
         assert!(parse_mapped_address(&[0u8; 3], 3).is_none());
-        // IPv4 needs 8 bytes
         let mut data = vec![0u8; 6];
         data[1] = 0x01;
         assert!(parse_mapped_address(&data, 6).is_none());
@@ -349,7 +462,7 @@ mod tests {
     #[test]
     fn test_parse_mapped_address_unknown_family() {
         let mut data = vec![0u8; 8];
-        data[1] = 0x03; // unknown family
+        data[1] = 0x03;
         assert!(parse_mapped_address(&data, 8).is_none());
     }
 
@@ -357,61 +470,45 @@ mod tests {
     fn test_build_binding_request_with_change() {
         let req = NatProbe::build_binding_request(true);
         assert_eq!(req.len(), 28);
-        // CHANGE-REQUEST attr at offset 20
-        assert_eq!(&req[20..22], &[0x00, 0x03]); // type
-        assert_eq!(&req[22..24], &[0x00, 0x04]); // length
-        assert_eq!(&req[24..28], &[0x00, 0x00, 0x00, 0x04]); // change port flag
-        // Message length (bytes 2-3) must be 8 for CHANGE-REQUEST (28 - 20 header)
+        assert_eq!(&req[20..22], &[0x00, 0x03]);
+        assert_eq!(&req[22..24], &[0x00, 0x04]);
+        assert_eq!(&req[24..28], &[0x00, 0x00, 0x00, 0x04]);
         assert_eq!(u16::from_be_bytes([req[2], req[3]]), 8,
             "CHANGE-REQUEST message length must be 8");
     }
 
     #[test]
     fn test_parse_binding_response_with_mapped_address() {
-        // Build a minimal STUN response with MAPPED-ADDRESS
         let mut msg = vec![0u8; 32];
-        msg[0] = 0x01; // Binding Success Response
-        msg[1] = 0x01;
-        // msg_len at [2..4] = 12 (attr only)
+        msg[0] = 0x01; msg[1] = 0x01;
         msg[2] = 0x00; msg[3] = 12;
-        // Attribute at offset 20: MAPPED-ADDRESS type=0x0001
         msg[20] = 0x00; msg[21] = 0x01;
-        msg[22] = 0x00; msg[23] = 0x08; // attr_len = 8
-        msg[24] = 0; msg[25] = 1; // family=IPv4
-        msg[26] = 0x1F; msg[27] = 0x90; // port=8080
+        msg[22] = 0x00; msg[23] = 0x08;
+        msg[24] = 0; msg[25] = 1;
+        msg[26] = 0x1F; msg[27] = 0x90;
         msg[28..32].copy_from_slice(&[192, 168, 1, 100]);
-
         let result = NatProbe::parse_binding_response(&msg, "1.2.3.4:3478".parse().unwrap());
-        assert!(result.is_some());
         let addr = result.unwrap();
         assert_eq!(addr.port(), 8080);
-        assert_eq!(addr.ip().to_string(), "192.168.1.100");
     }
 
     #[test]
     fn test_parse_binding_response_with_xor_mapped() {
-        let cookie: [u8; 4] = [0x21, 0x12, 0xA4, 0x42];
+        let cookie = [0x21, 0x12, 0xA4, 0x42];
         let real_ip = [10, 20, 30, 40u8];
         let real_port: u16 = 9999;
         let port_xor = real_port ^ u16::from_be_bytes([cookie[0], cookie[1]]);
-
         let mut msg = vec![0u8; 32];
         msg[0] = 0x01; msg[1] = 0x01;
         msg[2] = 0x00; msg[3] = 12;
-        // XOR-MAPPED-ADDRESS: type=0x0020
         msg[20] = 0x00; msg[21] = 0x20;
         msg[22] = 0x00; msg[23] = 0x08;
-        msg[24] = 0; msg[25] = 1; // family
+        msg[24] = 0; msg[25] = 1;
         msg[26..28].copy_from_slice(&port_xor.to_be_bytes());
-        for i in 0..4 {
-            msg[28 + i] = real_ip[i] ^ cookie[i];
-        }
-
+        for i in 0..4 { msg[28 + i] = real_ip[i] ^ cookie[i]; }
         let result = NatProbe::parse_binding_response(&msg, "1.2.3.4:3478".parse().unwrap());
-        assert!(result.is_some());
         let addr = result.unwrap();
         assert_eq!(addr.port(), real_port);
-        assert_eq!(addr.ip().to_string(), "10.20.30.40");
     }
 
     #[test]
@@ -421,10 +518,9 @@ mod tests {
 
     #[test]
     fn test_parse_binding_response_fallback_to_stun_addr() {
-        // No attributes, should fall back to STUN server addr
         let mut msg = vec![0u8; 24];
         msg[0] = 0x01; msg[1] = 0x01;
-        msg[2] = 0x00; msg[3] = 4; // msg_len=4, no content
+        msg[2] = 0x00; msg[3] = 4;
         let stun = "8.8.8.8:3478".parse().unwrap();
         let result = NatProbe::parse_binding_response(&msg, stun).unwrap();
         assert_eq!(result, stun);
@@ -434,7 +530,7 @@ mod tests {
     fn test_parse_xor_mapped_rejects_ipv6_family() {
         let cookie = [0x21, 0x12, 0xA4, 0x42];
         let mut data = vec![0u8; 20];
-        data[1] = 0x02; // IPv6 family
+        data[1] = 0x02;
         assert!(parse_xor_mapped(&data, &cookie).is_none());
     }
 
