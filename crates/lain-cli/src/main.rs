@@ -231,7 +231,34 @@ fn run_daemon(foreground: bool) {
     });
 }
 
-fn ipc_req(socket_path: &PathBuf, json: &str) -> Option<serde_json::Value> {
+fn read_line_timeout(reader: &mut BufReader<IpcStream>, timeout_secs: u64) -> std::io::Result<String> {
+    // Move the reader into a spawned thread so we can time out
+    // We can't move BufReader, so use raw reads with a small buffer
+    let mut buf = vec![0u8; 1];
+    let mut line = String::new();
+    let start = std::time::Instant::now();
+    loop {
+        if start.elapsed().as_secs() > timeout_secs {
+            return Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "timeout"));
+        }
+        // Read one byte at a time with a short wait between retries
+        match reader.get_mut().read(&mut buf) {
+            Ok(0) => {
+                if line.is_empty() { return Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "eof")); }
+                return Ok(line);
+            }
+            Ok(_) => {
+                line.push(buf[0] as char);
+                if buf[0] == b'\n' { return Ok(line); }
+            }
+            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                continue;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
     let mut stream = IpcStream::connect(socket_path).ok()?;
     let req = json.to_string() + "\n";
     stream.write_all(req.as_bytes()).ok()?;
@@ -267,15 +294,18 @@ fn connect_feedback(socket_path: &PathBuf, invite: &str) {
             return;
         }
     }
-    println!("connecting...");
+    eprintln!("connecting (trying all paths: QUIC → relay → TSO, up to 2 min)...");
     // Subscribe
     reader.get_mut().write_all(b"{\"cmd\":\"Subscribe\"}\n").ok();
     line.clear();
     let start = std::time::Instant::now();
     loop {
         line.clear();
-        if reader.read_line(&mut line).is_err() { break; }
-        if start.elapsed().as_secs() > 15 {
+        match read_line_timeout(&mut reader, 5) {
+            Ok(l) => line = l,
+            Err(_) => break,
+        }
+        if start.elapsed().as_secs() > 130 {
             println!("timeout — check 'lain status'");
             // Suggest TSO exchange for hard-to-reach peers
             match ipc_req(socket_path, r#"{"cmd":"GetInvite"}"#) {
@@ -343,7 +373,10 @@ fn tso_connect(socket_path: &PathBuf, invite: &str) {
     let start = std::time::Instant::now();
     loop {
         line.clear();
-        if reader.read_line(&mut line).is_err() { break; }
+        match read_line_timeout(&mut reader, 5) {
+            Ok(l) => line = l,
+            Err(_) => break,
+        }
         if start.elapsed().as_secs() > 110 {
             println!("TSO timeout — both peers must run 'lain tso' within 102 seconds");
             break;
@@ -430,7 +463,10 @@ fn monitor_loop(socket_path: &PathBuf) {
     let mut line = String::new();
     loop {
         line.clear();
-        if reader.read_line(&mut line).is_err() { break; }
+        match read_line_timeout(&mut reader, 5) {
+            Ok(l) => line = l,
+            Err(_) => break,
+        }
         if let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) {
             // Skip non-event messages (e.g. subscription confirmation)
             let event = match v.get("event").and_then(|e| e.as_str()) {
