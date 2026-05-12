@@ -272,10 +272,10 @@ impl Transport {
         });
     }
 
-    /// TCP Simultaneous Open: both sides bind+connect simultaneously.
-    /// Each side creates TcpSockets bound to a dedicated port (NAT hole),
-    /// connects to the peer's TSO endpoints concurrently.
-    /// Pure bind+connect — no listener sharing, works on all platforms.
+    /// TCP Simultaneous Open: bind into known port range and connect.
+    /// Both sides bind ports 42000-42023 and connect to peer's same range.
+    /// Outgoing SYN creates NAT hole; peer's crossing SYN completes handshake.
+    /// Birthday-attack: 24×24=576 pair combinations, concurrent per round.
     pub async fn ts_connect(
         &self,
         _peer_id: &PeerId,
@@ -287,29 +287,38 @@ impl Transport {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(102);
         let per_attempt_timeout = std::time::Duration::from_millis(150);
         let inter_round_sleep = std::time::Duration::from_millis(100);
+        let bind_ip = self.config.bind_addr.ip();
+
+        // Port range mirrors the daemon's TSO_BASE..TSO_BASE+TSO_PORTS
+        const TSO_BASE: u16 = 42000;
+        const TSO_PORTS: u16 = 24;
 
         while std::time::Instant::now() < deadline {
             let (tx, mut rx) = tokio::sync::mpsc::channel::<TcpStream>(1);
 
-            for &remote_ep in tso_endpoints {
-                let tx = tx.clone();
-                tokio::spawn(async move {
-                    match TcpSocket::new_v4() {
-                        Ok(socket) => {
-                            // Bind to any available port — this creates the NAT hole
-                            if socket.bind("0.0.0.0:0".parse().unwrap()).is_ok() {
-                                match tokio::time::timeout(
-                                    per_attempt_timeout,
-                                    socket.connect(remote_ep),
-                                ).await {
-                                    Ok(Ok(s)) => { tx.send(s).await.ok(); }
-                                    _ => {}
+            for i in 0..TSO_PORTS {
+                let local_port = TSO_BASE + i;
+                let local_addr = std::net::SocketAddr::new(bind_ip, local_port);
+                for &remote_ep in tso_endpoints {
+                    let tx = tx.clone();
+                    tokio::spawn(async move {
+                        match TcpSocket::new_v4() {
+                            Ok(socket) => {
+                                socket.set_reuseaddr(true).ok();
+                                if socket.bind(local_addr).is_ok() {
+                                    match tokio::time::timeout(
+                                        per_attempt_timeout,
+                                        socket.connect(remote_ep),
+                                    ).await {
+                                        Ok(Ok(s)) => { tx.send(s).await.ok(); }
+                                        _ => {}
+                                    }
                                 }
                             }
+                            Err(_) => {}
                         }
-                        Err(_) => {}
-                    }
-                });
+                    });
+                }
             }
             drop(tx);
 

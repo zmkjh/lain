@@ -356,85 +356,19 @@ impl Daemon {
         };
         endpoints.push(Endpoint::new(public_dht_addr, lain_core::endpoint::EndpointKind::STUN));
 
-        // TSO TCP ports: bind N consecutive sockets for smart birthday attack.
-        // Clustered ports → NAT maps them as consecutive blocks.
-        // Collect ports for ts_connect to bind source-side.
+        // TSO TCP ports: register N consecutive ports in invite so peer
+        // knows where to connect. Actual TCP simultaneous open happens in
+        // ts_connect (both sides bind+connect from same port range).
         const TSO_PORTS: u16 = 24;
         const TSO_BASE: u16 = 42000;
-        let bind_ip = bind_addr.ip();
         for i in 0..TSO_PORTS {
-            let target = std::net::SocketAddr::new(bind_ip, TSO_BASE + i);
-            let tso_listener = match tokio::net::TcpListener::bind(target).await {
-                Ok(l) => l,
-                Err(_) => tokio::net::TcpListener::bind(bind_addr).await
-                    .map_err(|e| DaemonError::Config(format!("TSO bind: {e}")))?,
-            };
-            let tso_port = tso_listener.local_addr()
-                .map_err(|e| DaemonError::Config(format!("TSO addr: {e}")))?
-                .port();
+            let tso_port = TSO_BASE + i;
             if let Some(stun) = nat_result.mapped_addr {
                 endpoints.push(Endpoint::new(
                     SocketAddr::new(stun.ip(), tso_port),
                     lain_core::endpoint::EndpointKind::TSO,
                 ));
             }
-            let tso_noise_secret = _noise_secret;
-            let tso_peer_id = peer_id;
-            let tso_noise_pk = noise_pubkey;
-            tokio::spawn(async move {
-                use tokio::io::{AsyncReadExt, AsyncWriteExt};
-                use lain_noise::{NoiseHandshake, encode_handshake_frame, parse_frame_header};
-                loop {
-                    match tso_listener.accept().await {
-                        Ok((mut stream, _)) => {
-                            // TSO handshake: exchange [PeerID:32 + noise_pk:32] → Role → Noise IK
-                            let mut our_info = [0u8; 64];
-                            our_info[..32].copy_from_slice(&tso_peer_id.0);
-                            our_info[32..].copy_from_slice(&tso_noise_pk);
-                            stream.write_all(&our_info).await.ok();
-
-                            let mut their_info = [0u8; 64];
-                            if stream.read_exact(&mut their_info).await.is_err() { continue; }
-                            let their_id: [u8; 32] = their_info[..32].try_into().unwrap();
-                            let their_pk: &[u8; 32] = &their_info[32..].try_into().unwrap();
-                            let we_initiate = tso_peer_id.0 < their_id;
-
-                            let noise_result = if we_initiate {
-                                NoiseHandshake::new_initiator(&tso_noise_secret, their_pk)
-                            } else {
-                                NoiseHandshake::new_responder(&tso_noise_secret)
-                            };
-                            if let Ok(mut noise) = noise_result {
-                                if we_initiate {
-                                    if let Ok(ik1) = noise.write_message(&[]) {
-                                        stream.write_all(&encode_handshake_frame(0, &ik1)).await.ok();
-                                        let mut buf = vec![0u8; 4096];
-                                        if let Ok(n) = stream.read(&mut buf).await {
-                                            if let Ok(h) = parse_frame_header(&buf[..n]) {
-                                                noise.read_message(&buf[8..8+h.payload_len.min(n-8)]).ok();
-                                            }
-                                        }
-                                    }
-                                } else {
-                                    let mut buf = vec![0u8; 4096];
-                                    if let Ok(n) = stream.read(&mut buf).await {
-                                        if let Ok(h) = parse_frame_header(&buf[..n]) {
-                                            if noise.read_message(&buf[8..8+h.payload_len.min(n-8)]).is_ok() {
-                                                if let Ok(ik2) = noise.write_message(&[]) {
-                                                    stream.write_all(&encode_handshake_frame(0, &ik2)).await.ok();
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                                let _session = noise.into_transport();
-                                tracing::info!("TSO accepted from peer");
-                            }
-                        }
-                        Err(_) => break,
-                    }
-                }
-            });
         }
         tracing::info!("TSO TCP: {TSO_PORTS} ports");
 
