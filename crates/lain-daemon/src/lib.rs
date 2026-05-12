@@ -569,7 +569,24 @@ impl Daemon {
         let conn_mgr = Arc::new(ConnectionManager::new());
 
         // Track active QUIC connections with semaphore permits for backpressure
-        let connected: Arc<RwLock<HashMap<PeerId, (quinn::Connection, tokio::sync::OwnedSemaphorePermit)>>> =
+        enum ActiveConnection {
+            Quic(quinn::Connection, tokio::sync::OwnedSemaphorePermit),
+            Tso(std::sync::Arc<lain_transport::TsoStream>),
+        }
+
+        impl ActiveConnection {
+            fn close(&self) {
+                if let Self::Quic(conn, _) = self {
+                    conn.close(0u32.into(), b"disconnected");
+                }
+            }
+
+            fn quic_conn(&self) -> Option<&quinn::Connection> {
+                match self { Self::Quic(c, _) => Some(c), _ => None }
+            }
+        }
+
+        let connected: Arc<RwLock<HashMap<PeerId, ActiveConnection>>> =
             Arc::new(RwLock::new(HashMap::new()));
         let conn_sem = Arc::new(tokio::sync::Semaphore::new(
             self.config.transport.max_connections,
@@ -605,15 +622,23 @@ impl Daemon {
 
                     // Send PATH_CHANGE to all connected peers
                     let cons = connected_iface.read().await;
-                    for (peer_id, (conn, _)) in cons.iter() {
+                    for (peer_id, ac) in cons.iter() {
                         let msg = lain_core::frame::encode_frame(
                             1, lain_core::frame::FrameType::PathChange,
                             &[],
                         );
-                        if let Ok((mut send, _)) = conn.open_bi().await {
-                            let _ = send.write_all(&msg).await;
-                            let _ = send.finish();
-                            tracing::debug!("sent PATH_CHANGE to {peer_id}");
+                        match ac {
+                            ActiveConnection::Quic(conn, _) => {
+                                if let Ok((mut send, _)) = conn.open_bi().await {
+                                    let _ = send.write_all(&msg).await;
+                                    let _ = send.finish();
+                                    tracing::debug!("sent PATH_CHANGE to {peer_id}");
+                                }
+                            }
+                            ActiveConnection::Tso(tso) => {
+                                let _ = tso.send(&msg).await;
+                                tracing::debug!("sent PATH_CHANGE (TSO) to {peer_id}");
+                            }
                         }
                     }
                 }
@@ -743,7 +768,7 @@ impl Daemon {
                                                 }
                                             };
                                             tracing::info!("connected to {pid}");
-                                            connected_ref.write().await.insert(pid, (conn.clone(), permit));
+                                            connected_ref.write().await.insert(pid, ActiveConnection::Quic(conn.clone(), permit));
 
                                             // Start QUIC keepalive PING every 15s
                                             lain_transport::Transport::spawn_keepalive(conn.clone(), 15);
@@ -820,7 +845,7 @@ impl Daemon {
                                                                 s.finish().ok();
                                                                 tracing::info!("relay: {my_id} -> {pid} via {}", relay.node_id);
                                                                 // Connected via relay — same as direct
-                                                                connected_ref.write().await.insert(pid, (relay_conn, {
+                                                                connected_ref.write().await.insert(pid, ActiveConnection::Quic(relay_conn, {
                                                                     let permit = conn_sem2.clone().acquire_owned().await.unwrap();
                                                                     permit
                                                                 }));
@@ -851,6 +876,7 @@ impl Daemon {
                                     match t.ts_connect(&pid, &tso_eps, effective_delta, nat_rtt_ms).await {
                                                         Ok(tso) => {
                                                             let tso = std::sync::Arc::new(tso);
+                                                            connected_ref.write().await.insert(pid, ActiveConnection::Tso(tso.clone()));
                                                             lain_transport::TsoStream::spawn_keepalive(tso.clone(), 15);
                                                             let ipc_ev2 = ipc_ev.clone();
                                                             let pid2 = pid;
@@ -932,6 +958,7 @@ impl Daemon {
                             if let Some(inv) = code {
                                 let t = transport.clone();
                                 let ipc_ev = _ipc_ev_tx.clone();
+                                let connected_ref = connected.clone();
                                 let pid = inv.peer_id;
                                 let tso_eps: Vec<SocketAddr> = inv.endpoints.iter()
                                     .filter(|e| e.kind == lain_core::endpoint::EndpointKind::TSO)
@@ -950,6 +977,7 @@ impl Daemon {
                                                 match t.ts_connect(&pid, &tso_eps, effective_delta, nat_rtt_ms).await {
                                                     Ok(tso) => {
                                                         let tso = std::sync::Arc::new(tso);
+                                                        connected_ref.write().await.insert(pid, ActiveConnection::Tso(tso.clone()));
                                                         lain_transport::TsoStream::spawn_keepalive(tso.clone(), 15);
                                                         let ipc_ev2 = ipc_ev.clone();
                                                         let pid2 = pid;
@@ -1001,8 +1029,9 @@ impl Daemon {
                         IpcCommand::FindPeer { peer_id } => {
                             tracing::info!("IPC: find {peer_id}");
                             let dht = dht_arc.clone();
-                            let t = transport.clone();
-                            let ipc_ev = _ipc_ev_tx.clone();
+                                let t = transport.clone();
+                                let ipc_ev = _ipc_ev_tx.clone();
+                                let connected_ref = connected.clone();
                             let connected_ref = connected.clone();
                             let conn_sem2 = conn_sem.clone();
                             let nat_port_delta = nat_result.port_delta;
@@ -1017,7 +1046,7 @@ impl Daemon {
                                             let conn_result = t.connect_raw(&npk, &eps).await;
                                             match conn_result {
                                                 Ok(conn) => {
-                                                    connected_ref.write().await.insert(pid, (conn, conn_sem2.acquire_owned().await.unwrap()));
+                                                    connected_ref.write().await.insert(pid, ActiveConnection::Quic(conn, conn_sem2.acquire_owned().await.unwrap()));
                                                     let _ = ipc_ev.send(IpcResponse::Event {
                                                         event: "peer_connected".into(),
                                                         peer_id: Some(pid.to_string()),
@@ -1039,7 +1068,7 @@ impl Daemon {
                                                                     if let Ok((mut s, _)) = relay_conn.open_bi().await {
                                                                         s.write_all(&rl_frame).await.ok();
                                                                         s.finish().ok();
-                                                                        connected_ref.write().await.insert(pid, (relay_conn, conn_sem2.acquire_owned().await.unwrap()));
+                                                                        connected_ref.write().await.insert(pid, ActiveConnection::Quic(relay_conn, conn_sem2.acquire_owned().await.unwrap()));
                                                                         let _ = ipc_ev.send(IpcResponse::Event {
                                                                             event: "peer_connected".into(),
                                                                             peer_id: Some(pid.to_string()),
@@ -1057,6 +1086,7 @@ impl Daemon {
                                                 match t.ts_connect(&pid, &tso_eps, nat_port_delta, nat_rtt_ms).await {
                                                             Ok(tso) => {
                                                                 let tso = std::sync::Arc::new(tso);
+                                                                connected_ref.write().await.insert(pid, ActiveConnection::Tso(tso.clone()));
                                                                 lain_transport::TsoStream::spawn_keepalive(tso.clone(), 15);
                                                                 let ipc_ev2 = ipc_ev.clone();
                                                                 let pid2 = pid;
@@ -1115,8 +1145,8 @@ impl Daemon {
                             tracing::info!("IPC: disconnect {peer_id}");
                             known_peers.write().await.remove(&peer_id);
                             conn_mgr.remove_peer(&peer_id).await;
-                            if let Some((conn, _permit)) = connected.write().await.remove(&peer_id) {
-                                conn.close(0u32.into(), b"disconnected");
+                            if let Some(ac) = connected.write().await.remove(&peer_id) {
+                                ac.close();
                             }
                             let _ = _ipc_ev_tx.send(IpcResponse::Event {
                                 event: "peer_disconnected".into(),
@@ -1125,12 +1155,9 @@ impl Daemon {
                             });
                         }
                         IpcCommand::SendToPeer { peer_id, data } => {
-                            let conn = {
-                                let cons = connected.read().await;
-                                cons.get(&peer_id).map(|(c, _)| c.clone())
-                            };
-                            match conn {
-                                Some(conn) => {
+                            let cons = connected.read().await;
+                            match cons.get(&peer_id) {
+                                Some(ActiveConnection::Quic(conn, _)) => {
                                     let msg = frame::encode_frame(2, FrameType::Data, &data);
                                     match conn.open_bi().await {
                                         Ok((mut send, _recv)) => {
@@ -1144,10 +1171,18 @@ impl Daemon {
                                         Err(e) => tracing::warn!("open stream to {peer_id}: {e}"),
                                     }
                                 }
+                                Some(ActiveConnection::Tso(tso)) => {
+                                    let msg = frame::encode_frame(2, FrameType::Data, &data);
+                                    if let Err(e) = tso.send(&msg).await {
+                                        tracing::warn!("TSO send to {peer_id}: {e}");
+                                    } else {
+                                        tracing::debug!("TSO sent {}b to {peer_id}", data.len());
+                                    }
+                                }
                                 None => {
                                     tracing::warn!("no active connection to {peer_id}");
                                 }
-                            }
+                            };
                         }
                         IpcCommand::AcceptConnection { connection_id } => {
                             tracing::info!("IPC: accept connection {connection_id}");
