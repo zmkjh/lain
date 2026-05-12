@@ -275,42 +275,33 @@ impl Transport {
     /// TCP Simultaneous Open: both sides bind TCP and connect simultaneously.
     /// Used as fallback when UDP hole punch fails (APDF Symmetric NAT pairs).
     /// Returns raw TCP stream after Noise IK handshake.
+    /// Connects to peer's TSO endpoints (from invite); the peer's permanent
+    /// TSO listener accepts and both sides exchange keys through the stream.
     pub async fn ts_connect(
         &self,
         _peer_id: &PeerId,
         our_noise_pk: &[u8; 32],
         tso_endpoints: &[SocketAddr],
     ) -> Result<(tokio::net::TcpStream, lain_noise::NoiseSession, SocketAddr), TransportError> {
-        use tokio::net::{TcpListener, TcpStream};
-        let listener = TcpListener::bind("0.0.0.0:0").await
-            .map_err(|e| TransportError::Io(format!("TSO bind: {e}")))?;
+        use tokio::net::TcpStream;
 
-        // Race connect and accept simultaneously. Both sides must try at
-        // the same time so TCP SYNs cross APDF filters. Whichever path
-        // wins first is used.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(102);
-        let mut stream: Option<(TcpStream, bool)> = None; // (stream, is_connect)
+        let mut stream: Option<TcpStream> = None;
 
-        'tso: loop {
-            if std::time::Instant::now() >= deadline { break; }
+        while std::time::Instant::now() < deadline {
             for ep in tso_endpoints {
                 match tokio::time::timeout(
                     std::time::Duration::from_millis(200), TcpStream::connect(*ep)
                 ).await {
-                    Ok(Ok(s)) => { stream = Some((s, true)); break 'tso; }
+                    Ok(Ok(s)) => { stream = Some(s); break; }
                     _ => {}
                 }
             }
-            match tokio::time::timeout(
-                std::time::Duration::from_millis(200), listener.accept()
-            ).await {
-                Ok(Ok((s, _))) => { stream = Some((s, false)); break 'tso; }
-                _ => {}
-            }
+            if stream.is_some() { break; }
             tokio::time::sleep(std::time::Duration::from_millis(300)).await;
         }
 
-        let (mut stream, _we_connected) = stream
+        let mut stream = stream
             .ok_or_else(|| TransportError::Connect("TSO timeout".into()))?;
 
         tracing::info!("TSO established");
