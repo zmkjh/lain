@@ -278,7 +278,7 @@ impl Transport {
     pub async fn ts_connect(
         &self,
         _peer_id: &PeerId,
-        noise_pubkey: &Ed25519PublicKey,
+        our_noise_pk: &[u8; 32],
         tso_endpoints: &[SocketAddr],
     ) -> Result<(tokio::net::TcpStream, lain_noise::NoiseSession, SocketAddr), TransportError> {
         use tokio::net::{TcpListener, TcpStream};
@@ -314,18 +314,22 @@ impl Transport {
             .ok_or_else(|| TransportError::Connect("TSO timeout".into()))?;
 
         tracing::info!("TSO established");
-        // Exchange PeerIDs to determine Noise IK role (lower PeerID = initiator)
+        // Exchange [PeerID:32 + noise_pk:32] to determine Noise IK role
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        stream.write_all(&self.peer_id.0).await
+        let mut our_info = [0u8; 64];
+        our_info[..32].copy_from_slice(&self.peer_id.0);
+        our_info[32..].copy_from_slice(our_noise_pk);
+        stream.write_all(&our_info).await
             .map_err(|e| TransportError::Io(format!("TSO send id: {e}")))?;
-        let mut their_id_bytes = vec![0u8; 32];
-        stream.read_exact(&mut their_id_bytes).await
+        let mut their_info = [0u8; 64];
+        stream.read_exact(&mut their_info).await
             .map_err(|e| TransportError::Io(format!("TSO recv id: {e}")))?;
-        let their_id = PeerId(their_id_bytes.try_into().unwrap_or([0u8; 32]));
+        let their_id = PeerId(their_info[..32].try_into().unwrap_or([0u8; 32]));
+        let their_pk: &[u8; 32] = &their_info[32..].try_into().unwrap();
         let we_are_initiator = self.peer_id.0 < their_id.0;
 
         let mut noise = if we_are_initiator {
-            NoiseHandshake::new_initiator(&self.noise_secret, noise_pubkey)
+            NoiseHandshake::new_initiator(&self.noise_secret, their_pk)
                 .map_err(|e| TransportError::Noise(format!("TSO init: {e}")))?
         } else {
             NoiseHandshake::new_responder(&self.noise_secret)
