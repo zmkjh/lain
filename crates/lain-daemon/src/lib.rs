@@ -801,10 +801,10 @@ impl Daemon {
                                                                         })),
                                                                     });
                                                                 }
-                        Err(e) => {
-                            tracing::debug!("TSO accept: {e}");
-                            continue;
-                        }
+                                                                            Err(e) => {
+                                                                                tracing::debug!("stream read: {e}");
+                                                                                continue;
+                                                                            }
                                                             }
                                                         }
                                                         Err(_) => break,
@@ -839,10 +839,40 @@ impl Daemon {
                                                                 s.finish().ok();
                                                                 tracing::info!("relay: {my_id} -> {pid} via {}", relay.node_id);
                                                                 // Connected via relay — same as direct
-                                                                connected_ref.write().await.insert(pid, ActiveConnection::Quic(relay_conn, {
-                                                                    let permit = conn_sem2.clone().acquire_owned().await.unwrap();
-                                                                    permit
-                                                                }));
+                                                                let relay_permit = conn_sem2.clone().acquire_owned().await.unwrap();
+                                                                connected_ref.write().await.insert(pid, ActiveConnection::Quic(relay_conn.clone(), relay_permit));
+
+                                                                // Start keepalive + reader loop for relay connection
+                                                                lain_transport::Transport::spawn_keepalive(relay_conn.clone(), 15);
+                                                                let ipc_ev2 = ipc_ev.clone();
+                                                                let pid2 = pid;
+                                                                let rc = relay_conn.clone();
+                                                                tokio::spawn(async move {
+                                                                    loop {
+                                                                        match rc.accept_bi().await {
+                                                                            Ok((_send, mut recv)) => {
+                                                                                match recv.read_to_end(65536).await {
+                                                                                    Ok(data) => {
+                                                                                        use base64::Engine;
+                                                                                        let b64 = base64::engine::general_purpose::STANDARD.encode(&data);
+                                                                                        let _ = ipc_ev2.send(IpcResponse::Event {
+                                                                                            event: "data".into(),
+                                                                                            peer_id: Some(pid2.to_string()),
+                                                                                            data: Some(serde_json::json!({"bytes": b64})),
+                                                                                        });
+                                                                                    }
+                                                                                    Err(_) => break,
+                                                                                }
+                                                                            }
+                                                                            Err(_) => break,
+                                                                        }
+                                                                    }
+                                                                    let _ = ipc_ev2.send(IpcResponse::Event {
+                                                                        event: "peer_disconnected".into(),
+                                                                        peer_id: Some(pid2.to_string()),
+                                                                        data: None,
+                                                                    });
+                                                                });
                                                                 let _ = ipc_ev.send(IpcResponse::Event {
                                                                     event: "peer_connected".into(),
                                                                     peer_id: Some(pid.to_string()),
