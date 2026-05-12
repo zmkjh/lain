@@ -387,104 +387,7 @@ impl Daemon {
         dht_for_mdns.spawn_bucket_refresh();
         dht_for_mdns.spawn_cleanup();
 
-        // Spawn relay accept loop: handle incoming RelayConnect frames
-        let transport_relay = transport.clone();
-        let dht_relay = dht_for_mdns.clone();
-        let public_dht = public_dht_addr;
-        tokio::spawn(async move {
-            loop {
-                let t = transport_relay.clone();
-                let d = dht_relay.clone();
-                match t.accept_connection().await {
-                    Ok((conn, _peer_id, _pubkey)) => {
-                        let c = conn.clone();
-                        let my_id = peer_id;
-                        let my_dht_addr = public_dht;
-                        tokio::spawn(async move {
-                            if let Ok((mut _send, mut recv)) = c.accept_bi().await {
-                                let mut buf = vec![0u8; 2048];
-                                if let Ok(Some(n)) = recv.read(&mut buf).await {
-                                    // DHT address exchange + PeerID: non-frame plaintext stream
-                                    // Format: "DHT_ADDR:ip:port:PeerIDhex"
-                                    if buf[..n].starts_with(b"DHT_ADDR:") {
-                                        let parts: Vec<&str> = std::str::from_utf8(&buf[7..n])
-                                            .unwrap_or("").trim().split(':').collect();
-                                        if parts.len() >= 3 {
-                                            if let Ok(peer_dht) = format!("{}:{}", parts[0], parts[1]).parse::<SocketAddr>() {
-                                                let correct_peer_id = if parts.len() >= 4 {
-                                                    PeerId::from_hex(parts[3]).unwrap_or(_peer_id)
-                                                } else {
-                                                    _peer_id
-                                                };
-                                                d.add_node(correct_peer_id, peer_dht).await;
-                                                // Respond with our DHT addr (public IP + DHT port) + PeerID
-                                                let resp = format!("DHT_ADDR:{my_dht_addr}:{}", my_id);
-                                                _send.write_all(resp.as_bytes()).await.ok();
-                                                _send.finish().ok();
-                                            }
-                                        }
-                                        return;
-                                    }
-
-                                    if let Some((_sid, ft, _len, hdr_len)) = frame::decode_frame_header(&buf[..n]) {
-                                        if ft == FrameType::RelayConnect {
-                                            let payload = &buf[hdr_len..hdr_len + (_len as usize).min(n - hdr_len)];
-                                            if payload.len() >= 64 {
-                                                let mut requester_bytes = [0u8; 32];
-                                                requester_bytes.copy_from_slice(&payload[..32]);
-                                                let requester = PeerId(requester_bytes);
-                                                let mut target_bytes = [0u8; 32];
-                                                target_bytes.copy_from_slice(&payload[32..64]);
-                                                let target = PeerId(target_bytes);
-                                                tracing::info!("relay: {requester} -> {target}");
-                                                if let Ok(Some(record)) = d.find_peer(&target).await {
-                                                    let result = t.handle_relay_request(
-                                                        c.clone(), target, record.noise_pubkey, &record.endpoints,
-                                                    ).await;
-                                                    // Relay pipe ended — attempt migration
-                                                    if result.is_err() {
-                                                        tracing::warn!("relay {requester}->{target} pipe broken, migrating");
-                                                        // Find alternative relay
-                                                        if let Ok(relays) = d.find_relays().await {
-                                                            for new_relay in relays {
-                                                                if new_relay.node_id == requester || new_relay.node_id == target {
-                                                                    continue;
-                                                                }
-                                                                // Re-establish: connect to new relay and forward
-                                                                if let Ok(Some(new_rec)) = d.find_peer(&new_relay.node_id).await {
-                                                                    if let Ok(new_conn) = t.connect_raw(
-                                                                        &new_rec.pubkey, &new_rec.endpoints,
-                                                                    ).await {
-                                                                        // Send RelayConnect to the new relay
-                                                                        let mut rl = Vec::with_capacity(64);
-                                                                        rl.extend_from_slice(&requester.0);
-                                                                        rl.extend_from_slice(&target.0);
-                                                                        let rl_frame = lain_core::frame::encode_frame(
-                                                                            1, lain_core::frame::FrameType::RelayConnect, &rl,
-                                                                        );
-                                                                        if let Ok((mut s, _)) = new_conn.open_bi().await {
-                                                                            let _ = s.write_all(&rl_frame).await;
-                                                                            let _ = s.finish();
-                                                                            tracing::info!("relay: re-established {requester}->{target} via {}", new_relay.node_id);
-                                                                            break;
-                                                                        }
-                                                                    }
-                                                                }
-                                                            }
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        });
-                    }
-                    Err(e) => tracing::debug!("transport accept: {e}"),
-                }
-            }
-        });
+        // IPC events will be forwarded through the accept loop below
 
         let local_port = dht_for_mdns.socket().local_addr()
             .map(|a| a.port())
@@ -554,7 +457,7 @@ impl Daemon {
 
         // 8. 启动 DHT + IPC 事件循环
         let socket = dht_for_mdns.socket();
-        let dht_arc = dht_for_mdns; // Already Arc-wrapped above
+        let dht_arc = dht_for_mdns.clone(); // Already Arc-wrapped above
         let dht_recv = dht_arc.clone();
 
         let mut buf = vec![0u8; 2048];
@@ -570,7 +473,7 @@ impl Daemon {
 
         // Track active QUIC connections with semaphore permits for backpressure
         enum ActiveConnection {
-            Quic(quinn::Connection, tokio::sync::OwnedSemaphorePermit),
+            Quic(quinn::Connection, #[allow(dead_code)] tokio::sync::OwnedSemaphorePermit),
             Tso(std::sync::Arc<lain_transport::TsoStream>),
         }
 
@@ -580,10 +483,6 @@ impl Daemon {
                     conn.close(0u32.into(), b"disconnected");
                 }
             }
-
-            fn quic_conn(&self) -> Option<&quinn::Connection> {
-                match self { Self::Quic(c, _) => Some(c), _ => None }
-            }
         }
 
         let connected: Arc<RwLock<HashMap<PeerId, ActiveConnection>>> =
@@ -591,6 +490,103 @@ impl Daemon {
         let conn_sem = Arc::new(tokio::sync::Semaphore::new(
             self.config.transport.max_connections,
         ));
+
+        // Spawn accept loop for incoming connections (relay + direct data)
+        let transport_accept = transport.clone();
+        let dht_accept = dht_for_mdns.clone();
+        let public_dht_accept = public_dht_addr;
+        let connected_accept = connected.clone();
+        let ipc_ev_accept = _ipc_ev_tx.clone();
+        let peer_id_accept = peer_id;
+        tokio::spawn(async move {
+            loop {
+                let t = transport_accept.clone();
+                let d = dht_accept.clone();
+                match t.accept_connection().await {
+                    Ok((conn, _peer_id, _pubkey)) => {
+                        let c = conn.clone();
+                        let c_data = conn.clone();
+                        let my_id = peer_id_accept;
+                        let my_dht_addr = public_dht_accept;
+                        tokio::spawn(async move {
+                            if let Ok((mut _send, mut recv)) = c.accept_bi().await {
+                                let mut buf = vec![0u8; 2048];
+                                if let Ok(Some(n)) = recv.read(&mut buf).await {
+                                    if buf[..n].starts_with(b"DHT_ADDR:") {
+                                        let parts: Vec<&str> = std::str::from_utf8(&buf[7..n])
+                                            .unwrap_or("").trim().split(':').collect();
+                                        if parts.len() >= 3 {
+                                            if let Ok(peer_dht) = format!("{}:{}", parts[0], parts[1]).parse::<SocketAddr>() {
+                                                let correct_peer_id = if parts.len() >= 4 {
+                                                    PeerId::from_hex(parts[3]).unwrap_or(_peer_id)
+                                                } else { _peer_id };
+                                                d.add_node(correct_peer_id, peer_dht).await;
+                                                let resp = format!("DHT_ADDR:{my_dht_addr}:{}", my_id);
+                                                _send.write_all(resp.as_bytes()).await.ok();
+                                                _send.finish().ok();
+                                            }
+                                        }
+                                    }
+                                    if let Some((_sid, ft, _len, hdr_len)) = frame::decode_frame_header(&buf[..n]) {
+                                        if ft == FrameType::RelayConnect {
+                                            let payload = &buf[hdr_len..hdr_len + (_len as usize).min(n - hdr_len)];
+                                            if payload.len() >= 64 {
+                                                let mut requester_bytes = [0u8; 32];
+                                                requester_bytes.copy_from_slice(&payload[..32]);
+                                                let requester = PeerId(requester_bytes);
+                                                let mut target_bytes = [0u8; 32];
+                                                target_bytes.copy_from_slice(&payload[32..64]);
+                                                let target = PeerId(target_bytes);
+                                                tracing::info!("relay: {requester} -> {target}");
+                                                if let Ok(Some(record)) = d.find_peer(&target).await {
+                                                    let result = t.handle_relay_request(
+                                                        c.clone(), target, record.noise_pubkey, &record.endpoints,
+                                                    ).await;
+                                                    if result.is_err() {
+                                                        tracing::warn!("relay {requester}->{target} pipe broken");
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        });
+                        // Spawn reader loop for subsequent data streams
+                        let _connected_a = connected_accept.clone();
+                        let ipc_ev_a = ipc_ev_accept.clone();
+                        let pid_a = _peer_id;
+                        tokio::spawn(async move {
+                            loop {
+                                match c_data.accept_bi().await {
+                                    Ok((_send, mut recv)) => {
+                                        match recv.read_to_end(65536).await {
+                                            Ok(data) => {
+                                                use base64::Engine;
+                                                let b64 = base64::engine::general_purpose::STANDARD.encode(&data);
+                                                let _ = ipc_ev_a.send(IpcResponse::Event {
+                                                    event: "data".into(),
+                                                    peer_id: Some(pid_a.to_string()),
+                                                    data: Some(serde_json::json!({"bytes": b64})),
+                                                });
+                                            }
+                                            Err(_) => break,
+                                        }
+                                    }
+                                    Err(_) => break,
+                                }
+                            }
+                            let _ = ipc_ev_a.send(IpcResponse::Event {
+                                event: "peer_disconnected".into(),
+                                peer_id: Some(pid_a.to_string()),
+                                data: None,
+                            });
+                        });
+                    }
+                    Err(e) => tracing::debug!("transport accept: {e}"),
+                }
+            }
+        });
 
         // Interface watcher: detect network changes and trigger emergency actions
         let iface_watcher = Arc::new(InterfaceWatcher::new());
@@ -1031,7 +1027,6 @@ impl Daemon {
                             let dht = dht_arc.clone();
                                 let t = transport.clone();
                                 let ipc_ev = _ipc_ev_tx.clone();
-                                let connected_ref = connected.clone();
                             let connected_ref = connected.clone();
                             let conn_sem2 = conn_sem.clone();
                             let nat_port_delta = nat_result.port_delta;
