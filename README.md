@@ -13,6 +13,7 @@
 - **Invite 替代 Bootstrap**：每份邀请码是一条网络入口。A 邀请 B，B 的连接动作自动播种 DHT。B 再邀请 C，网络随人际关系自然生长，无需任何公共服务器。
 - **DHT 自组织**：QUIC 连接成功后双方交换真实 DHT 地址并立即执行 `store_self`，路由表从零开始病毒式扩张。
 - **IPv6 优先**：自动检测全局单播地址（2000::/3），有则直连——零 NAT、零 relay。无全局 IPv6 时自动降级至 IPv4 + STUN + relay。
+- **TSO 穿透 CGNAT**：TCP Simultaneous Open（同时打开）作为最后一层穿透手段。双方从同端口范围（50000-50007）并发 bind+connect，出站 SYN 创建 NAT hole，对端 SYN 交叉握手。自适应参数：根据 NAT 端口保持性（delta 探测）和 RTT 动态调整端口数、超时和间隔。专为中国移动 CGNAT/校园网对称 NAT 设计。
 
 详细设计及协议规范见 [DESIGN.md](DESIGN.md) 和 [PROTOCOL.md](PROTOCOL.md)。
 
