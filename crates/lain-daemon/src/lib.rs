@@ -1258,4 +1258,81 @@ mod tests {
         assert_eq!(parsed.len(), 1);
         assert_eq!(parsed[0].peer_id_hex, pid.to_hex());
     }
+
+    #[test]
+    fn test_load_peers_rejects_tampered_signature() {
+        let id = Identity::generate().ok().unwrap();
+        let pid = id.peer_id();
+
+        let entries = vec![StoredPeer {
+            peer_id_hex: pid.to_hex(),
+            pubkey_hex: String::new(),
+            endpoints: vec!["127.0.0.1:9999".to_string()],
+        }];
+
+        // Build signed payload exactly like save_peers
+        let json = serde_json::to_string_pretty(&entries).unwrap();
+        let sig = id.sign(json.as_bytes());
+        let signed = serde_json::json!({
+            "data": &entries,
+            "sig": hex::encode(sig),
+        });
+        let final_json = serde_json::to_string_pretty(&signed).unwrap();
+
+        // Write to temp-dir/.lain/peers.json (matches peers_json_path)
+        let tmp = std::env::temp_dir().join("lain-test-peers");
+        let lain_dir = tmp.join(".lain");
+        std::fs::create_dir_all(&lain_dir).ok();
+        let tmp_peers = lain_dir.join("peers.json");
+        std::fs::write(&tmp_peers, &final_json).ok();
+
+        // Override LAIN_HOME to point to temp dir so load_peers reads from it
+        let prev = std::env::var("LAIN_HOME").ok();
+        unsafe { std::env::set_var("LAIN_HOME", tmp.to_str().unwrap_or("")); }
+
+        let loaded = load_peers(Some(*id.public_key()));
+        assert_eq!(loaded.len(), 1, "valid signed file should load");
+        assert!(loaded.contains_key(&pid));
+
+        // Now tamper with the signature and verify rejection
+        let bad_json = final_json.replace(&hex::encode(sig)[..8], "deadbeef");
+        std::fs::write(&tmp_peers, &bad_json).ok();
+        let loaded2 = load_peers(Some(*id.public_key()));
+        assert!(loaded2.is_empty(), "tampered signature should be rejected");
+
+        // Clean up
+        if let Some(v) = prev { unsafe { std::env::set_var("LAIN_HOME", v); } }
+        else { std::env::remove_var("LAIN_HOME"); }
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn test_load_peers_accepts_valid_no_signature() {
+        let id = Identity::generate().ok().unwrap();
+        let pid = id.peer_id();
+
+        let entries = vec![StoredPeer {
+            peer_id_hex: pid.to_hex(),
+            pubkey_hex: String::new(),
+            endpoints: vec!["10.0.0.1:443".to_string()],
+        }];
+        let json = serde_json::to_string(&entries).unwrap();
+
+        let tmp = std::env::temp_dir().join("lain-test-legacy");
+        let lain_dir = tmp.join(".lain");
+        std::fs::create_dir_all(&lain_dir).ok();
+        let tmp_peers = lain_dir.join("peers.json");
+        std::fs::write(&tmp_peers, &json).ok();
+
+        let prev = std::env::var("LAIN_HOME").ok();
+        unsafe { std::env::set_var("LAIN_HOME", tmp.to_str().unwrap_or("")); }
+
+        // Legacy format (no sig wrapper) + no pubkey provided = accept
+        let loaded = load_peers(None);
+        assert_eq!(loaded.len(), 1);
+
+        if let Some(v) = prev { unsafe { std::env::set_var("LAIN_HOME", v); } }
+        else { std::env::remove_var("LAIN_HOME"); }
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
 }

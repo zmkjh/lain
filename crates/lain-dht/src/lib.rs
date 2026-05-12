@@ -196,7 +196,7 @@ impl DhtHandle {
     }
 
     /// Generate a random PeerID in the given bucket's XOR range
-    fn random_id_in_bucket(&self, bucket_idx: usize) -> PeerId {
+    pub(crate) fn random_id_in_bucket(&self, bucket_idx: usize) -> PeerId {
         let mut id = self.peer_id.0;
         if bucket_idx < 256 {
             // Randomize all bits less significant than bucket_idx

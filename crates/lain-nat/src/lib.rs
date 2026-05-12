@@ -361,6 +361,9 @@ mod tests {
         assert_eq!(&req[20..22], &[0x00, 0x03]); // type
         assert_eq!(&req[22..24], &[0x00, 0x04]); // length
         assert_eq!(&req[24..28], &[0x00, 0x00, 0x00, 0x04]); // change port flag
+        // Message length (bytes 2-3) must be 8 for CHANGE-REQUEST (28 - 20 header)
+        assert_eq!(u16::from_be_bytes([req[2], req[3]]), 8,
+            "CHANGE-REQUEST message length must be 8");
     }
 
     #[test]

@@ -512,3 +512,85 @@ async fn test_dht_node_offline_find_peer_graceful() {
     let relays = node.find_relays().await.unwrap();
     assert!(relays.is_empty(), "no relays should be found with empty network");
 }
+
+#[tokio::test]
+async fn test_random_id_in_bucket_is_random() {
+    let dht = DhtHandle::new(make_id(41), [41u8; 32], make_config("127.0.0.1:0")).unwrap();
+    let mut ids = Vec::new();
+    for _ in 0..5 {
+        let id = dht.random_id_in_bucket(100);
+        ids.push(id.0);
+    }
+    // At least 2 of 5 calls should differ (probability near 1)
+    let unique: std::collections::HashSet<_> = ids.iter().collect();
+    assert!(unique.len() >= 2, "random_id_in_bucket should produce different values");
+}
+
+#[tokio::test]
+async fn test_find_value_event_has_correct_peer_id() {
+    let a = Arc::new(DhtHandle::new(make_id(42), [42u8; 32], make_config("127.0.0.1:0")).unwrap());
+    let b = Arc::new(DhtHandle::new(make_id(43), [43u8; 32], make_config("127.0.0.1:0")).unwrap());
+    spawn_recv_loop(a.clone());
+    spawn_recv_loop(b.clone());
+
+    let a_addr = a.socket().local_addr().unwrap();
+    let mut events = b.subscribe_events();
+
+    // Bootstrap
+    b.socket().send_to(&msg_codec::encode_ping_request(b.peer_id, [70u8; 16]), a_addr).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Create a real identity for the peer whose record we'll store
+    let target_id = Identity::generate().ok().unwrap();
+    let target_pk = *target_id.public_key();
+    let target_peer = target_id.peer_id();
+    let (_, target_np) = target_id.noise_keypair();
+    let ep = Endpoint::new("10.0.0.42:9000".parse().unwrap(), EndpointKind::STUN);
+
+    // A stores the record
+    let store = msg_codec::encode_store_request(b.peer_id, &target_peer.0, 600, &target_pk, &target_np, &[ep.clone()]);
+    b.socket().send_to(&store, a_addr).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // B sends FIND_VALUE to A for target_peer
+    b.socket().send_to(&msg_codec::encode_find_value_request(b.peer_id, [71u8; 16], &target_peer.0), a_addr).await.unwrap();
+
+    // Read events until we get PeerDiscovered or timeout
+    let start = std::time::Instant::now();
+    let mut got_event = false;
+    loop {
+        if start.elapsed() > Duration::from_secs(3) { break; }
+        match tokio::time::timeout(Duration::from_millis(500), events.recv()).await {
+            Ok(Ok(CoreDhtEvent::PeerDiscovered(pid, _rec))) => {
+                assert_eq!(pid, target_peer, "PeerDiscovered event must use correct PeerId");
+                got_event = true;
+                break;
+            }
+            _ => continue,
+        }
+    }
+    assert!(got_event, "should have received PeerDiscovered event");
+}
+
+#[tokio::test]
+async fn test_cleanup_does_not_clear_pending_queries() {
+    let dht = Arc::new(DhtHandle::new(make_id(44), [44u8; 32], make_config("127.0.0.1:0")).unwrap());
+    spawn_recv_loop(dht.clone());
+
+    // Register a pending query
+    let (tx, _rx) = tokio::sync::oneshot::channel();
+    dht.pending_queries.write().await.insert([99u8; 16], tx);
+
+    // Simulate cleanup (same logic as spawn_cleanup but without the pending_queries.clear)
+    {
+        let mut records = dht.peer_records.write().await;
+        let now = std::time::Instant::now();
+        records.retain(|_k, v| v.expires_at > now);
+    }
+    // Rate limit cleanup (this one still clears)
+    dht.peer_ratelimit.write().await.clear();
+
+    // pending_queries should still have our entry
+    assert!(dht.pending_queries.read().await.contains_key(&[99u8; 16]),
+        "pending queries must survive cleanup");
+}

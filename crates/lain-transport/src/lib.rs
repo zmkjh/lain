@@ -939,4 +939,18 @@ mod tests {
         assert_eq!(c.traversal_timeout_secs, 15);
         assert_eq!(c.bind_addr.port(), 9000);
     }
+
+    #[test]
+    fn test_ts_connect_key_derivation_matches_identity() {
+        let id = Identity::generate().ok().unwrap();
+        let (noise_secret, noise_pubkey) = id.noise_keypair();
+
+        // Re-derive the public key the same way ts_connect does
+        let secret = x25519_dalek::StaticSecret::from(noise_secret);
+        let public = x25519_dalek::PublicKey::from(&secret);
+        let derived_pk = public.to_bytes();
+
+        assert_eq!(derived_pk, noise_pubkey,
+            "X25519 public key derived from noise_secret must match noise_keypair output");
+    }
 }
