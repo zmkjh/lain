@@ -1,0 +1,35 @@
+2026-05-12T14:34:54.853017Z  INFO lain_daemon::config: No config file found, using defaults
+2026-05-12T14:34:54.853227Z  INFO lain_daemon: Lain daemon starting...
+2026-05-12T14:34:54.853475Z  INFO lain_identity: loading identity from C:\Users\86153\.lain\identity.json
+2026-05-12T14:34:54.853873Z  INFO lain_daemon: PeerID: f8df8b59c08df278
+2026-05-12T14:34:54.853996Z  INFO lain_daemon: Daemon is running
+2026-05-12T14:34:54.854115Z  INFO lain_daemon: IPC ready at Some("C:\\Users\\86153\\.lain\\socket")
+2026-05-12T14:34:54.854359Z  INFO lain_daemon::ipc: IPC local on "C:\\Users\\86153\\.lain\\socket"
+2026-05-12T14:35:29.163684Z  INFO lain_daemon: NAT: APDFSymmetric, mapped addr: Some(117.88.30.82:64273), IPv6: true
+2026-05-12T14:35:29.176747Z  INFO lain_transport: transport bound to Ok([::]:58414)
+2026-05-12T14:35:29.177363Z  INFO lain_daemon: transport on port 58414
+2026-05-12T14:35:29.178441Z  INFO lain_daemon: no bootstrap nodes configured, relying on mDNS LAN discovery
+2026-05-12T14:35:29.179426Z  INFO lain_dht: loaded 0 routes from C:\Users\86153\.lain\routes.json
+2026-05-12T14:35:29.179712Z  INFO lain_daemon: TSO TCP: 8 ports
+2026-05-12T14:35:29.180009Z  INFO lain_daemon: DHT heartbeat: 30s (NAT: APDFSymmetric)
+2026-05-12T14:35:29.181583Z  INFO lain_discovery::mdns: mDNS registered as f8df8b59c08df278 on port 58415
+2026-05-12T14:35:29.181977Z  INFO lain_daemon: mDNS registered on port 58415
+2026-05-12T14:35:29.183651Z  INFO lain_daemon: Invite: lain://qTHq0zx0hbzRPfDq49iTxYWF6KST6roUJJ9y6J5AZNMXWRRIXuYyjGljaJYsG36sgcho3oq2EE5snGhvZzDJiPNmPTxnfco8UuKewZiG0OAnrzZKFQz98ULcr8OdaSMdanajKGIUqSd3QUvtYrbnvNxY7YxHuWxiAAbXfPfnoGaLFu0GSqWnyQfYjxYMxGCjbCNQwuU5LCCtzdPTbe106ghyziTmFMkspzHQ9NgfUNT9WIIL0npd5ceb6nKdY2tM1f2bFPLy9GgZKkzEPytim6gTCUoIstd1uS7ZY2F9ctlWmGRxyVBO5aW4Rc8tdmg2ASoCe0WRwWSBKha9ZtBf67Z4Wv5JiZqEp5cQqYUuHPfJLQpuuzQ6pGbcRiGEpLf9uuMYXzPWXgdCPnCqkpIWqV9JAa
+2026-05-12T14:35:29.195888Z  INFO lain_daemon: restored 1 known peers
+2026-05-12T14:35:29.198295Z  INFO lain_dht: saved 0 routes to C:\Users\86153\.lain\routes.json
+2026-05-12T14:35:59.194381Z  INFO lain_dht: saved 0 routes to C:\Users\86153\.lain\routes.json
+2026-05-12T14:35:59.923341Z  INFO lain_dht: bootstrap bucket refresh complete, 0 nodes in routing table
+2026-05-12T14:36:25.466017Z  INFO lain_daemon: IPC: connect via lain://1O2tjDdxbo9hL4kg8yEFgU77sy6nxxpAFPSsWlRq1SYZPUQ71hmmNyYb3Out62QibXN2ICLMpSR0w6bxp2v13AEzPZjpN573xVlPQ4kgZg1feLUsIBqf8Pl9dAWfn0P49eIcsNmNffWjN42ZKNKhDSZS9UQX0bkSPuInXTPdlfMUwwdl6J3xzsBfU59qESNRuekne7VQcEmg8lNoQ0OLX1VnjdZRDWLlAmYHb2AxHngdrzukxXvrLBle0RW9wK3GW4AmTCcpdNOnoTAYCYVDDSRsyFL2FUZH8yS9QKKHswMqI9QPlyHe5MYOeOBjWyMVP6EJMT0CwdqxTssIKBKPq0G4Rry3Mq50aDSlgOVznthJoBwJti9Ocd1mHfWpoSdZdUqTo0rlH2mD02K4BwslHGUEfDolalVrheuLTWM3OWm8ZjXZDiDjSvAe1zbnYm1eXiNOvAhRfDIFKerpwRgbivwKsVpd7f
+2026-05-12T14:36:25.466482Z  INFO lain_daemon::conn_mgr: ConnectionManager: added 8aaaca7920ffa8d9
+2026-05-12T14:36:25.467370Z  WARN quinn_udp: sendmsg error: Os { code: 10051, kind: NetworkUnreachable, message: "向一个无法连接的网络尝试了一个套接字操作。" }, Transmit: { destination: [2001:0:14c9:d502:2c3c:a6b6:741c:7d92]:57460, src_ip: None, ecn: Some(Ect0), len: 1200, segment_size: None }
+2026-05-12T14:36:29.199423Z  INFO lain_dht: saved 0 routes to C:\Users\86153\.lain\routes.json
+2026-05-12T14:36:59.186335Z  INFO lain_dht: saved 0 routes to C:\Users\86153\.lain\routes.json
+2026-05-12T14:37:25.490850Z  WARN quinn_udp: sendmsg error: Os { code: 10051, kind: NetworkUnreachable, message: "向一个无法连接的网络尝试了一个套接字操作。" }, Transmit: { destination: [2001:0:14c9:d502:2c3c:a6b6:741c:7d92]:57461, src_ip: None, ecn: Some(Ect0), len: 1200, segment_size: None }
+2026-05-12T14:37:29.188228Z  INFO lain_dht: saved 0 routes to C:\Users\86153\.lain\routes.json
+2026-05-12T14:37:36.201747Z  INFO lain_daemon: IPC: connect via lain://1O2tjDdxbo9hL4kg8yEFgU77sy6nxxpAFPSsWlRq1SYZPUQ71hmmNyYb3Out62QibXN2ICLMpSR0w6bxp2v13AEzPZjpN573xVlPQ4kgZg1feLUsIBqf8Pl9dAWfn0P49eIcsNmNffWjN42ZKNKhDSZS9UQX0bkSPuInXTPdlfMUwwdl6J3xzsBfU59qESNRuekne7VQcEmg8lNoQ0OLX1VnjdZRDWLlAmYHb2AxHngdrzukxXvrLBle0RW9wK3GW4AmTCcpdNOnoTAYCYVDDSRsyFL2FUZH8yS9QKKHswMqI9QPlyHe5MYOeOBjWyMVP6EJMT0CwdqxTssIKBKPq0G4Rry3Mq50aDSlgOVznthJoBwJti9Ocd1mHfWpoSdZdUqTo0sxQrjFKeJoIPwBsmjyYMgkBj8YLKrx87YPyfb4BMtPylPitHqJSeYCLhrnSdVutQ5PYfLp8RS2JckQAmYJbSwzKd
+2026-05-12T14:37:36.202148Z  INFO lain_daemon::conn_mgr: ConnectionManager: added 8aaaca7920ffa8d9
+2026-05-12T14:37:59.198300Z  INFO lain_dht: saved 0 routes to C:\Users\86153\.lain\routes.json
+2026-05-12T14:38:25.506924Z  WARN lain_daemon: direct connect to 8aaaca7920ffa8d9 failed: no path for 0000000000000000, trying relay
+2026-05-12T14:38:29.197729Z  INFO lain_dht: saved 0 routes to C:\Users\86153\.lain\routes.json
+2026-05-12T14:38:33.127559Z  INFO lain_daemon: SIGTERM, draining...
+2026-05-12T14:38:33.129009Z  INFO lain_daemon: Daemon stopped

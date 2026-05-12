@@ -37,6 +37,8 @@ pub struct TransportConfig {
     pub max_connections: usize,
     pub idle_timeout_ms: u32,
     pub traversal_timeout_secs: u64,
+    /// Whether outbound IPv6 is routable (has global unicast address)
+    pub has_ipv6: bool,
 }
 
 impl Default for TransportConfig {
@@ -46,6 +48,7 @@ impl Default for TransportConfig {
             max_connections: lain_core::MAX_CONNECTIONS,
             idle_timeout_ms: (lain_core::IDLE_TIMEOUT_SECS * 1000) as u32,
             traversal_timeout_secs: lain_core::TRAVERSAL_TIMEOUT_SECS,
+            has_ipv6: false,
         }
     }
 }
@@ -276,7 +279,8 @@ impl Transport {
         ));
 
         let mut eps: Vec<_> = endpoints.iter()
-            .filter(|e| e.kind != EndpointKind::TSO) // TSO handled by ts_connect
+            .filter(|e| e.kind != EndpointKind::TSO)
+            .filter(|e| self.config.has_ipv6 || e.kind != EndpointKind::IPv6) // skip IPv6 if not available
             .collect();
         eps.sort_by(|a, b| b.priority.cmp(&a.priority));
 
@@ -1070,6 +1074,7 @@ mod tests {
             max_connections: 128,
             idle_timeout_ms: 60000,
             traversal_timeout_secs: 15,
+            has_ipv6: false,
         };
         assert_eq!(c.max_connections, 128);
         assert_eq!(c.idle_timeout_ms, 60000);

@@ -267,7 +267,11 @@ impl Daemon {
 
         // 3. 初始化 Transport (dual-stack when IPv6 available)
         let transport = Transport::new(
-            TransportConfig { bind_addr, ..Default::default() },
+            TransportConfig {
+                bind_addr,
+                has_ipv6: ipv6_addr.is_some(),
+                ..Default::default()
+            },
             _noise_secret,
             peer_id,
             public_key,
