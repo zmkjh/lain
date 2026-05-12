@@ -1,0 +1,28 @@
+2026-05-12T14:35:17.874662Z  INFO lain_daemon::config: No config file found, using defaults
+2026-05-12T14:35:17.875128Z  INFO lain_daemon: Lain daemon starting...
+2026-05-12T14:35:17.875530Z  INFO lain_identity: loading identity from C:\Users\OscarTeng\.lain\identity.json
+2026-05-12T14:35:17.876280Z  INFO lain_daemon: PeerID: 8aaaca7920ffa8d9
+2026-05-12T14:35:17.876407Z  INFO lain_daemon: Daemon is running
+2026-05-12T14:35:17.876586Z  INFO lain_daemon: IPC ready at Some("C:\\Users\\OscarTeng\\.lain\\socket")
+2026-05-12T14:35:17.876931Z  INFO lain_daemon::ipc: IPC local on "C:\\Users\\OscarTeng\\.lain\\socket"
+2026-05-12T14:35:17.881287Z  WARN lain_daemon: VPN/TUN interface 'Teredo Tunneling Pseudo-Interface' detected — STUN may return wrong public IP.Consider disabling VPN for accurate NAT detection.
+2026-05-12T14:35:17.881502Z  WARN lain_daemon: VPN/TUN interface 'Teredo Tunneling Pseudo-Interface' detected — STUN may return wrong public IP.Consider disabling VPN for accurate NAT detection.
+2026-05-12T14:35:54.015188Z  INFO lain_daemon: NAT: APDFSymmetric, mapped addr: Some(139.227.130.109:22973), IPv6: true
+2026-05-12T14:35:54.017476Z  INFO lain_daemon: IPv6 global: 2001:0:14c9:d502:2c3c:a6b6:741c:7d92
+2026-05-12T14:35:54.018402Z  INFO lain_transport: transport bound to Ok([::]:57460)
+2026-05-12T14:35:54.018505Z  INFO lain_daemon: transport on port 57460
+2026-05-12T14:35:54.018849Z  INFO lain_daemon: no bootstrap nodes configured, relying on mDNS LAN discovery
+2026-05-12T14:35:54.019161Z  INFO lain_dht: loaded 0 routes from C:\Users\OscarTeng\.lain\routes.json
+2026-05-12T14:35:54.019240Z  INFO lain_daemon: TSO TCP: 8 ports
+2026-05-12T14:35:54.019388Z  INFO lain_daemon: DHT heartbeat: 30s (NAT: APDFSymmetric)
+2026-05-12T14:35:54.019853Z  INFO lain_discovery::mdns: mDNS registered as 8aaaca7920ffa8d9 on port 57461
+2026-05-12T14:35:54.019913Z  INFO lain_daemon: mDNS registered on port 57461
+2026-05-12T14:35:54.020559Z  INFO lain_daemon: Invite: lain://1O2tjDdxbo9hL4kg8yEFgU77sy6nxxpAFPSsWlRq1SYZPUQ71hmmNyYb3Out62QibXN2ICLMpSR0w6bxp2v13AEzPZjpN573xVlPQ4kgZg1feLUsIBqf8Pl9dAWfn0P49eIcsNmNffWjN42ZKNKhDSZS9UQX0bkSPuInXTPdlfMUwwdl6J3xzsBfU59qESNRuekne7VQcEmg8lNoQ0OLX1VnjdZRDWLlAmYHb2AxHngdrzukxXvrLBle0RW9wK3GW4AmTCcpdNOnoTAYCYVDDSRsyFL2FUZH8yS9QKKHswMqI9QPlyHe5MYOeOBjWyMVP6EJMT0CwdqxTssIKBKPq0G4Rry3Mq50aDSlgOVznthJoBwJti9Ocd1mHfWpoSdZdUqTo0rlH2mD02K4BwslHGUEfDolalVrheuLTWM3OWm8ZjXZDiDjSvAe1zbnYm1eXiNOvAhRfDIFKerpwRgbivwKsVpd7f
+2026-05-12T14:35:54.031362Z  INFO lain_dht: saved 0 routes to C:\Users\OscarTeng\.lain\routes.json
+2026-05-12T14:36:24.023811Z  INFO lain_dht: saved 0 routes to C:\Users\OscarTeng\.lain\routes.json
+2026-05-12T14:36:25.070543Z  INFO lain_dht: bootstrap bucket refresh complete, 0 nodes in routing table
+2026-05-12T14:36:54.023777Z  INFO lain_dht: saved 0 routes to C:\Users\OscarTeng\.lain\routes.json
+2026-05-12T14:37:24.032392Z  INFO lain_dht: saved 0 routes to C:\Users\OscarTeng\.lain\routes.json
+2026-05-12T14:37:54.023535Z  INFO lain_dht: saved 0 routes to C:\Users\OscarTeng\.lain\routes.json
+2026-05-12T14:38:19.148057Z  INFO lain_daemon: SIGTERM, draining...
+2026-05-12T14:38:19.149089Z  INFO lain_daemon: Daemon stopped

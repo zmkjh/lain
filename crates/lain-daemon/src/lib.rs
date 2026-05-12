@@ -238,13 +238,6 @@ impl Daemon {
         tracing::info!("NAT: {:?}, mapped addr: {:?}, IPv6: {}", nat_result.nat_type, nat_result.mapped_addr, nat_result.ipv6_inbound);
 
         // 2. Purity under NAT: detect IPv6 global address for direct P2P
-        let bind_addr = if nat_result.ipv6_inbound {
-            "[::]:0".parse::<SocketAddr>()
-                .map_err(|e: std::net::AddrParseError| DaemonError::Config(e.to_string()))?
-        } else {
-            "0.0.0.0:0".parse::<SocketAddr>()
-                .map_err(|e: std::net::AddrParseError| DaemonError::Config(e.to_string()))?
-        };
         let ipv6_addr: Option<std::net::SocketAddr> = if nat_result.ipv6_inbound {
             if_addrs::get_if_addrs().ok().and_then(|ifs| {
                 ifs.into_iter().find_map(|i| {
@@ -261,6 +254,9 @@ impl Daemon {
         if let Some(ref addr) = ipv6_addr {
             tracing::info!("IPv6 global: {}", addr.ip());
         }
+
+        // Only bind IPv6 when we have a routable global address
+        let bind_addr = if ipv6_addr.is_some() {
 
         // 3. 身份噪声密钥对
         let (_noise_secret, noise_pubkey) = self.identity.noise_keypair();
