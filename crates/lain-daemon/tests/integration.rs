@@ -661,7 +661,7 @@ async fn test_tso_handshake_and_exchange() {
     let tso_addr = addr_rx.await.unwrap();
 
     // ─── Client side: call ts_connect ───
-    let result = t_a.ts_connect(&id_b.peer_id(), &[tso_addr], &[]).await;
+    let result = t_a.ts_connect(&id_b.peer_id(), &[tso_addr]).await;
     assert!(result.is_ok(), "TSO connect must succeed: {:?}", result.err());
 
     let (_stream, mut client_session, _peer) = result.unwrap();

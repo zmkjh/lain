@@ -361,7 +361,6 @@ impl Daemon {
         // Collect ports for ts_connect to bind source-side.
         const TSO_PORTS: u16 = 24;
         const TSO_BASE: u16 = 42000;
-        let mut tso_local_ports = Vec::with_capacity(TSO_PORTS as usize);
         let bind_ip = bind_addr.ip();
         for i in 0..TSO_PORTS {
             let target = std::net::SocketAddr::new(bind_ip, TSO_BASE + i);
@@ -373,7 +372,6 @@ impl Daemon {
             let tso_port = tso_listener.local_addr()
                 .map_err(|e| DaemonError::Config(format!("TSO addr: {e}")))?
                 .port();
-            tso_local_ports.push(tso_port);
             if let Some(stun) = nat_result.mapped_addr {
                 endpoints.push(Endpoint::new(
                     SocketAddr::new(stun.ip(), tso_port),
@@ -439,7 +437,6 @@ impl Daemon {
             });
         }
         tracing::info!("TSO TCP: {TSO_PORTS} ports");
-        let tso_ports = std::sync::Arc::new(tso_local_ports);
 
         if let Err(e) = dht.store_self(&public_key, &noise_pubkey, &endpoints, capabilities).await {
             tracing::warn!("initial DHT STORE failed: {e}");
@@ -757,7 +754,6 @@ impl Daemon {
                                 let my_dht = endpoints.last().map(|e| e.addr);
                                 let my_endpoints = endpoints.clone();
                                 let my_pubkey = public_key;
-                                let tso_ports = tso_ports.clone();
                                 let my_noise_pk = noise_pubkey;
                                 let my_caps = capabilities;
                                 tokio::spawn(async move {
@@ -907,16 +903,16 @@ impl Daemon {
                                                 .filter(|ep| ep.kind == lain_core::endpoint::EndpointKind::TSO)
                                                 .map(|ep| ep.addr).collect();
                                             if !tso_eps.is_empty() {
-                                    match t.ts_connect(&pid, &tso_eps, &tso_ports).await {
-                                                    Ok((_stream, _session, _peer)) => {
-                                                        let _ = ipc_ev.send(IpcResponse::Event {
-                                                            event: "peer_connected".into(),
-                                                            peer_id: Some(pid.to_string()),
-                                                            data: Some(serde_json::json!({"via": "tso"})),
-                                                        });
-                                                        return;
-                                                    }
-                                                    Err(e) => tracing::debug!("TSO to {pid}: {e}"),
+                                    match t.ts_connect(&pid, &tso_eps).await {
+                                                        Ok((_stream, _session, _peer)) => {
+                                                            let _ = ipc_ev.send(IpcResponse::Event {
+                                                                event: "peer_connected".into(),
+                                                                peer_id: Some(pid.to_string()),
+                                                                data: Some(serde_json::json!({"via": "tso"})),
+                                                            });
+                                                            return;
+                                                        }
+                                                        Err(e) => tracing::debug!("TSO to {pid}: {e}"),
                                                 }
                                             }
                                             // All paths exhausted
@@ -971,9 +967,8 @@ impl Daemon {
                                     .filter(|e| e.kind == lain_core::endpoint::EndpointKind::TSO)
                                     .map(|e| e.addr)
                                     .collect();
-                                let tso_ports = tso_ports.clone();
                                 tokio::spawn(async move {
-                                                        match t.ts_connect(&pid, &tso_eps, &tso_ports).await {
+                                                match t.ts_connect(&pid, &tso_eps).await {
                                         Ok((_stream, _session, peer)) => {
                                             let _ = ipc_ev.send(IpcResponse::Event {
                                                 event: "peer_connected".into(),
@@ -1006,7 +1001,6 @@ impl Daemon {
                             let ipc_ev = _ipc_ev_tx.clone();
                             let connected_ref = connected.clone();
                             let conn_sem2 = conn_sem.clone();
-                            let tso_ports = tso_ports.clone();
                             tokio::spawn(async move {
                                 if let Ok(pid) = PeerId::from_hex(&peer_id) {
                                     match dht.find_peer(&pid).await {
@@ -1054,7 +1048,7 @@ impl Daemon {
                                                     // TSO fallback
                                                     let tso_eps: Vec<_> = eps.iter().filter(|ep| ep.kind == lain_core::endpoint::EndpointKind::TSO).map(|ep| ep.addr).collect();
                                                     if !tso_eps.is_empty() {
-                                                match t.ts_connect(&pid, &tso_eps, &tso_ports).await {
+                                                match t.ts_connect(&pid, &tso_eps).await {
                                                             Ok((_stream, _session, _peer)) => {
                                                                 let _ = ipc_ev.send(IpcResponse::Event {
                                                                     event: "peer_connected".into(),

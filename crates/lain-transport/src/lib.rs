@@ -272,15 +272,14 @@ impl Transport {
         });
     }
 
-    /// TCP Simultaneous Open: both sides bind TCP and connect simultaneously.
-    /// Uses local TSO ports (set via set_tso_ports) as source so outgoing SYN
-    /// creates NAT hole for the listener on the same port.
-    /// Birthday-attack style: concurrent per round, first to connect wins.
+    /// TCP Simultaneous Open: both sides bind+connect simultaneously.
+    /// Each side creates TcpSockets bound to a dedicated port (NAT hole),
+    /// connects to the peer's TSO endpoints concurrently.
+    /// Pure bind+connect — no listener sharing, works on all platforms.
     pub async fn ts_connect(
         &self,
         _peer_id: &PeerId,
         tso_endpoints: &[SocketAddr],
-        local_tso_ports: &[u16],
     ) -> Result<(tokio::net::TcpStream, lain_noise::NoiseSession, SocketAddr), TransportError> {
         use tokio::net::TcpSocket;
         use tokio::net::TcpStream;
@@ -289,75 +288,31 @@ impl Transport {
         let per_attempt_timeout = std::time::Duration::from_millis(150);
         let inter_round_sleep = std::time::Duration::from_millis(100);
 
-        if local_tso_ports.is_empty() {
-            return self.ts_connect_fallback(_peer_id, tso_endpoints).await;
-        }
-
-        let bind_ip = self.config.bind_addr.ip();
-
         while std::time::Instant::now() < deadline {
             let (tx, mut rx) = tokio::sync::mpsc::channel::<TcpStream>(1);
 
-            for &local_port in local_tso_ports {
-                for &remote_ep in tso_endpoints {
-                    let tx = tx.clone();
-                    let local_addr = std::net::SocketAddr::new(bind_ip, local_port);
-                    tokio::spawn(async move {
-                        match TcpSocket::new_v4() {
-                            Ok(socket) => {
-                                socket.set_reuseaddr(true).ok();
-                                if socket.bind(local_addr).is_ok() {
-                                    match tokio::time::timeout(
-                                        per_attempt_timeout,
-                                        socket.connect(remote_ep),
-                                    ).await {
-                                        Ok(Ok(s)) => { tx.send(s).await.ok(); }
-                                        _ => {}
-                                    }
+            for &remote_ep in tso_endpoints {
+                let tx = tx.clone();
+                tokio::spawn(async move {
+                    match TcpSocket::new_v4() {
+                        Ok(socket) => {
+                            // Bind to any available port — this creates the NAT hole
+                            if socket.bind("0.0.0.0:0".parse().unwrap()).is_ok() {
+                                match tokio::time::timeout(
+                                    per_attempt_timeout,
+                                    socket.connect(remote_ep),
+                                ).await {
+                                    Ok(Ok(s)) => { tx.send(s).await.ok(); }
+                                    _ => {}
                                 }
                             }
-                            Err(_) => {}
                         }
-                    });
-                }
-            }
-            drop(tx);
-
-            if let Some(stream) = rx.recv().await {
-                tracing::info!("TSO established");
-                return self.ts_handshake(stream).await;
-            }
-            tokio::time::sleep(inter_round_sleep).await;
-        }
-
-        Err(TransportError::Connect("TSO timeout".into()))
-    }
-
-    /// Fallback when no TSO ports configured: random source port (legacy behavior)
-    async fn ts_connect_fallback(
-        &self,
-        _peer_id: &PeerId,
-        tso_endpoints: &[SocketAddr],
-    ) -> Result<(tokio::net::TcpStream, lain_noise::NoiseSession, SocketAddr), TransportError> {
-        use tokio::net::TcpStream;
-
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(102);
-        let per_attempt_timeout = std::time::Duration::from_millis(150);
-        let inter_round_sleep = std::time::Duration::from_millis(100);
-
-        while std::time::Instant::now() < deadline {
-            let (tx, mut rx) = tokio::sync::mpsc::channel::<TcpStream>(1);
-            for ep in tso_endpoints {
-                let tx = tx.clone();
-                let addr = *ep;
-                tokio::spawn(async move {
-                    match tokio::time::timeout(per_attempt_timeout, TcpStream::connect(addr)).await {
-                        Ok(Ok(s)) => { tx.send(s).await.ok(); }
-                        _ => {}
+                        Err(_) => {}
                     }
                 });
             }
             drop(tx);
+
             if let Some(stream) = rx.recv().await {
                 tracing::info!("TSO established");
                 return self.ts_handshake(stream).await;
@@ -368,7 +323,6 @@ impl Transport {
         Err(TransportError::Connect("TSO timeout".into()))
     }
 
-    /// Complete Noise IK handshake over an established TSO TCP stream
     async fn ts_handshake(
         &self,
         mut stream: tokio::net::TcpStream,

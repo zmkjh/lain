@@ -46,3 +46,4 @@ libc = "0.2"
 hex = "0.4"
 base64 = "0.22"
 x25519-dalek = { version = "2", features = ["static_secrets"] }
+socket2 = "0.5"
