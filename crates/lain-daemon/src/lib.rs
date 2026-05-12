@@ -543,10 +543,11 @@ impl Daemon {
         )));
 
         // Log initial invite
-        let init_invite = lain_discovery::InviteCode::new(
+        let mut init_invite = lain_discovery::InviteCode::new(
             peer_id, public_key, noise_pubkey, capabilities, endpoints.clone(),
             &|data| self.identity.sign(data),
         );
+        init_invite.port_delta_hint = nat_result.port_delta.unwrap_or(0) as u8;
         tracing::info!("Invite: lain://{}", init_invite.to_base62());
 
         // 7. (IPC was started early at the top of run())
@@ -1090,10 +1091,11 @@ impl Daemon {
                         }
                         IpcCommand::GetInviteCode { reply } => {
                             let (pid, pk, npk, caps, eps) = invite_state.read().await.clone();
-                            let inv = lain_discovery::InviteCode::new(
+                            let mut inv = lain_discovery::InviteCode::new(
                                 pid, pk, npk, caps, eps,
                                 &|data| self.identity.sign(data),
                             );
+                            inv.port_delta_hint = nat_result.port_delta.unwrap_or(0) as u8;
                             let _ = reply.send(format!("lain://{}", inv.to_base62()));
                         }
                     }
