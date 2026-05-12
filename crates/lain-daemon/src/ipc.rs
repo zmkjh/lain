@@ -333,7 +333,7 @@ async fn dispatch(
         IpcRequest::ListPeers => {
             let (tx, rx) = tokio::sync::oneshot::channel();
             send_or_warn(cmd_tx, IpcCommand::GetStatus { reply: tx }, "status");
-            match tokio::time::timeout(std::time::Duration::from_secs(5), rx).await {
+            match tokio::time::timeout(std::time::Duration::from_secs(30), rx).await {
                 Ok(Ok(data)) => IpcResponse::Ok { message: None, data: Some(data) },
                 _ => IpcResponse::Error { code: "TIMEOUT".into(), message: "daemon busy".into() },
             }
@@ -341,7 +341,7 @@ async fn dispatch(
         IpcRequest::Whoami => {
             let (tx, rx) = tokio::sync::oneshot::channel();
             send_or_warn(cmd_tx, IpcCommand::GetWhoami { reply: tx }, "whoami");
-            match tokio::time::timeout(std::time::Duration::from_secs(5), rx).await {
+            match tokio::time::timeout(std::time::Duration::from_secs(30), rx).await {
                 Ok(Ok(pid)) => IpcResponse::Ok { message: Some(pid), data: None },
                 _ => IpcResponse::Error { code: "TIMEOUT".into(), message: "daemon busy".into() },
             }
@@ -349,7 +349,7 @@ async fn dispatch(
         IpcRequest::GetInvite => {
             let (tx, rx) = tokio::sync::oneshot::channel();
             send_or_warn(cmd_tx, IpcCommand::GetInviteCode { reply: tx }, "invite");
-            match tokio::time::timeout(std::time::Duration::from_secs(5), rx).await {
+            match tokio::time::timeout(std::time::Duration::from_secs(30), rx).await {
                 Ok(Ok(code)) => IpcResponse::Ok { message: Some(code), data: None },
                 _ => IpcResponse::Error { code: "TIMEOUT".into(), message: "daemon busy".into() },
             }

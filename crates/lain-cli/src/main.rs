@@ -191,17 +191,21 @@ fn run_daemon(foreground: bool) {
             Ok(_child) => {
                 println!("Starting daemon (NAT probe + DHT bootstrap may take a few seconds)...");
                 // Retry IPC until daemon is ready
-                for i in 0..10 {
+                for i in 0..20 {
+                    if i == 5 { eprintln!("still waiting (NAT probe may take a while)..."); }
                     std::thread::sleep(std::time::Duration::from_secs(1));
                     match ipc_req(&socket_path, r#"{"cmd":"Whoami"}"#) {
                         Some(v) => {
-                            let pid = v.get("message").and_then(|m| m.as_str()).unwrap_or("?");
-                            println!("Lain daemon started");
-                            println!("PeerID: {pid}");
-                            println!("Logs: ~/.lain/daemon.log");
-                            return;
+                            if v.get("type").and_then(|t| t.as_str()) == Some("Ok") {
+                                let pid = v.get("message").and_then(|m| m.as_str()).unwrap_or("?");
+                                println!("Lain daemon started");
+                                println!("PeerID: {pid}");
+                                println!("Logs: ~/.lain/daemon.log");
+                                return;
+                            }
+                            // Got error response (daemon busy) — keep retrying
                         }
-                        None => continue,
+                        None => {} // IPC not available yet — keep retrying
                     }
                 }
                 eprintln!("daemon failed to start (timeout)");
