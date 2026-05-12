@@ -356,12 +356,20 @@ impl Daemon {
         };
         endpoints.push(Endpoint::new(public_dht_addr, lain_core::endpoint::EndpointKind::STUN));
 
-        // TSO TCP ports: bind N sockets for birthday-attack-style TSO,
-        // increasing probability of TCP simultaneous open through APDF NAT.
+        // TSO TCP ports: bind N consecutive sockets for smart birthday attack.
+        // Clustered ports → NAT maps them as a consecutive block →
+        // peer's concurrent SYNs hit a tight window with high overlap.
+        // Fallback to random port if consecutive one is occupied.
         const TSO_PORTS: u16 = 24;
-        for _ in 0..TSO_PORTS {
-            let tso_listener = tokio::net::TcpListener::bind(bind_addr).await
-                .map_err(|e| DaemonError::Config(format!("TSO bind: {e}")))?;
+        const TSO_BASE: u16 = 42000;
+        let bind_ip = bind_addr.ip();
+        for i in 0..TSO_PORTS {
+            let target = std::net::SocketAddr::new(bind_ip, TSO_BASE + i);
+            let tso_listener = match tokio::net::TcpListener::bind(target).await {
+                Ok(l) => l,
+                Err(_) => tokio::net::TcpListener::bind(bind_addr).await
+                    .map_err(|e| DaemonError::Config(format!("TSO bind: {e}")))?,
+            };
             let tso_port = tso_listener.local_addr()
                 .map_err(|e| DaemonError::Config(format!("TSO addr: {e}")))?
                 .port();
