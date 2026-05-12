@@ -560,6 +560,7 @@ impl Daemon {
                                     Ok((_send, mut recv)) => {
                                         match recv.read_to_end(65536).await {
                                             Ok(data) => {
+                                            if is_ping_frame(&data) { continue; }
                                                 use base64::Engine;
                                                 let b64 = base64::engine::general_purpose::STANDARD.encode(&data);
                                                 let _ = ipc_ev_a.send(IpcResponse::Event {
@@ -791,6 +792,7 @@ impl Daemon {
                                                         Ok((_send, mut recv)) => {
                                                             match recv.read_to_end(65536).await {
                                                                 Ok(data) => {
+                                            if is_ping_frame(&data) { continue; }
                                                                     use base64::Engine;
                                                                     let b64 = base64::engine::general_purpose::STANDARD.encode(&data);
                                                                     let _ = ipc_ev2.send(IpcResponse::Event {
@@ -853,6 +855,7 @@ impl Daemon {
                                                                             Ok((_send, mut recv)) => {
                                                                                 match recv.read_to_end(65536).await {
                                                                                     Ok(data) => {
+                                            if is_ping_frame(&data) { continue; }
                                                                                         use base64::Engine;
                                                                                         let b64 = base64::engine::general_purpose::STANDARD.encode(&data);
                                                                                         let _ = ipc_ev2.send(IpcResponse::Event {
@@ -908,6 +911,7 @@ impl Daemon {
                                                                 loop {
                                                                     match tso.recv().await {
                                                                         Ok(data) => {
+                                            if is_ping_frame(&data) { continue; }
                                                                             use base64::Engine;
                                                                             let b64 = base64::engine::general_purpose::STANDARD.encode(&data);
                                                                             let _ = ipc_ev2.send(IpcResponse::Event {
@@ -1009,6 +1013,7 @@ impl Daemon {
                                                             loop {
                                                                 match tso.recv().await {
                                                                     Ok(data) => {
+                                            if is_ping_frame(&data) { continue; }
                                                                         use base64::Engine;
                                                                         let b64 = base64::engine::general_purpose::STANDARD.encode(&data);
                                                                         let _ = ipc_ev2.send(IpcResponse::Event {
@@ -1081,6 +1086,7 @@ impl Daemon {
                                                                 Ok((_send, mut recv)) => {
                                                                     match recv.read_to_end(65536).await {
                                                                         Ok(data) => {
+                                            if is_ping_frame(&data) { continue; }
                                                                             use base64::Engine;
                                                                             let b64 = base64::engine::general_purpose::STANDARD.encode(&data);
                                                                             let _ = ipc_ev2.send(IpcResponse::Event {
@@ -1133,8 +1139,9 @@ impl Daemon {
                                                                             match rc.accept_bi().await {
                                                                                 Ok((_send, mut recv)) => {
                                                                                     match recv.read_to_end(65536).await {
-                                                                                        Ok(data) => {
-                                                                                            use base64::Engine;
+                                                                Ok(data) => {
+                                            if is_ping_frame(&data) { continue; }
+                                                                                use base64::Engine;
                                                                                             let b64 = base64::engine::general_purpose::STANDARD.encode(&data);
                                                                                             let _ = ipc_ev2.send(IpcResponse::Event {
                                                                                                 event: "data".into(),
@@ -1179,6 +1186,7 @@ impl Daemon {
                                                                     loop {
                                                                         match tso.recv().await {
                                                                             Ok(data) => {
+                                            if is_ping_frame(&data) { continue; }
                                                                                 use base64::Engine;
                                                                                 let b64 = base64::engine::general_purpose::STANDARD.encode(&data);
                                                                                 let _ = ipc_ev2.send(IpcResponse::Event {
@@ -1301,6 +1309,9 @@ impl Daemon {
                             let rt_size = dht_arc.routing_table_size().await;
                             let known = known_peers.read().await.len();
                             let active = connected.read().await.len();
+        let peers: Vec<String> = connected.read().await.keys()
+            .map(|p| p.to_string())
+            .collect();
                             let peers: Vec<String> = connected.read().await.keys()
                                 .map(|p| p.to_string())
                                 .collect();
@@ -1393,6 +1404,13 @@ fn ipc_socket_alive(path: &PathBuf) -> bool {
             .open(path)
             .is_ok()
     }
+}
+
+/// Filter out keepalive PING frames — these should not be forwarded to IPC as data.
+fn is_ping_frame(data: &[u8]) -> bool {
+    lain_core::frame::decode_frame_header(data)
+        .map(|(_, ft, _, _)| ft == lain_core::frame::FrameType::Ping)
+        .unwrap_or(false)
 }
 
 fn dirs_home() -> Option<PathBuf> {
