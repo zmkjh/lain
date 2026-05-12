@@ -3,7 +3,7 @@
 **零服务器 P2P 网络基础设施。** 无需 bootstrap 节点、无需 DNS、无需 TLS 证书。PeerID 即身份，Invite 即入口，DHT 即拓扑。
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-[![Tests](https://img.shields.io/badge/tests-152-brightgreen.svg)](https://github.com/zmkjh/lain/actions)
+[![Tests](https://img.shields.io/badge/tests-154-brightgreen.svg)](https://github.com/zmkjh/lain/actions)
 ![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-lightgrey)
 
 ## 核心创新
@@ -191,10 +191,10 @@ IPC 协议完整规范见 [PROTOCOL.md §8](PROTOCOL.md#8-ipc-api)。
 
 ```bash
 cargo build --release    # 生产构建
-cargo test               # 152 自动化测试 (0 warning)
+cargo test               # 154 自动化测试 (0 warning)
 ```
 
-152 个测试覆盖全部协议层：identity、noise、nat（含全部 NAT 类型分类）、dht（全部消息类型）、discovery、transport（QUIC/TSO/relay/并发）、daemon + 13 个端到端集成测试。
+154 个测试覆盖全部协议层：identity、noise、nat（含全部 NAT 类型分类）、dht（全部消息类型）、discovery、transport（QUIC/TSO/relay/并发）、daemon + 15 个端到端集成测试。
 
 ## 许可证
 
