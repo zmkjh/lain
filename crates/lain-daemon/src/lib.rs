@@ -688,6 +688,8 @@ impl Daemon {
                                 let my_dht = endpoints.last().map(|e| e.addr);
                                 let my_endpoints = endpoints.clone();
                                 let my_pubkey = public_key;
+                                let nat_port_delta = nat_result.port_delta;
+                                let nat_rtt_ms = nat_result.stun_rtt_ms;
                                 let my_noise_pk = noise_pubkey;
                                 let my_caps = capabilities;
                                 tokio::spawn(async move {
@@ -837,7 +839,7 @@ impl Daemon {
                                                 .filter(|ep| ep.kind == lain_core::endpoint::EndpointKind::TSO)
                                                 .map(|ep| ep.addr).collect();
                                             if !tso_eps.is_empty() {
-                                    match t.ts_connect(&pid, &tso_eps).await {
+                                    match t.ts_connect(&pid, &tso_eps, nat_port_delta, nat_rtt_ms).await {
                                                         Ok((_stream, _session, _peer)) => {
                                                             let _ = ipc_ev.send(IpcResponse::Event {
                                                                 event: "peer_connected".into(),
@@ -847,7 +849,7 @@ impl Daemon {
                                                             return;
                                                         }
                                                         Err(e) => tracing::debug!("TSO to {pid}: {e}"),
-                                                }
+                                                    }
                                             }
                                             // All paths exhausted
                                             let _ = ipc_ev.send(IpcResponse::Event {
@@ -901,14 +903,16 @@ impl Daemon {
                                     .filter(|e| e.kind == lain_core::endpoint::EndpointKind::TSO)
                                     .map(|e| e.addr)
                                     .collect();
+                                let nat_port_delta = nat_result.port_delta;
+                                let nat_rtt_ms = nat_result.stun_rtt_ms;
                                 tokio::spawn(async move {
-                                                match t.ts_connect(&pid, &tso_eps).await {
-                                        Ok((_stream, _session, peer)) => {
-                                            let _ = ipc_ev.send(IpcResponse::Event {
-                                                event: "peer_connected".into(),
-                                                peer_id: Some(pid.to_string()),
-                                                data: Some(serde_json::json!({"via": "TSO"})),
-                                            });
+                                                match t.ts_connect(&pid, &tso_eps, nat_port_delta, nat_rtt_ms).await {
+                                                    Ok((_stream, _session, peer)) => {
+                                                        let _ = ipc_ev.send(IpcResponse::Event {
+                                                            event: "peer_connected".into(),
+                                                            peer_id: Some(pid.to_string()),
+                                                            data: Some(serde_json::json!({"via": "TSO"})),
+                                                        });
                                             tracing::info!("TSO connected: {pid} via {peer}");
                                         }
                                         Err(e) => {
@@ -935,6 +939,8 @@ impl Daemon {
                             let ipc_ev = _ipc_ev_tx.clone();
                             let connected_ref = connected.clone();
                             let conn_sem2 = conn_sem.clone();
+                            let nat_port_delta = nat_result.port_delta;
+                            let nat_rtt_ms = nat_result.stun_rtt_ms;
                             tokio::spawn(async move {
                                 if let Ok(pid) = PeerId::from_hex(&peer_id) {
                                     match dht.find_peer(&pid).await {
@@ -982,7 +988,7 @@ impl Daemon {
                                                     // TSO fallback
                                                     let tso_eps: Vec<_> = eps.iter().filter(|ep| ep.kind == lain_core::endpoint::EndpointKind::TSO).map(|ep| ep.addr).collect();
                                                     if !tso_eps.is_empty() {
-                                                match t.ts_connect(&pid, &tso_eps).await {
+                                                match t.ts_connect(&pid, &tso_eps, nat_port_delta, nat_rtt_ms).await {
                                                             Ok((_stream, _session, _peer)) => {
                                                                 let _ = ipc_ev.send(IpcResponse::Event {
                                                                     event: "peer_connected".into(),

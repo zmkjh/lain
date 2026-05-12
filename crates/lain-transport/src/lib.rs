@@ -273,32 +273,39 @@ impl Transport {
     }
 
     /// TCP Simultaneous Open: bind into known port range and connect.
-    /// Both sides bind ports 50000-50007 and connect to peer's same range.
-    /// Outgoing SYN creates NAT hole; peer's crossing SYN completes handshake.
-    /// 8×8=64 pair combinations, concurrent per round with jitter to avoid
-    /// CGNAT rate limiting. 400ms per-attempt timeout to survive high-latency NAT.
+    /// Parameters adapt to NAT profile: port-preserving NAT uses fewer ports
+    /// and tighter timeouts; high-latency CGNAT uses more ports and longer waits.
     pub async fn ts_connect(
         &self,
         _peer_id: &PeerId,
         tso_endpoints: &[SocketAddr],
+        port_delta: Option<u16>,
+        stun_rtt_ms: Option<u64>,
     ) -> Result<(tokio::net::TcpStream, lain_noise::NoiseSession, SocketAddr), TransportError> {
         use tokio::net::TcpSocket;
         use tokio::net::TcpStream;
 
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(102);
-        let per_attempt_timeout = std::time::Duration::from_millis(400);
-        let inter_round_base = std::time::Duration::from_millis(300);
-        let jitter_max = std::time::Duration::from_millis(50);
         let bind_ip = self.config.bind_addr.ip();
 
-        // Port range mirrors the daemon's TSO_BASE..TSO_BASE+TSO_PORTS
+        // Adaptive parameters based on NAT probe results
+        let is_port_preserving = port_delta == Some(1);
+        let rtt = stun_rtt_ms.unwrap_or(200);
+
+        let tso_ports: u16 = if is_port_preserving { 4 } else { 8 };
+        let per_attempt_timeout = if rtt < 100 { std::time::Duration::from_millis(200) }
+            else if rtt < 300 { std::time::Duration::from_millis(400) }
+            else { std::time::Duration::from_millis(600) };
+        let inter_round_base = if is_port_preserving { std::time::Duration::from_millis(200) }
+            else { std::time::Duration::from_millis(300) };
+        let jitter_max = std::time::Duration::from_millis(50);
+
         const TSO_BASE: u16 = 50000;
-        const TSO_PORTS: u16 = 8;
 
         while std::time::Instant::now() < deadline {
             let (tx, mut rx) = tokio::sync::mpsc::channel::<TcpStream>(1);
 
-            for i in 0..TSO_PORTS {
+            for i in 0..tso_ports {
                 let local_port = TSO_BASE + i;
                 let local_addr = std::net::SocketAddr::new(bind_ip, local_port);
                 for &remote_ep in tso_endpoints {
@@ -329,7 +336,6 @@ impl Transport {
                 return self.ts_handshake(stream).await;
             }
 
-            // Random jitter ±50ms to avoid CGNAT rate-limit pattern matching
             let jitter = if jitter_max.as_millis() > 0 {
                 let ms = rand::random::<u64>() % (jitter_max.as_millis() as u64 * 2);
                 std::time::Duration::from_millis(
