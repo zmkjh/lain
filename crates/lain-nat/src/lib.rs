@@ -56,6 +56,8 @@ impl NatProbe {
                 nat_type: NatType::Unknown,
                 ipv6_inbound: false,
                 mapped_addr: None,
+                port_delta: None,
+                stun_rtt_ms: None,
             });
         }
 
@@ -109,7 +111,62 @@ impl NatProbe {
             nat_type,
             ipv6_inbound: self.check_ipv6(),
             mapped_addr,
+            port_delta: self.probe_port_delta(socket, &self.stun_servers),
+            stun_rtt_ms: self.measure_stun_rtt(socket, &self.stun_servers),
         })
+    }
+
+    /// Probe NAT port delta: bind 3 adjacent sockets and compare mapped ports.
+    /// Returns Some(1) if port-preserving, Some(n) for consistent delta, None if random.
+    fn probe_port_delta(&self, _socket: &UdpSocket, stun_servers: &[SocketAddr]) -> Option<u16> {
+        if stun_servers.is_empty() { return None; }
+        let server = stun_servers[0];
+
+        // Bind 3 sockets on consecutive ports
+        let socks: Vec<UdpSocket> = (0..3)
+            .filter_map(|_| UdpSocket::bind("0.0.0.0:0").ok())
+            .collect();
+        if socks.len() < 2 { return None; }
+
+        let mut ports = Vec::new();
+        for s in &socks {
+            s.set_read_timeout(Some(std::time::Duration::from_secs(2))).ok();
+            if let Ok(addr) = self.probe_stun(s, server, false) {
+                ports.push(addr.port());
+            }
+        }
+        drop(socks);
+
+        if ports.len() < 2 { return None; }
+
+        // Check if mapped ports have consistent delta matching internal delta
+        let mut deltas = Vec::new();
+        for i in 1..ports.len() {
+            if ports[i] > ports[i - 1] {
+                deltas.push(ports[i] - ports[i - 1]);
+            } else if ports[i - 1] > ports[i] {
+                deltas.push(ports[i - 1] - ports[i]);
+            }
+        }
+
+        if deltas.is_empty() { return None; }
+        // If all deltas are 1, port-preserving
+        if deltas.iter().all(|&d| d == 1) { return Some(1); }
+        // If all deltas are the same, port-shifting with fixed offset
+        if deltas.iter().all(|&d| d == deltas[0]) { return Some(deltas[0]); }
+        None
+    }
+
+    /// Measure single-hop STUN RTT
+    fn measure_stun_rtt(&self, socket: &UdpSocket, stun_servers: &[SocketAddr]) -> Option<u64> {
+        if stun_servers.is_empty() { return None; }
+        let server = stun_servers[0];
+
+        let start = std::time::Instant::now();
+        let result = self.probe_stun(socket, server, false);
+        let elapsed = start.elapsed().as_millis() as u64;
+
+        result.ok().map(|_| elapsed)
     }
 
     fn probe_stun(

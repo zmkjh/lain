@@ -29,6 +29,12 @@ pub struct NatProbeResult {
     pub nat_type: NatType,
     pub ipv6_inbound: bool,
     pub mapped_addr: Option<std::net::SocketAddr>,
+    /// NAT port delta: difference between mapped ports of adjacent internal ports.
+    /// Some(1) means port-preserving (ideal for TSO).
+    /// None means couldn't determine.
+    pub port_delta: Option<u16>,
+    /// STUN round-trip time in milliseconds
+    pub stun_rtt_ms: Option<u64>,
 }
 
 #[async_trait::async_trait]
