@@ -80,6 +80,8 @@ daemon shutting down
 | `lain tso <code>` | TCP 同时打开（APDF NAT 备选） |
 | `lain find <peer_id>` | DHT 发现并自动连接 |
 | `lain disconnect <peer_id>` | 断开指定 peer |
+| `lain find <peer_id>` | DHT 发现并自动连接 |
+| `lain disconnect <peer_id>` | 断开指定 peer |
 | `lain monitor` | 监控事件流（连接、数据通知） |
 | `lain status` | 查看网络状态 |
 | `lain shutdown` | 停止 daemon |
