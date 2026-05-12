@@ -87,6 +87,80 @@ monitoring...
 [disconnected] ffe4d9a8
 ```
 
+## 场景指南
+
+以下场景覆盖从零开始的完整连接流程。**每一方都需要先启动 `lain daemon`**。
+
+### 场景 1：两人直连（Invite）
+
+这是最基础的连接方式——一人发邀请，另一人连接。
+
+```bash
+# ====== A 的终端 ======
+$ lain invite
+lain://5KncdUB060WGkVZU...          ← 复制这行，通过任意方式发给 B
+
+# ====== B 的终端 ======
+$ lain connect lain://5KncdUB060WGkVZU...
+connecting...
+connected to f8df8b59c08df278        ← 连上了
+```
+
+如果双方都在同一个局域网，mDNS 会自动发现——连上后 `lain status` 里 DHT nodes ≥ 1。
+
+### 场景 2：不能直连（校园网 / CGNAT）
+
+中国移动宽带、校园网等对称 NAT 环境下，UDP 打洞失败。用 TSO：
+
+```bash
+# A 和 B 都需要对方的 invite，然后同时运行
+# ====== A 的终端 ======
+$ lain invite
+lain://AAAAAA...
+
+$ lain tso lain://BBBBBB...          ← 用 B 的 invite
+
+# ====== B 的终端（102 秒内） ======
+$ lain invite
+lain://BBBBBB...
+
+$ lain tso lain://AAAAAA...          ← 用 A 的 invite
+```
+
+双方都应在 102 秒内看到 `connected to ... via TSO`。
+
+### 场景 3：局域网组网（mDNS 自动）
+
+同一局域网内无须 invite。启动 daemon 后 mDNS 自动发现——`lain status` 查看 DHT 节点数是否增长。但**第一个上线的人**没有网络可加入（路由表为空），需要等人连接后才会扩张。
+
+### 场景 4：小网络起步（第一个上线的人）
+
+```bash
+$ lain daemon
+$ lain status
+PeerID:    0425cd35d5fa46d0
+NAT:       APDFSymmetric
+DHT nodes: 0                          ← 正常，你是第一个
+Known:     0
+Connected: 0
+
+# 现在生成 invite 发给第二个人。他连接后：
+$ lain status
+DHT nodes: 1                          ← 网络开始生长
+Known:     1
+
+# 第三个人连第二个人 → DHT nodes: 2 → 网络已建成
+```
+
+### 常见问题
+
+| 现象 | 原因 | 解决 |
+|---|---|---|
+| `DHT nodes: 0` 且连不上 | 你是第一个人，或网络完全隔离 | 找人通过 invite 连接你 |
+| `lain connect` 超时 | NAT 太严，UDP/relay 都失败 | 双方用 `lain tso` |
+| 连上但 `DHT nodes` 不增长 | 对方 daemon 未启动或已断 | 确认对方 `lain status` 正常 |
+| 重启后 `Known` 还在但连不上 | IP 变了，存储的地址过时 | `lain connect` 重新用 invite |
+
 ## 命令参考
 
 | 命令 | 说明 |
