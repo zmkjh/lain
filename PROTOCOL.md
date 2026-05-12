@@ -394,14 +394,15 @@ import socket, json
 s = socket.socket(socket.AF_UNIX)
 s.connect("/home/user/.lain/socket")
 
+# 先订阅事件（避免错过 peer_connected 通知）
+s.send(b'{"cmd":"Subscribe"}\n')
+
 # 连接 peer
 s.send(b'{"cmd":"Connect","invite":"lain://..."}\n')
 
-# 订阅事件
-s.send(b'{"cmd":"Subscribe"}\n')
-
-# 接受入站连接
-s.send(b'{"cmd":"Accept","connection_id":1}\n')
+# 发送数据
+s.send(b'{"cmd":"Send","peer_id":"a1b2c3d4","data":"aGVsbG8="}\n')
+s.send(b'{"cmd":"Disconnect","peer_id":"a1b2c3d4"}\n')
 
 # 监听事件
 while True:
