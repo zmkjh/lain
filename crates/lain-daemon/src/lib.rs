@@ -1177,12 +1177,6 @@ impl Daemon {
                                 }
                             };
                         }
-                        IpcCommand::AcceptConnection { connection_id } => {
-                            tracing::info!("IPC: accept connection {connection_id}");
-                        }
-                        IpcCommand::RejectConnection { connection_id } => {
-                            tracing::info!("IPC: reject connection {connection_id}");
-                        }
                         IpcCommand::Shutdown => {
                             tracing::info!("IPC: shutdown requested");
                             break;

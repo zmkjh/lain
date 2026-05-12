@@ -23,8 +23,6 @@ pub enum IpcRequest {
     Tso { invite: String },
     FindPeer { peer_id: String },
     Disconnect { peer_id: String },
-    Accept { connection_id: u64 },
-    Reject { connection_id: u64 },
     ListPeers,
     GetInvite,
     Whoami,
@@ -57,8 +55,6 @@ pub enum IpcCommand {
     TsoPeer { invite: String },
     FindPeer { peer_id: String },
     DisconnectPeer { peer_id: PeerId },
-    AcceptConnection { connection_id: u64 },
-    RejectConnection { connection_id: u64 },
     Shutdown,
     SendToPeer { peer_id: PeerId, data: Vec<u8> },
     GetStatus { reply: tokio::sync::oneshot::Sender<serde_json::Value> },
@@ -79,31 +75,16 @@ pub struct IpcServer {
     config: IpcConfig,
     cmd_tx: mpsc::Sender<IpcCommand>,
     event_tx: broadcast::Sender<IpcResponse>,
-    next_conn_id: u64,
-    /// Daemon metadata (set after construction)
-    pub peer_id: Option<PeerId>,
-    pub invite_code: Option<String>,
 }
 
 impl IpcServer {
     pub fn new(config: IpcConfig, cmd_tx: mpsc::Sender<IpcCommand>) -> Self {
         let (event_tx, _) = broadcast::channel(256);
-        Self { config, cmd_tx, event_tx, next_conn_id: 1, peer_id: None, invite_code: None }
+        Self { config, cmd_tx, event_tx }
     }
 
     pub fn event_sender(&self) -> broadcast::Sender<IpcResponse> {
         self.event_tx.clone()
-    }
-
-    pub fn notify_incoming(&mut self, peer_id: PeerId) -> u64 {
-        let conn_id = self.next_conn_id;
-        self.next_conn_id = self.next_conn_id.wrapping_add(1);
-        self.event_tx.send(IpcResponse::Event {
-            event: "incoming_connection".into(),
-            peer_id: Some(peer_id.to_string()),
-            data: Some(serde_json::json!({"connection_id": conn_id})),
-        }).ok();
-        conn_id
     }
 
     pub async fn run(self) -> Result<(), IpcError> {
@@ -345,14 +326,6 @@ async fn dispatch(
                 send_or_warn(cmd_tx, IpcCommand::DisconnectPeer { peer_id: pid }, "disconnect");
             }
             IpcResponse::Ok { message: Some("disconnecting".into()), data: None }
-        }
-        IpcRequest::Accept { connection_id } => {
-            send_or_warn(cmd_tx, IpcCommand::AcceptConnection { connection_id }, "accept");
-            IpcResponse::Ok { message: Some("accepted".into()), data: None }
-        }
-        IpcRequest::Reject { connection_id } => {
-            send_or_warn(cmd_tx, IpcCommand::RejectConnection { connection_id }, "reject");
-            IpcResponse::Ok { message: Some("rejected".into()), data: None }
         }
         IpcRequest::ListPeers => {
             let (tx, rx) = tokio::sync::oneshot::channel();
