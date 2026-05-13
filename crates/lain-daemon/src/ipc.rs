@@ -5,10 +5,18 @@
 use lain_core::peer::PeerId;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+use std::sync::OnceLock;
 use thiserror::Error;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, AsyncRead, AsyncWrite};
 use tokio::sync::{broadcast, mpsc};
 use tracing;
+
+/// 由 daemon 在初始化后设置，供 Whoami 在 main loop 启动前直接响应。
+static DAEMON_PEER_ID: OnceLock<String> = OnceLock::new();
+
+pub fn set_daemon_peer_id(pid: &PeerId) {
+    let _ = DAEMON_PEER_ID.set(pid.to_string());
+}
 
 #[derive(Error, Debug)]
 pub enum IpcError {
@@ -339,11 +347,10 @@ async fn dispatch(
             }
         }
         IpcRequest::Whoami => {
-            let (tx, rx) = tokio::sync::oneshot::channel();
-            send_or_warn(cmd_tx, IpcCommand::GetWhoami { reply: tx }, "whoami");
-            match tokio::time::timeout(std::time::Duration::from_secs(30), rx).await {
-                Ok(Ok(pid)) => IpcResponse::Ok { message: Some(pid), data: None },
-                _ => IpcResponse::Error { code: "TIMEOUT".into(), message: "daemon busy".into() },
+            if let Some(pid) = DAEMON_PEER_ID.get() {
+                IpcResponse::Ok { message: Some(pid.clone()), data: None }
+            } else {
+                IpcResponse::Error { code: "NOT_READY".into(), message: "daemon initializing".into() }
             }
         }
         IpcRequest::GetInvite => {

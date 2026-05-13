@@ -97,6 +97,8 @@ impl Daemon {
             }, cmd_tx,
         );
         let ipc_ev = ipc_server.event_sender();
+        // 让 IPC dispatch 能在 main loop 启动前直接响应 Whoami
+        ipc::set_daemon_peer_id(&peer_id);
         tokio::spawn(async move { let _ = ipc_server.run().await; });
 
         // ── NAT ──
