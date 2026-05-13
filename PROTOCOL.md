@@ -50,10 +50,12 @@ x25519_public = x25519_dalek::PublicKey::from(&x25519_secret)
 
 传输加密使用 Noise IK 模式：`Noise_IK_25519_ChaChaPoly_BLAKE2s`。
 
-- **发起方** — 持有自身 X25519 私钥和对端 X25519 公钥，发送 IK message 1。
-- **响应方** — 仅需自身 X25519 私钥，读取 IK message 1，回复 IK message 2。
+- **发起方** — 持有自身 X25519 私钥和对端 X25519 公钥，发送 IK message 1。Payload 携带发起方 PeerID。
+- **响应方** — 仅需自身 X25519 私钥，读取 IK message 1，回复 IK message 2。Payload 携带响应方 PeerID。
 
-握手完成后的 Noise Transport 状态用于对称加密后续 QUIC 流。
+握手完成后双方已知对方 PeerID，无需额外的身份交换协议。
+
+握手完成后的 Noise Transport 状态用于端到端对称加密。在 QUIC 路径上，加密由 QUIC TLS 1.3 提供，Noise 仅用于身份认证；在 TSO/TCP 路径上，Noise 提供完整传输加密。
 
 ---
 
@@ -106,16 +108,9 @@ QUIC 流上承载 Lain 帧。帧格式：
 | 16384–1073741823 | 四字节，首字节高 2 bit = 10 |
 | 1073741824–2^62-1 | 八字节，首字节高 2 bit = 11 |
 
-### 3.4 DHT 地址交换
+### 3.4 DHT 路由表同步
 
-QUIC 连接建立后，双方通过专用 stream 交换真实 DHT 地址：
-
-```
-发起方 → 响应方:  "DHT_ADDR:<socket_addr>\n"
-响应方 → 发起方:  "DHT_ADDR:<socket_addr>\n"
-```
-
-socket_addr 格式为 `IP:PORT`（如 `117.88.30.86:52606`）。交换后双方将对方地址加入 DHT 路由表。
+QUIC 连接建立后，节点根据 Noise IK 握手确定的 PeerID，将对方加入 DHT 路由表。路由表同步通过 DHT RPC（§4）完成，不依赖独立线协议。
 
 ---
 
@@ -251,9 +246,8 @@ encode_payload 布局：
 [0]       addr_kind: 0=IPv4, 1=IPv6
 [1..]     address: IPv4(4+2) 或 IPv6(16+2)
 [kind]    endpoint_kind: 0=IPv6, 1=STUN, 2=LAN, 3=WebSocket, 4=Relay, 5=TSO (u8)
-[priority] priority: u8
+[priority] priority: u8    // v0.1.2+: 写固定值 128（保留字段，运行时不再用于排序）
 [ttl]     ttl_seconds: u32 大端
-```
 
 **注意：** invite 中的 endpoint 编码**含 priority 字节**，与 DHT STORE 中的 endpoint 编码不同。
 

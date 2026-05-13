@@ -83,54 +83,79 @@ pub trait IdentityProvider: Send + Sync {
     fn sign(&self, data: &[u8]) -> Ed25519Signature;
 }
 
-// ── lain-core/src/dht.rs
-pub struct NodeInfo {
-    pub node_id: PeerId,
-    pub address: SocketAddr,
+// ── lain-core/src/crypto.rs
+/// Noise 握手状态
+pub trait NoiseHandshake: Send {
+    fn write_message(&mut self, peer_id: &PeerId) -> Result<Vec<u8>, CoreError>;
+    fn read_message(&mut self, data: &[u8]) -> Result<PeerId, CoreError>;
+    fn into_transport(self: Box<Self>) -> Result<Box<dyn NoiseTransport>, CoreError>;
+    fn remote_pubkey(&self) -> Option<[u8; 32]>;
 }
 
+/// Noise 传输模式（握手完成后）
+pub trait NoiseTransport: Send {
+    fn encrypt(&mut self, plaintext: &[u8]) -> Result<Vec<u8>, CoreError>;
+    fn decrypt(&mut self, ciphertext: &[u8]) -> Result<Vec<u8>, CoreError>;
+}
+
+/// Noise 工厂 — 由 daemon 注入 transport，消除 crate 间直接依赖
+pub trait CryptoProvider: Send + Sync {
+    fn new_initiator(&self, remote_pubkey: &[u8; 32]) -> Result<Box<dyn NoiseHandshake>, CoreError>;
+    fn new_responder(&self) -> Result<Box<dyn NoiseHandshake>, CoreError>;
+    fn local_pubkey(&self) -> [u8; 32];
+}
+
+// ── lain-core/src/dht.rs
 pub struct PeerRecord {
     pub pubkey: Ed25519PublicKey,
+    pub noise_pubkey: Ed25519PublicKey,  // X25519 key
     pub endpoints: Vec<Endpoint>,
     pub capabilities: Capabilities,
     pub ttl_remaining: u32,
 }
 
+pub struct RelayInfo {
+    pub node_id: PeerId,
+    pub address: SocketAddr,
+    pub noise_pubkey: [u8; 32],
+}
+
 #[async_trait]
 pub trait DhtBackend: Send + Sync {
-    /// 启动 DHT，bootstrap 到给定地址列表（按优先级尝试）
-    async fn bootstrap(&self, seeds: &[SocketAddr]) -> Result<()>;
-    /// 宣告自己在线
-    async fn store_self(&self, record: PeerRecord) -> Result<()>;
-    /// 查找 peer 的公钥和地址
-    async fn find_peer(&self, peer_id: &PeerId) -> Result<Option<PeerRecord>>;
-    /// 查找 relay 候选
-    async fn find_relays(&self) -> Result<Vec<NodeInfo>>;
-    /// 订阅路由表变更事件
-    fn subscribe_events(&self) -> broadcast::Receiver<DhtEvent>;
+    async fn bootstrap(&self, seeds: &[SocketAddr]) -> Result<(), CoreError>;
+    async fn store_self(&self, pubkey: &[u8; 32], noise_pubkey: &[u8; 32],
+        endpoints: &[Endpoint], capabilities: Capabilities) -> Result<(), CoreError>;
+    async fn find_peer(&self, peer_id: &PeerId) -> Result<Option<PeerRecord>, CoreError>;
+    async fn find_relays(&self) -> Result<Vec<RelayInfo>, CoreError>;
+    async fn routing_table_size(&self) -> usize;
 }
 
 // ── lain-core/src/nat.rs
 #[async_trait]
 pub trait NatProber: Send + Sync {
-    async fn probe(&self) -> Result<NatType>;
+    async fn probe(&self) -> Result<NatProbeResult, CoreError>;
 }
 
 // ── lain-core/src/transport.rs
-pub struct Connection {
-    pub peer_id: PeerId,
-    pub stream: QuicStream,          // QUIC stream（可靠）
-    pub datagram: QuicDatagramSender, // QUIC datagram（不可靠）
+#[async_trait]
+pub trait Connection: Send + Sync {
+    fn peer_id(&self) -> PeerId;
+    async fn send(&self, data: &[u8]) -> Result<(), CoreError>;
+    async fn recv(&self) -> Result<Vec<u8>, CoreError>;
+    fn close(&self);
+    fn path(&self) -> PathType;
+    fn rtt_ms(&self) -> Option<u64> { None }
 }
 
 #[async_trait]
-pub trait TransportLayer: Send + Sync {
-    /// 主动连接 peer（执行完整穿透流程）
-    async fn connect(&self, peer_id: &PeerId, record: &PeerRecord) -> Result<Connection>;
-    /// 处理入站连接（Noise IK 已完成）
-    async fn accept(&self, conn: QuicConnection) -> Result<IncomingConnection>;
-    /// 监听地址变更事件（由 DHT 更新触发）
-    fn on_endpoints_changed(&self, peer_id: &PeerId, endpoints: Vec<Endpoint>);
+pub trait Transport: Send + Sync {
+    async fn connect(&self, peer_id: PeerId, noise_pubkey: &[u8; 32],
+        endpoints: &[Endpoint]) -> Result<Box<dyn Connection>, CoreError>;
+    async fn connect_tso(&self, peer_id: PeerId, tso_endpoints: &[SocketAddr],
+        port_delta: Option<u16>, stun_rtt_ms: Option<u64>)
+        -> Result<Box<dyn Connection>, CoreError>;
+    async fn accept(&self) -> Result<Box<dyn Connection>, CoreError>;
+    fn local_addr(&self) -> Result<SocketAddr, CoreError>;
 }
 ```
 
@@ -141,16 +166,14 @@ lain-core          （零内部依赖 — trait、类型、协议常量）
   ↑
   ├── lain-identity  （Ed25519 密钥管理、PeerID）
   ├── lain-nat       （STUN 客户端、NAT 探测）
-  ├── lain-noise     （Noise IK 握手实现）
-  ├── lain-dht       （Kademlia DHT 实现）
-  │     ↑
-  │     └── lain-discovery （mDNS、invite 编解码）
-  │
-  └── lain-transport （QUIC 管理、帧协议、穿透编排）
-        ↑
-        └── lain-daemon   （IPC、任务编排、持久化）
-              ↑
-              └── lain-cli  （CLI 工具，通过 UDS 与 daemon 通信）
+  ├── lain-noise     （Noise IK 实现，实现 CryptoProvider trait）
+  ├── lain-dht       （Kademlia DHT 实现，实现 DhtBackend trait）
+  ├── lain-discovery （mDNS、invite 编解码）[仅依赖 core]
+  ├── lain-transport （QUIC + TSO 连接，实现 Transport + Connection trait）
+  │                    [仅依赖 core，不依赖 lain-noise — 通过 trait 注入]
+  ├── lain-daemon    （编排层，持有所有具体 crate）
+  │                   唯一知晓具体类型的 crate
+  └── lain-cli       （CLI，通过 IPC 与 daemon 通信，零代码耦合）
 ```
 
 编译依赖是**单向无环**的。运行时交互通过 trait 和 Tokio channel。
@@ -254,57 +277,60 @@ config.toml (文件)
 ### 3.6.6 Daemon 主事件循环
 
 ```rust
-// lain-daemon/src/main.rs 的骨架
-#[tokio::main]
-async fn main() -> Result<()> {
-    let config = DaemonConfig::load_or_default();
-    let identity = Identity::load_or_generate().await?;
-    let nat_type = NatProber::probe(&config.nat).await?;
+// lain-daemon/src/lib.rs 的骨架
+pub async fn run(&self) -> Result<(), DaemonError> {
+    // 初始化
+    let crypto: Arc<dyn CryptoProvider> = Arc::new(NoiseProvider::new(noise_secret));
+    let transport: Arc<dyn Transport> = Arc::new(Transport::new(config, crypto, peer_id)?);
+    let dht = Arc::new(DhtHandle::new(peer_id, public_key, config)?);
 
-    // 初始化 DHT（从 routes.json 恢复 或 空启动）
-    let dht = Dht::new(identity.peer_id(), config.dht);
-    dht.bootstrap(config.bootstrap_seeds()).await?;
+    // IPC 服务器
+    let (cmd_tx, mut cmd_rx) = mpsc::channel(256);
+    let ipc_ev = IpcServer::new(config, cmd_tx).event_sender();
 
-    // 预连 relay 候选
-    let relay_pool = RelayPool::new(&dht, &transport);
+    // 状态
+    let connected: Arc<RwLock<HashMap<PeerId, Arc<dyn Connection>>>> = ...;
 
-    // 启动 IPC 服务（UDS + HTTP）
-    let ipc = IpcServer::new(config.ipc, identity.peer_id());
-
-    // 心跳 + 路由表维护
-    tokio::spawn(heartbeat_loop(dht.clone(), config.timing));
-    tokio::spawn(bucket_refresh_loop(dht.clone(), config.dht));
-
-    // 事件循环
+    // 主事件循环
     loop {
         tokio::select! {
-            // IPC 请求（来自本地应用）
-            Some(req) = ipc.recv() => handle_ipc(req, &dht, &transport).await?,
-
-            // 入站连接（来自远程 peer）
-            Some(conn) = transport.accept_incoming() => {
-                let (peer_id, stream) = noise_handshake(conn).await?;
-                ipc.broadcast_incoming(peer_id, stream.id());
+            // DHT 消息
+            recv = dht_socket.recv_from(&mut buf) => {
+                dht.handle_incoming(&buf[..len], src).await;
             }
 
-            // DHT 事件
-            Ok(event) = dht.recv_event() => match event {
-                DhtEvent::PeerDiscovered(peer_id, record) => {
-                    // 更新本地缓存，可触发自动重连
+            // IPC 命令
+            Some(cmd) = cmd_rx.recv() => match cmd {
+                ConnectPeer { invite, .. } => connect_cmd(invite, ...),
+                TsoPeer { invite } => tso_cmd(invite, ...),
+                FindPeer { peer_id } => find_cmd(peer_id, ...),
+                DisconnectPeer { peer_id } => {
+                    guard.disconnect();
+                    conn.close();
                 }
-                DhtEvent::PeerExpired(peer_id) => {
-                    // 清理本地状态
+                SendToPeer { peer_id, data, reply } => {
+                    connected[pid].send(&data).await;
                 }
+                Shutdown => break,
+                GetStatus { reply } => { /* 返回状态 */ }
             }
 
-            // 信号
-            _ = tokio::signal::ctrl_c() => {
-                dht.shutdown().await?;  // 序列化 routes.json
-                break;
+            // 入站连接（PeerID 由 Noise 握手确定）
+            conn = transport.accept() => {
+                // 检查首条消息：RelayConnect → handle_relay
+                // 否则 → PeekConnection + spawn_reader
             }
+
+            // 心跳
+            _ = heartbeat.tick() => {
+                dht.store_self(&endpoints);
+                save_peers(&known);
+                iface_changed() → dht.store_self();
+            }
+
+            _ = ctrl_c() => break,
         }
     }
-    Ok(())
 }
 ```
 
@@ -313,11 +339,11 @@ async fn main() -> Result<()> {
 | 测试层级 | 做法 | 依赖 |
 |---------|------|------|
 | **单元测试** | 每个 crate 内部，mock trait 的实现注入 | 仅本 crate |
-| **集成测试** | `tests/` 目录，启动真实 DHT + QUIC，mock 网络 | 跨 crate |
+| **集成测试** | `tests/`，真实 QUIC 连接 + Noise 握手 | 跨 crate |
 | **表现测试** | Docker + Linux netns 模拟 NAT | 全栈 |
 | **互操作测试** | CI matrix，跨版本通信 | 全栈 |
 
-Mock 的关键：`IdentityProvider`、`DhtBackend`、`NatProber`、`TransportLayer` 都在 `lain-core` 中定义为 trait。单元测试中注入 mock 实现，不需要真实的网络或密钥。
+Mock 的关键：`IdentityProvider`、`CryptoProvider`、`DhtBackend`、`NatProber`、`Transport`、`Connection` 都在 `lain-core` 中定义为 trait。单元测试中注入 mock 实现，不需要真实的网络或密钥。所有编排函数通过 trait 对象注入，覆盖连接建立、重连、事件通知全流程。
 
 ---
 

@@ -137,11 +137,11 @@ async fn peek_connection_replays_first_message() {
     h.await.unwrap();
 }
 
-/// TSO 依赖 TCP simultaneous open（RFC 793 §3.4）。
-/// Linux 支持，Windows 不支持（SYN 碰撞时返回 WSAECONNREFUSED）。
-/// 此测试在 Linux 上可运行，Windows 上标记忽略。
+/// TSO（TCP Simultaneous Open）需要两个不同的源地址。
+/// SYN 从 A:50000 到 B:50000 必须经过真实网络层，loopback 上自收自发。
+/// 单机 localhost 无法测试——A 的 SYN 被自己接收并立即 RST。需要双机或不同 IP。
 #[tokio::test]
-#[cfg_attr(target_os = "windows", ignore)]
+#[ignore]
 async fn tso_handshake() {
     let a = TestNode::new().await;
     let b = TestNode::new().await;
