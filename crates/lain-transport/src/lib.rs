@@ -58,10 +58,18 @@ impl Connection for QuicConnection {
                 .map_err(|e| CoreError::InvalidEndpoint(e.to_string()))?;
             let data = recv.read_to_end(65536).await
                 .map_err(|e| CoreError::InvalidEndpoint(e.to_string()))?;
-            // quinn keepalive is internal — data may be empty (Headers/Close)
+            // Each QUIC stream carries one Lain frame. Decode the header.
+            if let Some((_, ft, plen, hlen)) = frame::decode_frame_header(&data) {
+                if ft == FrameType::Data {
+                    let payload = data.get(hlen..hlen + plen as usize)
+                        .unwrap_or(&[]).to_vec();
+                    return Ok(payload);
+                }
+                // Control frames: skip silently
+                continue;
+            }
+            // Raw data (legacy or empty) — pass through
             if data.is_empty() { continue; }
-            // Skip application-level PING frames from legacy peers
-            if is_ping(&data) { continue; }
             return Ok(data);
         }
     }
@@ -470,14 +478,14 @@ impl rustls::client::danger::ServerCertVerifier for NoVerify {
         Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
     }
     fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-        vec![rustls::SignatureScheme::ED25519, rustls::SignatureScheme::RSA_PSS_SHA512]
+        vec![
+            rustls::SignatureScheme::ECDSA_NISTP384_SHA384,
+            rustls::SignatureScheme::ECDSA_NISTP256_SHA256,
+            rustls::SignatureScheme::ED25519,
+            rustls::SignatureScheme::RSA_PSS_SHA512,
+            rustls::SignatureScheme::RSA_PKCS1_SHA256,
+        ]
     }
-}
-
-fn is_ping(data: &[u8]) -> bool {
-    frame::decode_frame_header(data)
-        .map(|(_, ft, _, _)| ft == FrameType::Ping)
-        .unwrap_or(false)
 }
 
 // ── PeekConnection: wrap a Connection, buffer the first recv'd message ──
