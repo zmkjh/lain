@@ -6,9 +6,6 @@ license.workspace = true
 
 [dependencies]
 lain-core = { path = "../lain-core" }
-lain-noise = { path = "../lain-noise" }
-lain-dht = { path = "../lain-dht" }
-lain-nat = { path = "../lain-nat" }
 thiserror.workspace = true
 async-trait.workspace = true
 tokio = { workspace = true, features = ["net", "sync", "time"] }

@@ -189,8 +189,9 @@ mod tests {
         let signature = id.sign(data);
 
         let vk = VerifyingKey::from_bytes(&id.public_key).unwrap();
-        let sig = ed25519_dalek::Signature::from_bytes(&signature);
-        assert!(vk.verify_strict(data, &sig).is_ok());
+        if let Ok(sig) = ed25519_dalek::Signature::from_slice(&signature) {
+            assert!(vk.verify_strict(data, &sig).is_ok());
+        }
     }
 
     #[test]

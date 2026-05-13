@@ -2,1162 +2,538 @@
 #![deny(clippy::expect_used)]
 #![deny(clippy::panic)]
 
+use lain_core::crypto::{CryptoProvider, NoiseHandshake, NoiseTransport};
 use lain_core::endpoint::{Endpoint, EndpointKind};
-use lain_core::frame::{self, FrameType};
-use lain_core::identity::Ed25519PublicKey;
-use lain_core::peer::PeerId;
-use lain_core::transport::{Connection as CoreConn, IncomingConnection, PathType, TransportLayer};
 use lain_core::error::CoreError;
-use lain_noise::{NoiseHandshake, encode_handshake_frame, parse_frame_header};
-use std::collections::HashMap;
+use lain_core::frame::{self, encode_handshake_frame, parse_handshake_frame_header as parse_frame_header, FrameType};
+use lain_core::peer::PeerId;
+use lain_core::transport::{Connection, PathType, Transport as TransportTrait};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use thiserror::Error;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::Mutex;
-use tracing;
 
 #[derive(Error, Debug)]
 pub enum TransportError {
-    #[error("connection: {0}")]
+    #[error("connect: {0}")]
     Connect(String),
-    #[error("no path for {peer_id}")]
-    NoPath { peer_id: PeerId },
     #[error("noise: {0}")]
     Noise(String),
-    #[error("tls: {0}")]
-    Tls(String),
     #[error("io: {0}")]
     Io(String),
+    #[error("no path")]
+    NoPath,
 }
 
-#[derive(Clone, Debug)]
+impl From<TransportError> for CoreError {
+    fn from(e: TransportError) -> Self { CoreError::InvalidEndpoint(e.to_string()) }
+}
+
+// ── QuicConnection ──
+
+struct QuicConnection {
+    peer_id: PeerId,
+    quic: quinn::Connection,
+}
+
+#[async_trait::async_trait]
+impl Connection for QuicConnection {
+    fn peer_id(&self) -> PeerId { self.peer_id }
+    fn path(&self) -> PathType { PathType::Direct }
+
+    async fn send(&self, data: &[u8]) -> Result<(), CoreError> {
+        let msg = frame::encode_frame(2, FrameType::Data, data);
+        let (mut s, _) = self.quic.open_bi().await
+            .map_err(|e| CoreError::InvalidEndpoint(e.to_string()))?;
+        s.write_all(&msg).await
+            .map_err(|e| CoreError::InvalidEndpoint(e.to_string()))?;
+        s.finish().ok();
+        Ok(())
+    }
+
+    async fn recv(&self) -> Result<Vec<u8>, CoreError> {
+        loop {
+            let (_, mut recv) = self.quic.accept_bi().await
+                .map_err(|e| CoreError::InvalidEndpoint(e.to_string()))?;
+            let data = recv.read_to_end(65536).await
+                .map_err(|e| CoreError::InvalidEndpoint(e.to_string()))?;
+            // quinn keepalive is internal — data may be empty (Headers/Close)
+            if data.is_empty() { continue; }
+            // Skip application-level PING frames from legacy peers
+            if is_ping(&data) { continue; }
+            return Ok(data);
+        }
+    }
+
+    fn close(&self) {
+        self.quic.close(0u32.into(), b"bye");
+    }
+
+    fn rtt_ms(&self) -> Option<u64> {
+        Some(self.quic.rtt().as_millis() as u64)
+    }
+}
+
+// ── TcpConnection ──
+
+struct TcpInner {
+    stream: Mutex<tokio::net::TcpStream>,
+    noise: Mutex<Box<dyn NoiseTransport>>,
+}
+
+struct TcpConnection {
+    peer_id: PeerId,
+    inner: Arc<TcpInner>,
+}
+
+impl TcpConnection {
+    async fn new(
+        stream: tokio::net::TcpStream,
+        noise: Box<dyn NoiseTransport>,
+        peer_id: PeerId,
+        keepalive_secs: u64,
+    ) -> Self {
+        let inner = Arc::new(TcpInner {
+            stream: Mutex::new(stream),
+            noise: Mutex::new(noise),
+        });
+        let ka = inner.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(keepalive_secs));
+            loop {
+                interval.tick().await;
+                let ct = {
+                    let mut n = ka.noise.lock().await;
+                    match n.encrypt(b"") { Ok(c) => c, Err(_) => break }
+                };
+                let frame = encode_handshake_frame(0, &ct);
+                let mut s = ka.stream.lock().await;
+                if s.write_all(&frame).await.is_err() { break; }
+            }
+        });
+        Self { peer_id, inner }
+    }
+}
+
+#[async_trait::async_trait]
+impl Connection for TcpConnection {
+    fn peer_id(&self) -> PeerId { self.peer_id }
+    fn path(&self) -> PathType { PathType::TSO }
+
+    async fn send(&self, data: &[u8]) -> Result<(), CoreError> {
+        let mut noise = self.inner.noise.lock().await;
+        let mut stream = self.inner.stream.lock().await;
+        let ct = noise.encrypt(data)?;
+        let frame = encode_handshake_frame(0, &ct);
+        stream.write_all(&frame).await
+            .map_err(|e| CoreError::InvalidEndpoint(e.to_string()))
+    }
+
+    async fn recv(&self) -> Result<Vec<u8>, CoreError> {
+        loop {
+            let mut header = [0u8; 8];
+            { let mut s = self.inner.stream.lock().await;
+              s.read_exact(&mut header).await
+                .map_err(|e| CoreError::InvalidEndpoint(e.to_string()))?; }
+            let plen = ((header[5] as usize) << 16) | ((header[6] as usize) << 8) | (header[7] as usize);
+            let mut payload = vec![0u8; plen];
+            if plen > 0 {
+                let mut s = self.inner.stream.lock().await;
+                s.read_exact(&mut payload).await
+                    .map_err(|e| CoreError::InvalidEndpoint(e.to_string()))?;
+            }
+            let data = { let mut n = self.inner.noise.lock().await; n.decrypt(&payload)? };
+            if data.is_empty() { continue; }
+            return Ok(data);
+        }
+    }
+
+    fn close(&self) {}
+}
+
+// ── Transport ──
+
 pub struct TransportConfig {
     pub bind_addr: SocketAddr,
-    pub max_connections: usize,
-    pub idle_timeout_ms: u32,
-    pub traversal_timeout_secs: u64,
-    /// Whether outbound IPv6 is routable (has global unicast address)
     pub has_ipv6: bool,
 }
 
 impl Default for TransportConfig {
     fn default() -> Self {
-        Self {
-            bind_addr: "0.0.0.0:0".parse().unwrap(),
-            max_connections: lain_core::MAX_CONNECTIONS,
-            idle_timeout_ms: (lain_core::IDLE_TIMEOUT_SECS * 1000) as u32,
-            traversal_timeout_secs: lain_core::TRAVERSAL_TIMEOUT_SECS,
-            has_ipv6: false,
-        }
+        Self { bind_addr: "0.0.0.0:0".parse().unwrap(), has_ipv6: false }
     }
 }
 
-struct PeerConnection {
-    _quic: quinn::Connection,
-    _noise: lain_noise::NoiseSession,
-}
-
-/// TSO data-plane: framed encryption over a single TCP stream.
-/// Handles message boundaries, Noise encrypt/decrypt, and keepalive pings.
-pub struct TsoStream {
-    stream: tokio::sync::Mutex<tokio::net::TcpStream>,
-    noise: tokio::sync::Mutex<lain_noise::NoiseSession>,
+pub struct Transport {
+    endpoint: quinn::Endpoint,
+    crypto: Arc<dyn CryptoProvider>,
     peer_id: PeerId,
 }
 
-impl TsoStream {
+impl Transport {
     pub fn new(
-        stream: tokio::net::TcpStream,
-        noise: lain_noise::NoiseSession,
+        config: TransportConfig,
+        crypto: Arc<dyn CryptoProvider>,
         peer_id: PeerId,
-    ) -> Self {
-        Self {
-            stream: tokio::sync::Mutex::new(stream),
-            noise: tokio::sync::Mutex::new(noise),
-            peer_id,
+    ) -> Result<Self, TransportError> {
+        let key_pair = rcgen::KeyPair::generate()
+            .map_err(|e| TransportError::Io(e.to_string()))?;
+        let cert_params = rcgen::CertificateParams::new(vec!["lain".into()])
+            .map_err(|e| TransportError::Io(e.to_string()))?;
+        let cert = cert_params.self_signed(&key_pair)
+            .map_err(|e| TransportError::Io(e.to_string()))?;
+
+        let cert_der = rustls::pki_types::CertificateDer::from(cert.der().to_vec());
+        let pkcs8 = rustls::pki_types::PrivatePkcs8KeyDer::from(key_pair.serialize_der());
+        let key_der = rustls::pki_types::PrivateKeyDer::from(pkcs8);
+
+        let server_config = rustls::ServerConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
+            .with_no_client_auth()
+            .with_single_cert(vec![cert_der], key_der)
+            .map_err(|e| TransportError::Io(e.to_string()))?;
+
+        let mut transport_cfg = quinn::TransportConfig::default();
+        transport_cfg.keep_alive_interval(Some(std::time::Duration::from_secs(lain_core::KEEP_ALIVE_SECS)));
+
+        let mut server_cfg = quinn::ServerConfig::with_crypto(Arc::new(
+            quinn::crypto::rustls::QuicServerConfig::try_from(server_config)
+                .map_err(|e| TransportError::Io(e.to_string()))?
+        ));
+        server_cfg.transport = Arc::new(transport_cfg);
+
+        let socket = std::net::UdpSocket::bind(config.bind_addr)
+            .map_err(|e| TransportError::Io(e.to_string()))?;
+        let runtime = quinn::default_runtime()
+            .ok_or_else(|| TransportError::Io("no runtime".into()))?;
+
+        let endpoint = quinn::Endpoint::new(
+            quinn::EndpointConfig::default(), Some(server_cfg), socket, runtime,
+        ).map_err(|e| TransportError::Io(e.to_string()))?;
+
+        Ok(Self { endpoint, crypto, peer_id })
+    }
+
+    pub fn local_addr(&self) -> Result<SocketAddr, TransportError> {
+        self.endpoint.local_addr().map_err(|e| TransportError::Io(e.to_string()))
+    }
+
+    pub async fn accept(&self) -> Result<Box<dyn Connection>, TransportError> {
+        let incoming = self.endpoint.accept().await
+            .ok_or_else(|| TransportError::Connect("endpoint closed".into()))?;
+        let conn = incoming.await
+            .map_err(|e| TransportError::Connect(e.to_string()))?;
+
+        let (mut send, mut recv) = conn.accept_bi().await
+            .map_err(|e| TransportError::Connect(e.to_string()))?;
+
+        let mut buf = vec![0u8; 4096];
+        let n = recv.read(&mut buf).await
+            .map_err(|e| TransportError::Connect(e.to_string()))?
+            .ok_or_else(|| TransportError::Noise("no ik1".into()))?;
+
+        let hdr = parse_frame_header(&buf[..n])
+            .map_err(|e| TransportError::Noise(e.to_string()))?;
+        let mut noise = self.crypto.new_responder()
+            .map_err(|e| TransportError::Noise(e.to_string()))?;
+        let remote_id = noise.read_message(&buf[8..8 + hdr.payload_len.min(n - 8)])
+            .map_err(|e| TransportError::Noise(e.to_string()))?;
+
+        let ik2 = noise.write_message(&self.peer_id)
+            .map_err(|e| TransportError::Noise(e.to_string()))?;
+        send.write_all(&encode_handshake_frame(1, &ik2)).await
+            .map_err(|e| TransportError::Io(e.to_string()))?;
+        send.finish().ok();
+        // Snow requires into_transport_mode to finalize the handshake
+        let _noise = noise.into_transport()
+            .map_err(|e| TransportError::Noise(e.to_string()))?;
+
+        // HEADERS
+        if let Ok((mut hd_s, _)) = conn.clone().accept_bi().await {
+            hd_s.write_all(&frame::encode_frame(1, FrameType::Headers, b"{}")).await.ok();
+            hd_s.finish().ok();
         }
+
+        Ok(Box::new(QuicConnection { peer_id: remote_id, quic: conn }))
     }
 
-    pub fn peer_id(&self) -> PeerId {
-        self.peer_id
-    }
+    pub async fn connect(
+        &self,
+        _peer_id: PeerId,
+        noise_pubkey: &[u8; 32],
+        endpoints: &[Endpoint],
+    ) -> Result<Box<dyn Connection>, TransportError> {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Result<Box<dyn Connection>, TransportError>>(4);
 
-    /// Read one framed message from the TCP stream and decrypt it.
-    pub async fn recv(&self) -> Result<Vec<u8>, TransportError> {
-        use tokio::io::AsyncReadExt;
-        let mut stream = self.stream.lock().await;
-        let mut noise = self.noise.lock().await;
-
-        // Read enough for a frame header: 8 bytes (MAGIC+VERSION+step+3byte_len)
-        let mut header = [0u8; 8];
-        stream.read_exact(&mut header).await
-            .map_err(|e| TransportError::Io(format!("TSO read header: {e}")))?;
-
-        let payload_len = ((header[5] as usize) << 16)
-            | ((header[6] as usize) << 8)
-            | (header[7] as usize);
-
-        let mut payload = vec![0u8; payload_len];
-        if payload_len > 0 {
-            stream.read_exact(&mut payload).await
-                .map_err(|e| TransportError::Io(format!("TSO read payload: {e}")))?;
+        for ep in endpoints {
+            if !matches!(ep.kind, EndpointKind::IPv6 | EndpointKind::STUN) { continue; }
+            let tx = tx.clone(); let addr = ep.addr;
+            let npk = *noise_pubkey; let cry = self.crypto.clone(); let my = self.peer_id;
+            let qep = self.endpoint.clone();
+            tokio::spawn(async move {
+                let r = try_quic(addr, npk, cry, my, qep).await;
+                tx.send(r.map(|(pid, q)| Box::new(QuicConnection { peer_id: pid, quic: q }) as Box<dyn Connection>)).await.ok();
+            });
         }
+        drop(tx);
 
-        noise.decrypt(&payload)
-            .map_err(|e| TransportError::Noise(format!("TSO decrypt: {e}")))
+        let deadline = tokio::time::sleep(std::time::Duration::from_secs(lain_core::TRAVERSAL_TIMEOUT_SECS));
+        tokio::pin!(deadline);
+        while let Some(r) = tokio::select! { r = rx.recv() => r, _ = &mut deadline => None } {
+            if let Ok(c) = r { return Ok(c); }
+        }
+        Err(TransportError::NoPath)
     }
 
-    /// Encrypt data, prepend frame header, write to TCP stream.
-    pub async fn send(&self, data: &[u8]) -> Result<(), TransportError> {
-        use tokio::io::AsyncWriteExt;
-        let mut stream = self.stream.lock().await;
-        let mut noise = self.noise.lock().await;
+    pub async fn connect_tso(
+        &self,
+        peer_id: PeerId,
+        tso_endpoints: &[SocketAddr],
+        port_delta: Option<u16>,
+        stun_rtt_ms: Option<u64>,
+    ) -> Result<Box<dyn Connection>, TransportError> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(102);
+        let bind_ip = self.endpoint.local_addr()
+            .map(|a| a.ip()).unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED));
 
-        let ct = noise.encrypt(data)
-            .map_err(|e| TransportError::Noise(format!("TSO encrypt: {e}")))?;
+        let is_pp = port_delta == Some(1);
+        let rtt = stun_rtt_ms.unwrap_or(200);
+        let ports: u16 = if is_pp { 4 } else { 8 };
+        let per_attempt = if rtt < 100 { 200 } else if rtt < 300 { 400 } else { 600 };
+        let inter_round = if is_pp { 200 } else { 300 };
 
-        let frame = encode_handshake_frame(0, &ct);
-        stream.write_all(&frame).await
-            .map_err(|e| TransportError::Io(format!("TSO write: {e}")))?;
-
-        Ok(())
-    }
-
-    /// Send a keepalive PING frame to maintain NAT mapping.
-    pub async fn keepalive(&self) -> Result<(), TransportError> {
-        let ping = frame::encode_frame(1, frame::FrameType::Ping, &[]);
-        self.send(&ping).await
-    }
-
-    /// Spawn a background keepalive task.
-    pub fn spawn_keepalive(this: std::sync::Arc<Self>, interval_secs: u64) {
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(
-                std::time::Duration::from_secs(interval_secs),
-            );
-            loop {
-                interval.tick().await;
-                if this.keepalive().await.is_err() {
-                    break;
+        while std::time::Instant::now() < deadline {
+            let (tx, mut rx) = tokio::sync::mpsc::channel::<tokio::net::TcpStream>(1);
+            for i in 0..ports {
+                let la = SocketAddr::new(bind_ip, 50000 + i);
+                for &ra in tso_endpoints {
+                    let tx = tx.clone();
+                    tokio::spawn(async move {
+                        use tokio::net::TcpSocket;
+                        if let Ok(s) = TcpSocket::new_v4() {
+                            s.set_reuseaddr(true).ok();
+                            if s.bind(la).is_ok() {
+                                if let Ok(Ok(s)) = tokio::time::timeout(
+                                    std::time::Duration::from_millis(per_attempt), s.connect(ra),
+                                ).await { tx.send(s).await.ok(); }
+                            }
+                        }
+                    });
                 }
             }
-        });
+            drop(tx);
+            if let Some(stream) = rx.recv().await {
+                return tso_handshake(stream, peer_id, &self.crypto, &self.peer_id, 15).await;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(inter_round)).await;
+        }
+        Err(TransportError::Connect("TSO timeout".into()))
     }
 }
+
+// ── Free functions ──
+
+/// Try a single QUIC connection attempt. Uses a pre-existing endpoint
+/// (cheaply cloned from Transport's endpoint) instead of creating a new one.
+async fn try_quic(
+    addr: SocketAddr, noise_pubkey: [u8; 32], crypto: Arc<dyn CryptoProvider>, my_id: PeerId,
+    endpoint: quinn::Endpoint,
+) -> Result<(PeerId, quinn::Connection), TransportError> {
+    let client_crypto = rustls::ClientConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(NoVerify))
+        .with_no_client_auth();
+    let mut transport_config = quinn::TransportConfig::default();
+    transport_config.keep_alive_interval(Some(std::time::Duration::from_secs(lain_core::KEEP_ALIVE_SECS)));
+    let mut quic_cfg = quinn::ClientConfig::new(Arc::new(
+        quinn::crypto::rustls::QuicClientConfig::try_from(client_crypto)
+            .map_err(|e| TransportError::Io(e.to_string()))?
+    ));
+    quic_cfg.transport_config(Arc::new(transport_config));
+
+    let conn = endpoint.connect_with(quic_cfg, addr, "lain")
+        .map_err(|e| TransportError::Connect(e.to_string()))?
+        .await
+        .map_err(|e| TransportError::Connect(e.to_string()))?;
+
+    let (mut send, mut recv) = conn.open_bi().await
+        .map_err(|e| TransportError::Connect(e.to_string()))?;
+
+    let mut noise = crypto.new_initiator(&noise_pubkey)
+        .map_err(|e| TransportError::Noise(e.to_string()))?;
+    let ik1 = noise.write_message(&my_id)
+        .map_err(|e| TransportError::Noise(e.to_string()))?;
+    send.write_all(&encode_handshake_frame(0, &ik1)).await
+        .map_err(|e| TransportError::Io(e.to_string()))?;
+
+    let mut buf = vec![0u8; 4096];
+    let n = recv.read(&mut buf).await
+        .map_err(|e| TransportError::Connect(e.to_string()))?
+        .ok_or_else(|| TransportError::Noise("no ik2".into()))?;
+    let hdr = parse_frame_header(&buf[..n])
+        .map_err(|e| TransportError::Noise(e.to_string()))?;
+    let pid = noise.read_message(&buf[8..8 + hdr.payload_len.min(n - 8)])
+        .map_err(|e| TransportError::Noise(e.to_string()))?;
+    // Snow requires into_transport_mode to finalize the handshake,
+    // even though QUIC handles encryption after this point.
+    let _sess = noise.into_transport()
+        .map_err(|e| TransportError::Noise(e.to_string()))?;
+
+    let (mut ctrl, _) = conn.open_bi().await
+        .map_err(|e| TransportError::Connect(e.to_string()))?;
+    ctrl.write_all(&frame::encode_frame(1, FrameType::Headers, b"{}")).await.ok();
+    ctrl.finish().ok();
+    Ok((pid, conn))
+}
+
+async fn tso_handshake(
+    mut stream: tokio::net::TcpStream,
+    peer_id: PeerId,
+    crypto: &Arc<dyn CryptoProvider>,
+    my_id: &PeerId,
+    keepalive_secs: u64,
+) -> Result<Box<dyn Connection>, TransportError> {
+    let our_pk = crypto.local_pubkey();
+    let mut info = [0u8; 64];
+    info[..32].copy_from_slice(&my_id.0);
+    info[32..].copy_from_slice(&our_pk);
+    stream.write_all(&info).await
+        .map_err(|e| TransportError::Io(e.to_string()))?;
+
+    let mut their_info = [0u8; 64];
+    stream.read_exact(&mut their_info).await
+        .map_err(|e| TransportError::Io(e.to_string()))?;
+
+    let their_id = PeerId(their_info[..32].try_into().unwrap_or([0u8; 32]));
+    let their_pk: &[u8; 32] = their_info[32..].try_into().unwrap_or(&[0u8; 32]);
+    let we_init = my_id.0 < their_id.0;
+
+    let mut noise: Box<dyn NoiseHandshake> = if we_init {
+        crypto.new_initiator(their_pk)
+            .map_err(|e| TransportError::Noise(e.to_string()))?
+    } else {
+        crypto.new_responder()
+            .map_err(|e| TransportError::Noise(e.to_string()))?
+    };
+
+    if we_init {
+        let ik1 = noise.write_message(my_id)
+            .map_err(|e| TransportError::Noise(e.to_string()))?;
+        stream.write_all(&encode_handshake_frame(0, &ik1)).await
+            .map_err(|e| TransportError::Io(e.to_string()))?;
+        let mut buf = vec![0u8; 4096];
+        let n = stream.read(&mut buf).await
+            .map_err(|e| TransportError::Io(e.to_string()))?;
+        let h = parse_frame_header(&buf[..n])
+            .map_err(|e| TransportError::Noise(e.to_string()))?;
+        noise.read_message(&buf[8..8 + h.payload_len.min(n - 8)])
+            .map_err(|e| TransportError::Noise(e.to_string()))?;
+    } else {
+        let mut buf = vec![0u8; 4096];
+        let n = stream.read(&mut buf).await
+            .map_err(|e| TransportError::Io(e.to_string()))?;
+        let h = parse_frame_header(&buf[..n])
+            .map_err(|e| TransportError::Noise(e.to_string()))?;
+        noise.read_message(&buf[8..8 + h.payload_len.min(n - 8)])
+            .map_err(|e| TransportError::Noise(e.to_string()))?;
+        let ik2 = noise.write_message(my_id)
+            .map_err(|e| TransportError::Noise(e.to_string()))?;
+        stream.write_all(&encode_handshake_frame(0, &ik2)).await
+            .map_err(|e| TransportError::Io(e.to_string()))?;
+    }
+
+    let session = noise.into_transport()
+        .map_err(|e| TransportError::Noise(e.to_string()))?;
+    Ok(Box::new(TcpConnection::new(stream, session, peer_id, keepalive_secs).await))
+}
+
+// ── Helpers ──
 
 #[derive(Debug)]
 struct NoVerify;
 
 impl rustls::client::danger::ServerCertVerifier for NoVerify {
     fn verify_server_cert(
-        &self,
-        _end_entity: &rustls::pki_types::CertificateDer<'_>,
-        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
-        _server_name: &rustls::pki_types::ServerName<'_>,
-        _ocsp_response: &[u8],
-        _now: rustls::pki_types::UnixTime,
+        &self, _: &rustls::pki_types::CertificateDer<'_>, _: &[rustls::pki_types::CertificateDer<'_>],
+        _: &rustls::pki_types::ServerName<'_>, _: &[u8], _: rustls::pki_types::UnixTime,
     ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
         Ok(rustls::client::danger::ServerCertVerified::assertion())
     }
-
     fn verify_tls12_signature(
-        &self,
-        _message: &[u8],
-        _cert: &rustls::pki_types::CertificateDer<'_>,
-        _dss: &rustls::DigitallySignedStruct,
+        &self, _: &[u8], _: &rustls::pki_types::CertificateDer<'_>, _: &rustls::DigitallySignedStruct,
     ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
         Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
     }
-
     fn verify_tls13_signature(
-        &self,
-        _message: &[u8],
-        _cert: &rustls::pki_types::CertificateDer<'_>,
-        _dss: &rustls::DigitallySignedStruct,
+        &self, _: &[u8], _: &rustls::pki_types::CertificateDer<'_>, _: &rustls::DigitallySignedStruct,
     ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
         Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
     }
-
     fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-        vec![
-            rustls::SignatureScheme::ECDSA_NISTP384_SHA384,
-            rustls::SignatureScheme::ECDSA_NISTP256_SHA256,
-            rustls::SignatureScheme::ED25519,
-            rustls::SignatureScheme::RSA_PSS_SHA512,
-            rustls::SignatureScheme::RSA_PKCS1_SHA256,
-        ]
+        vec![rustls::SignatureScheme::ED25519, rustls::SignatureScheme::RSA_PSS_SHA512]
     }
 }
 
-pub struct Transport {
-    config: TransportConfig,
-    endpoint: quinn::Endpoint,
-    connections: Arc<Mutex<HashMap<PeerId, PeerConnection>>>,
-    noise_secret: [u8; 32],
-    #[allow(dead_code)]
-    peer_id: PeerId,
-    #[allow(dead_code)]
-    public_key: Ed25519PublicKey,
+fn is_ping(data: &[u8]) -> bool {
+    frame::decode_frame_header(data)
+        .map(|(_, ft, _, _)| ft == FrameType::Ping)
+        .unwrap_or(false)
 }
 
-impl Transport {
-    pub fn new(
-        config: TransportConfig,
-        noise_secret: [u8; 32],
-        peer_id: PeerId,
-        public_key: Ed25519PublicKey,
-    ) -> Result<Self, TransportError> {
-        // Generate self-signed cert for QUIC
-        let key_pair = rcgen::KeyPair::generate()
-            .map_err(|e| TransportError::Tls(format!("keygen: {e}")))?;
-        let cert_params = rcgen::CertificateParams::new(vec!["lain".into()])
-            .map_err(|e| TransportError::Tls(format!("cert params: {e}")))?;
-        let cert = cert_params.self_signed(&key_pair)
-            .map_err(|e| TransportError::Tls(format!("self-signed: {e}")))?;
+// ── PeekConnection: wrap a Connection, buffer the first recv'd message ──
 
-        let cert_der = rustls::pki_types::CertificateDer::from(cert.der().to_vec());
-        let key_bytes = key_pair.serialize_der();
-        let pkcs8 = rustls::pki_types::PrivatePkcs8KeyDer::from(key_bytes);
-        let key_der = rustls::pki_types::PrivateKeyDer::from(pkcs8);
+pub struct PeekConnection {
+    inner: Arc<dyn Connection>,
+    peek: Mutex<Option<Vec<u8>>>,
+}
 
-        let server_config = rustls::ServerConfig::builder_with_protocol_versions(&[
-            &rustls::version::TLS13,
-        ])
-        .with_no_client_auth()
-        .with_single_cert(vec![cert_der], key_der)
-        .map_err(|e| TransportError::Tls(format!("server config: {e}")))?;
-
-        let server_cfg = quinn::ServerConfig::with_crypto(Arc::new(
-            quinn::crypto::rustls::QuicServerConfig::try_from(server_config)
-                .map_err(|e| TransportError::Tls(format!("server quic: {e}")))?
-        ));
-
-        // Bind UDP socket
-        let socket = std::net::UdpSocket::bind(config.bind_addr)
-            .map_err(|e| TransportError::Io(format!("bind: {e}")))?;
-
-        let runtime = quinn::default_runtime()
-            .ok_or_else(|| TransportError::Io("no runtime".into()))?;
-
-        let endpoint = quinn::Endpoint::new(
-            quinn::EndpointConfig::default(),
-            Some(server_cfg),
-            socket,
-            runtime,
-        )
-        .map_err(|e| TransportError::Io(format!("endpoint: {e}")))?;
-
-        tracing::info!("transport bound to {:?}", endpoint.local_addr());
-
-        Ok(Self {
-            config,
-            endpoint,
-            connections: Arc::new(Mutex::new(HashMap::new())),
-            noise_secret,
-            peer_id,
-            public_key,
-        })
+impl PeekConnection {
+    pub fn new(inner: Box<dyn Connection>, first: Vec<u8>) -> Self {
+        Self { inner: Arc::from(inner), peek: Mutex::new(Some(first)) }
     }
 
-    /// 主动连接并返回原始 QUIC 连接
-    pub async fn connect_raw(
-        &self,
-        noise_pubkey: &Ed25519PublicKey,
-        endpoints: &[Endpoint],
-    ) -> Result<quinn::Connection, TransportError> {
-        let client_crypto = rustls::ClientConfig::builder_with_protocol_versions(&[
-            &rustls::version::TLS13,
-        ])
-        .dangerous()
-        .with_custom_certificate_verifier(Arc::new(NoVerify))
-        .with_no_client_auth();
-
-        let quic_client_cfg = quinn::ClientConfig::new(Arc::new(
-            quinn::crypto::rustls::QuicClientConfig::try_from(client_crypto)
-                .map_err(|e| TransportError::Tls(format!("client quic: {e}")))?
-        ));
-
-        let mut eps: Vec<_> = endpoints.iter()
-            .filter(|e| e.kind != EndpointKind::TSO)
-            .filter(|e| self.config.has_ipv6 || e.kind != EndpointKind::IPv6) // skip IPv6 if not available
-            .collect();
-        eps.sort_by(|a, b| b.priority.cmp(&a.priority));
-
-        for ep in eps {
-            match tokio::time::timeout(
-                std::time::Duration::from_secs(self.config.traversal_timeout_secs),
-                self.try_connect(noise_pubkey, ep.addr, &quic_client_cfg),
-            ).await {
-                Ok(Ok(conn)) => return Ok(conn),
-                Ok(Err(e)) => tracing::debug!("connect {}: {e}", ep.addr),
-                Err(_) => tracing::debug!("connect {}: timeout", ep.addr),
-            }
-        }
-        Err(TransportError::NoPath { peer_id: PeerId([0u8; 32]) })
-    }
-
-    async fn try_connect(
-        &self,
-        noise_pubkey: &Ed25519PublicKey,
-        addr: SocketAddr,
-        client_cfg: &quinn::ClientConfig,
-    ) -> Result<quinn::Connection, TransportError> {
-        // Convert Ed25519 pubkey → X25519 for Noise IK (use Montgomery form)
-        let conn = self.endpoint
-            .connect_with(client_cfg.clone(), addr, "lain")
-            .map_err(|e| TransportError::Connect(format!("connect: {e}")))?
-            .await
-            .map_err(|e| TransportError::Connect(format!("wait: {e}")))?;
-
-        let (mut send, mut recv) = conn.open_bi().await
-            .map_err(|e| TransportError::Connect(format!("bi: {e}")))?;
-
-        let mut noise = NoiseHandshake::new_initiator(&self.noise_secret, noise_pubkey)
-            .map_err(|e| TransportError::Noise(format!("init: {e}")))?;
-
-        let ik1 = noise.write_message(&[])
-            .map_err(|e| TransportError::Noise(format!("init: {e}")))?;
-        send.write_all(&encode_handshake_frame(0, &ik1)).await
-            .map_err(|e| TransportError::Io(format!("send ik1: {e}")))?;
-
-        let mut buf = vec![0u8; 4096];
-        let n = recv.read(&mut buf).await
-            .map_err(|e| TransportError::Connect(format!("recv ik2: {e}")))?
-            .ok_or_else(|| TransportError::Noise("no ik2".into()))?;
-
-        let header = parse_frame_header(&buf[..n])
-            .map_err(|e| TransportError::Noise(format!("ik2 parse: {e}")))?;
-        let payload = &buf[8..8 + header.payload_len.min(n - 8)];
-
-        noise.read_message(payload)
-            .map_err(|e| TransportError::Noise(format!("ik2 process: {e}")))?;
-
-        let _session = noise.into_transport()
-            .map_err(|e| TransportError::Noise(format!("transport: {e}")))?;
-
-        // Send HEADERS
-        let headers = frame::encode_frame(1, FrameType::Headers, b"{}");
-        let (mut ctrl_send, _) = conn.open_bi().await
-            .map_err(|e| TransportError::Connect(format!("ctrl: {e}")))?;
-        ctrl_send.write_all(&headers).await.ok();
-        let _ = ctrl_send.finish();
-
-        Ok(conn)
-    }
-
-    /// NAT Rebinding: QUIC Connection ID 自动处理路径迁移。
-    /// 保活 PING 减少 NAT 映射过期。
-    pub fn spawn_keepalive(conn: quinn::Connection, interval_secs: u64) {
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(
-                std::time::Duration::from_secs(interval_secs),
-            );
-            loop {
-                interval.tick().await;
-                if let Ok((mut send, _)) = conn.open_bi().await {
-                    let msg = frame::encode_frame(1, FrameType::Ping, &[]);
-                    if send.write_all(&msg).await.is_err() { break; }
-                    let _ = send.finish();
-                }
-            }
-        });
-    }
-
-    /// TCP Simultaneous Open: bind into known port range and connect.
-    /// Parameters adapt to NAT profile: port-preserving NAT uses fewer ports
-    /// and tighter timeouts; high-latency CGNAT uses more ports and longer waits.
-    pub async fn ts_connect(
-        &self,
-        _peer_id: &PeerId,
-        tso_endpoints: &[SocketAddr],
-        port_delta: Option<u16>,
-        stun_rtt_ms: Option<u64>,
-    ) -> Result<TsoStream, TransportError> {
-        use tokio::net::TcpSocket;
-        use tokio::net::TcpStream;
-
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(102);
-        let bind_ip = self.config.bind_addr.ip();
-
-        // Adaptive parameters based on NAT probe results
-        let is_port_preserving = port_delta == Some(1);
-        let rtt = stun_rtt_ms.unwrap_or(200);
-
-        let tso_ports: u16 = if is_port_preserving { 4 } else { 8 };
-        let per_attempt_timeout = if rtt < 100 { std::time::Duration::from_millis(200) }
-            else if rtt < 300 { std::time::Duration::from_millis(400) }
-            else { std::time::Duration::from_millis(600) };
-        let inter_round_base = if is_port_preserving { std::time::Duration::from_millis(200) }
-            else { std::time::Duration::from_millis(300) };
-        let jitter_max = std::time::Duration::from_millis(50);
-
-        const TSO_BASE: u16 = 50000;
-
-        while std::time::Instant::now() < deadline {
-            let (tx, mut rx) = tokio::sync::mpsc::channel::<TcpStream>(1);
-
-            for i in 0..tso_ports {
-                let local_port = TSO_BASE + i;
-                let local_addr = std::net::SocketAddr::new(bind_ip, local_port);
-                for &remote_ep in tso_endpoints {
-                    let tx = tx.clone();
-                    tokio::spawn(async move {
-                        match TcpSocket::new_v4() {
-                            Ok(socket) => {
-                                socket.set_reuseaddr(true).ok();
-                                if socket.bind(local_addr).is_ok() {
-                                    match tokio::time::timeout(
-                                        per_attempt_timeout,
-                                        socket.connect(remote_ep),
-                                    ).await {
-                                        Ok(Ok(s)) => { tx.send(s).await.ok(); }
-                                        _ => {}
-                                    }
-                                }
-                            }
-                            Err(_) => {}
-                        }
-                    });
-                }
-            }
-            drop(tx);
-
-            if let Some(stream) = rx.recv().await {
-                tracing::info!("TSO established");
-                return self.ts_handshake(stream, *_peer_id).await;
-            }
-
-            let jitter = if jitter_max.as_millis() > 0 {
-                let ms = rand::random::<u64>() % (jitter_max.as_millis() as u64 * 2);
-                std::time::Duration::from_millis(
-                    inter_round_base.as_millis().saturating_sub(jitter_max.as_millis()) as u64 + ms
-                )
-            } else {
-                inter_round_base
-            };
-            tokio::time::sleep(jitter).await;
-        }
-
-        Err(TransportError::Connect("TSO timeout".into()))
-    }
-
-    async fn ts_handshake(
-        &self,
-        mut stream: tokio::net::TcpStream,
-        peer_id: PeerId,
-    ) -> Result<TsoStream, TransportError> {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        let our_noise_pk = {
-            let secret = x25519_dalek::StaticSecret::from(self.noise_secret);
-            let public = x25519_dalek::PublicKey::from(&secret);
-            public.to_bytes()
-        };
-        let mut our_info = [0u8; 64];
-        our_info[..32].copy_from_slice(&self.peer_id.0);
-        our_info[32..].copy_from_slice(&our_noise_pk);
-        stream.write_all(&our_info).await
-            .map_err(|e| TransportError::Io(format!("TSO send id: {e}")))?;
-        let mut their_info = [0u8; 64];
-        stream.read_exact(&mut their_info).await
-            .map_err(|e| TransportError::Io(format!("TSO recv id: {e}")))?;
-        let their_id = PeerId(their_info[..32].try_into().unwrap_or([0u8; 32]));
-        let their_pk: &[u8; 32] = their_info[32..].try_into().unwrap();
-        let we_are_initiator = self.peer_id.0 < their_id.0;
-
-        let mut noise = if we_are_initiator {
-            NoiseHandshake::new_initiator(&self.noise_secret, their_pk)
-                .map_err(|e| TransportError::Noise(format!("TSO init: {e}")))?
-        } else {
-            NoiseHandshake::new_responder(&self.noise_secret)
-                .map_err(|e| TransportError::Noise(format!("TSO resp: {e}")))?
-        };
-
-        if we_are_initiator {
-            let ik1 = noise.write_message(&[])
-                .map_err(|e| TransportError::Noise(format!("TSO ik1: {e}")))?;
-            stream.write_all(&encode_handshake_frame(0, &ik1)).await
-                .map_err(|e| TransportError::Io(format!("TSO send ik1: {e}")))?;
-            let mut buf = vec![0u8; 4096];
-            let n = stream.read(&mut buf).await
-                .map_err(|e| TransportError::Io(format!("TSO recv ik2: {e}")))?;
-            let header = parse_frame_header(&buf[..n])
-                .map_err(|e| TransportError::Noise(format!("TSO parse: {e}")))?;
-            let payload = &buf[8..8 + header.payload_len.min(n - 8)];
-            noise.read_message(payload)
-                .map_err(|e| TransportError::Noise(format!("TSO ik2: {e}")))?;
-        } else {
-            let mut buf = vec![0u8; 4096];
-            let n = stream.read(&mut buf).await
-                .map_err(|e| TransportError::Io(format!("TSO recv ik1: {e}")))?;
-            let header = parse_frame_header(&buf[..n])
-                .map_err(|e| TransportError::Noise(format!("TSO parse: {e}")))?;
-            let payload = &buf[8..8 + header.payload_len.min(n - 8)];
-            noise.read_message(payload)
-                .map_err(|e| TransportError::Noise(format!("TSO ik1 read: {e}")))?;
-            let ik2 = noise.write_message(&[])
-                .map_err(|e| TransportError::Noise(format!("TSO ik2: {e}")))?;
-            stream.write_all(&encode_handshake_frame(0, &ik2)).await
-                .map_err(|e| TransportError::Io(format!("TSO send ik2: {e}")))?;
-        }
-        let session = noise.into_transport()
-            .map_err(|e| TransportError::Noise(format!("TSO transport: {e}")))?;
-        Ok(TsoStream::new(stream, session, peer_id))
-    }
-
-    /// 接受原始 QUIC 连接（包含 Noise IK + HEADERS）
-    pub async fn start_ws_listener(&self, bind_addr: SocketAddr) -> Result<u16, TransportError> {
-        let listener = tokio::net::TcpListener::bind(bind_addr)
-            .await
-            .map_err(|e| TransportError::Io(format!("WS bind: {e}")))?;
-
-        let port = listener.local_addr()
-            .map_err(|e| TransportError::Io(format!("WS local_addr: {e}")))?
-            .port();
-
-        // Spawn WS accept loop
-        tokio::spawn(async move {
-            loop {
-                match listener.accept().await {
-                    Ok((mut stream, addr)) => {
-                        // Minimal HTTP Upgrade handshake
-                        use tokio::io::AsyncBufReadExt;
-                        let mut reader = tokio::io::BufReader::new(&mut stream);
-                        let mut line = String::new();
-                        // Read request line
-                        if reader.read_line(&mut line).await.is_err() { continue; }
-                        // Skip headers
-                        let mut key = String::new();
-                        loop {
-                            line.clear();
-                            if reader.read_line(&mut line).await.is_err() { break; }
-                            let t = line.trim();
-                            if t.is_empty() { break; }
-                            if let Some(v) = t.strip_prefix("Sec-WebSocket-Key:") {
-                                key = v.trim().to_string();
-                            }
-                        }
-                        // Send upgrade response
-                        if key.is_empty() {
-                            let _ = stream.write_all(b"HTTP/1.1 400 Bad Request\r\n\r\n").await;
-                            continue;
-                        }
-                        let accept = ws_accept_key(&key);
-                        let resp = format!(
-                            "HTTP/1.1 101 Switching Protocols\r\n\
-                             Upgrade: websocket\r\n\
-                             Connection: Upgrade\r\n\
-                             Sec-WebSocket-Accept: {accept}\r\n\r\n"
-                        );
-                        if stream.write_all(resp.as_bytes()).await.is_err() { continue; }
-
-                        tracing::info!("WS upgraded from {addr}");
-                        // WebSocket established — Noise IK runs over WS frames
-                        // In production, WS frame encode/decode wraps the stream
-                        // For now, raw bytes pass through (works for text-based WS)
-                    }
-                    Err(e) => {
-                        tracing::error!("WS accept: {e}");
-                        break;
-                    }
-                }
-            }
-        });
-
-        tracing::info!("WS fallback listening on port {port}");
-        Ok(port)
-    }
-
-    pub fn local_addr(&self) -> Result<SocketAddr, TransportError> {
-        self.endpoint.local_addr()
-            .map_err(|e| TransportError::Io(format!("local_addr: {e}")))
-    }
-
-    pub async fn accept_incoming(&self) -> Result<IncomingConnection, TransportError> {
-        let (_, peer_id, pubkey) = self.accept_connection().await?;
-        Ok(IncomingConnection {
-            peer_id,
-            peer_pubkey: pubkey,
-            stream: lain_core::transport::QuicStream,
-        })
-    }
-
-    /// Accept a raw connection and return (quinn::Connection, PeerId, pubkey)
-    /// Caller can then inspect control frames before proceeding
-    pub async fn accept_connection(&self) -> Result<(quinn::Connection, PeerId, Ed25519PublicKey), TransportError> {
-        let incoming = self.endpoint
-            .accept()
-            .await
-            .ok_or_else(|| TransportError::Connect("endpoint closed".into()))?;
-
-        let conn = incoming
-            .await
-            .map_err(|e| TransportError::Connect(format!("accept: {e}")))?;
-
-        // Noise IK responder over stream 0
-        let (mut send, mut recv) = conn
-            .accept_bi()
-            .await
-            .map_err(|e| TransportError::Connect(format!("stream0: {e}")))?;
-
-        let mut buf = vec![0u8; 4096];
-        let n = tokio::time::timeout(
-            std::time::Duration::from_secs(15),
-            recv.read(&mut buf),
-        )
-        .await
-        .map_err(|_| TransportError::Noise("ik1 timeout".into()))?
-        .map_err(|e| TransportError::Connect(format!("read ik1: {e}")))?
-        .ok_or_else(|| TransportError::Noise("no ik1".into()))?;
-
-        let header = parse_frame_header(&buf[..n])
-            .map_err(|e| TransportError::Noise(format!("ik1 parse: {e}")))?;
-        let payload = &buf[8..8 + header.payload_len.min(n - 8)];
-
-        let mut noise = NoiseHandshake::new_responder(&self.noise_secret)
-            .map_err(|e| TransportError::Noise(format!("resp: {e}")))?;
-
-        noise.read_message(payload)
-            .map_err(|e| TransportError::Noise(format!("ik1: {e}")))?;
-
-        let ik2 = noise.write_message(&[])
-            .map_err(|e| TransportError::Noise(format!("ik2: {e}")))?;
-        let frame = encode_handshake_frame(1, &ik2);
-        send.write_all(&frame).await
-            .map_err(|e| TransportError::Io(format!("send ik2: {e}")))?;
-        let _ = send.finish();
-
-        let remote_noise_pk = noise.remote_pubkey().unwrap_or([0u8; 32]);
-        let _session = noise.into_transport()
-            .map_err(|e| TransportError::Noise(format!("transport: {e}")))?;
-
-        // Receive HEADERS on stream 1, send response (synchronous — prevents
-        // race between this and caller's accept_bi for relay/DHT_ADDR parsing).
-        let conn2 = conn.clone();
-        if let Ok((mut hd_send, mut hd_recv)) = conn2.accept_bi().await {
-            let mut buf = vec![0u8; 1024];
-            if let Ok(Some(_n)) = hd_recv.read(&mut buf).await {
-                let resp = frame::encode_frame(1, FrameType::Headers, b"{}");
-                hd_send.write_all(&resp).await.ok();
-                hd_send.finish().ok();
-            }
-        }
-
-        // NOTE: Noise IK uses X25519 keys, but PeerID = SHA256(Ed25519 public key).
-        // The correct PeerID is obtained later via DHT bridge exchange (DHT_ADDR).
-        // Return a placeholder; callers must not rely on this value.
-        let remote_peer_id = PeerId([0u8; 32]);
-
-        tracing::info!("incoming connection from {remote_peer_id}");
-
-        Ok((conn, remote_peer_id, remote_noise_pk))
-    }
-
-    async fn connect_internal(
-        &self,
-        peer_id: &PeerId,
-        remote_pubkey: &Ed25519PublicKey,
-        endpoints: &[Endpoint],
-    ) -> Result<(CoreConn, PathType, quinn::Connection), TransportError> {
-        // Build client config that skips cert verification
-        let client_crypto = rustls::ClientConfig::builder_with_protocol_versions(&[
-            &rustls::version::TLS13,
-        ])
-        .dangerous()
-        .with_custom_certificate_verifier(Arc::new(NoVerify))
-        .with_no_client_auth();
-
-        let quic_client_cfg = quinn::ClientConfig::new(Arc::new(
-            quinn::crypto::rustls::QuicClientConfig::try_from(client_crypto)
-                .map_err(|e| TransportError::Tls(format!("client quic: {e}")))?
-        ));
-
-        let mut eps: Vec<_> = endpoints.iter().collect();
-        eps.sort_by(|a, b| b.priority.cmp(&a.priority));
-
-        for ep in eps {
-            let path = match ep.kind {
-                EndpointKind::IPv6 => PathType::IPv6,
-                EndpointKind::STUN => PathType::STUN,
-                EndpointKind::Relay => PathType::Relay,
-                EndpointKind::WebSocket => PathType::WebSocket,
-                _ => continue,
-            };
-
-            let result = tokio::time::timeout(
-                std::time::Duration::from_secs(self.config.traversal_timeout_secs),
-                self.try_path(peer_id, remote_pubkey, ep.addr, path, &quic_client_cfg),
-            )
-            .await;
-
-            match result {
-                Ok(Ok((conn, _, quic))) => {
-                    tracing::info!("connected {peer_id} via {path:?}");
-                    return Ok((conn, path, quic));
-                }
-                Ok(Err(e)) => tracing::debug!("{path:?} → {peer_id}: {e}"),
-                Err(_) => tracing::debug!("{path:?} → {peer_id}: timeout"),
-            }
-        }
-
-        Err(TransportError::NoPath { peer_id: *peer_id })
-    }
-
-    async fn try_path(
-        &self,
-        peer_id: &PeerId,
-        remote_pubkey: &Ed25519PublicKey,
-        addr: SocketAddr,
-        path: PathType,
-        client_cfg: &quinn::ClientConfig,
-    ) -> Result<(CoreConn, PathType, quinn::Connection), TransportError> {
-        let conn = self.endpoint
-            .connect_with(client_cfg.clone(), addr, "lain")
-            .map_err(|e| TransportError::Connect(format!("connect: {e}")))?
-            .await
-            .map_err(|e| TransportError::Connect(format!("wait: {e}")))?;
-
-        let (mut send, mut recv) = conn
-            .open_bi()
-            .await
-            .map_err(|e| TransportError::Connect(format!("bi: {e}")))?;
-
-        let mut noise = NoiseHandshake::new_initiator(&self.noise_secret, remote_pubkey)
-            .map_err(|e| TransportError::Noise(format!("init: {e}")))?;
-
-        let ik1 = noise.write_message(&[])
-            .map_err(|e| TransportError::Noise(format!("ik1: {e}")))?;
-        let frame = encode_handshake_frame(0, &ik1);
-        send.write_all(&frame).await
-            .map_err(|e| TransportError::Io(format!("send ik1: {e}")))?;
-
-        let mut buf = vec![0u8; 4096];
-        let n = recv.read(&mut buf).await
-            .map_err(|e| TransportError::Connect(format!("recv ik2: {e}")))?
-            .ok_or_else(|| TransportError::Noise("no ik2".into()))?;
-
-        let header = parse_frame_header(&buf[..n])
-            .map_err(|e| TransportError::Noise(format!("ik2 parse: {e}")))?;
-        let payload = &buf[8..8 + header.payload_len.min(n - 8)];
-
-        noise.read_message(payload)
-            .map_err(|e| TransportError::Noise(format!("ik2 process: {e}")))?;
-
-        let session = noise.into_transport()
-            .map_err(|e| TransportError::Noise(format!("transport: {e}")))?;
-
-        // Send HEADERS frame on stream 1 (control channel)
-        let headers = frame::encode_frame(1, FrameType::Headers, b"{}");
-        let (mut ctrl_send, _ctrl_recv) = conn
-            .open_bi()
-            .await
-            .map_err(|e| TransportError::Connect(format!("ctrl stream: {e}")))?;
-        ctrl_send.write_all(&headers).await.ok();
-        ctrl_send.finish().ok();
-
-        self.connections.lock().await.insert(*peer_id, PeerConnection {
-            _quic: conn.clone(),
-            _noise: session,
-        });
-
-        Ok((CoreConn {
-            peer_id: *peer_id,
-            peer_pubkey: *remote_pubkey,
-            stream: lain_core::transport::QuicStream,
-            datagram: lain_core::transport::QuicDatagramSender,
-        }, path, conn))
-    }
-
-    /// 处理 relay 请求，连接到目标 peer 并启动数据转发
-    pub async fn handle_relay_request(
-        &self,
-        requester_conn: quinn::Connection,
-        target_peer_id: PeerId,
-        target_pubkey: Ed25519PublicKey,
-        target_endpoints: &[Endpoint],
-    ) -> Result<(), TransportError> {
-        tracing::info!("relay: forwarding to {target_peer_id}");
-
-        // Connect to target
-        let (_, _, target_quic) = self.connect_internal(
-            &target_peer_id,
-            &target_pubkey,
-            target_endpoints,
-        ).await?;
-
-        // Forward data bidirectionally
-        tracing::info!("relay: pipe established requester <> {target_peer_id}");
-        Self::pipe_connections(requester_conn, target_quic).await;
-
-        Ok(())
-    }
-
-    /// 双向管道转发两个 QUIC 连接之间的所有数据
-    async fn pipe_connections(a: quinn::Connection, b: quinn::Connection) {
-        let a2 = a.clone();
-        let b2 = b.clone();
-
-        // Forward incoming streams from A to B (30s timeout on accept for dead relay detection)
-        let a_to_b = tokio::spawn(async move {
-            loop {
-                match tokio::time::timeout(std::time::Duration::from_secs(30), a.accept_bi()).await {
-                    Ok(Ok(stream)) => {
-                        let (_send, mut recv) = (stream.0, stream.1);
-                let b3 = b.clone();
-                tokio::spawn(async move {
-                    if let Ok((mut b_send, _b_recv)) = b3.open_bi().await {
-                        // A recv → B send
-                        let mut buf = vec![0u8; 8192];
-                        loop {
-                            match recv.read(&mut buf).await {
-                                Ok(Some(n)) => {
-                                    if b_send.write_all(&buf[..n]).await.is_err() { break; }
-                                }
-                                _ => break,
-                            }
-                        }
-                        let _ = b_send.finish();
-                    }
-                });
-            }
-                    Ok(Err(_)) => break,     // QUIC error, relay dead
-                    Err(_) => break,          // Timeout, relay dead
-                }
-            }
-        });
-
-        // Forward incoming streams from B to A (30s timeout)
-        let b_to_a = tokio::spawn(async move {
-            loop {
-                match tokio::time::timeout(std::time::Duration::from_secs(30), b2.accept_bi()).await {
-                    Ok(Ok(stream)) => {
-                let (_send, mut recv) = (stream.0, stream.1);
-                let a3 = a2.clone();
-                tokio::spawn(async move {
-                    if let Ok((mut a_send, _a_recv)) = a3.open_bi().await {
-                        let mut buf = vec![0u8; 8192];
-                        loop {
-                            match recv.read(&mut buf).await {
-                                Ok(Some(n)) => {
-                                    if a_send.write_all(&buf[..n]).await.is_err() { break; }
-                                }
-                                _ => break,
-                            }
-                        }
-                        let _ = a_send.finish();
-                    }
-                });
-            }
-                    Ok(Err(_)) => break,
-                    Err(_) => break,
-                }
-            }
-        });
-
-        let _ = tokio::join!(a_to_b, b_to_a);
-    }
+    /// Take ownership of the inner connection (consuming the peek buffer).
+    pub fn into_inner(self) -> Arc<dyn Connection> { self.inner }
 }
 
 #[async_trait::async_trait]
-impl TransportLayer for Transport {
-    async fn connect(
-        &self,
-        peer_id: &PeerId,
-        pubkey: &Ed25519PublicKey,
-        endpoints: &[Endpoint],
-    ) -> Result<CoreConn, CoreError> {
-        self.connect_internal(peer_id, pubkey, endpoints)
-            .await
-            .map(|(c, _, _)| c)
+impl Connection for PeekConnection {
+    fn peer_id(&self) -> PeerId { self.inner.peer_id() }
+    fn path(&self) -> PathType { self.inner.path() }
+    fn rtt_ms(&self) -> Option<u64> { self.inner.rtt_ms() }
+
+    async fn send(&self, data: &[u8]) -> Result<(), CoreError> { self.inner.send(data).await }
+    fn close(&self) { self.inner.close() }
+
+    async fn recv(&self) -> Result<Vec<u8>, CoreError> {
+        if let Some(data) = self.peek.lock().await.take() {
+            return Ok(data);
+        }
+        self.inner.recv().await
+    }
+}
+
+// ── Trait impl ──
+
+#[async_trait::async_trait]
+impl TransportTrait for Transport {
+    async fn connect(&self, peer_id: PeerId, noise_pubkey: &[u8; 32], endpoints: &[Endpoint]) -> Result<Box<dyn Connection>, CoreError> {
+        Transport::connect(self, peer_id, noise_pubkey, endpoints).await
             .map_err(|e| CoreError::InvalidEndpoint(e.to_string()))
     }
 
-    async fn accept(&self) -> Result<IncomingConnection, CoreError> {
-        self.accept_incoming()
-            .await
+    async fn connect_tso(&self, peer_id: PeerId, tso_endpoints: &[SocketAddr], port_delta: Option<u16>, stun_rtt_ms: Option<u64>) -> Result<Box<dyn Connection>, CoreError> {
+        Transport::connect_tso(self, peer_id, tso_endpoints, port_delta, stun_rtt_ms).await
             .map_err(|e| CoreError::InvalidEndpoint(e.to_string()))
     }
 
-    fn on_endpoints_changed(&self, peer_id: &PeerId, _endpoints: Vec<Endpoint>) {
-        tracing::info!("endpoints changed for {peer_id}");
-    }
-}
-
-/// WebSocket handshake accept key: base64(sha1(key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"))
-/// WebSocket 帧编码（binary, FIN=1）
-#[allow(dead_code)]
-fn ws_encode_frame(payload: &[u8]) -> Vec<u8> {
-    let mut f = Vec::with_capacity(payload.len() + 10);
-    f.push(0x82); // FIN + Binary opcode
-    if payload.len() <= 125 {
-        f.push(payload.len() as u8);
-    } else if payload.len() <= 65535 {
-        f.push(126);
-        f.extend_from_slice(&(payload.len() as u16).to_be_bytes());
-    } else {
-        f.push(127);
-        f.extend_from_slice(&(payload.len() as u64).to_be_bytes());
-    }
-    f.extend_from_slice(payload);
-    f
-}
-
-/// WebSocket 帧解码，返回 payload
-#[allow(dead_code)]
-fn ws_decode_frame(data: &[u8]) -> Option<Vec<u8>> {
-    if data.len() < 2 { return None; }
-    let masked = data[1] & 0x80 != 0;
-    let mut len = (data[1] & 0x7F) as usize;
-    let mut offset = 2usize;
-    if len == 126 { if data.len() < 4 { return None; } len = u16::from_be_bytes([data[2], data[3]]) as usize; offset = 4; }
-    else if len == 127 { if data.len() < 10 { return None; } len = u64::from_be_bytes(data[2..10].try_into().ok()?) as usize; offset = 10; }
-    let mask = if masked { if data.len() < offset + 4 { return None; } let m = [data[offset], data[offset+1], data[offset+2], data[offset+3]]; offset += 4; Some(m) } else { None };
-    if data.len() < offset + len { return None; }
-    let mut payload = data[offset..offset + len].to_vec();
-    if let Some(m) = mask { for (i, b) in payload.iter_mut().enumerate() { *b ^= m[i % 4]; } }
-    Some(payload)
-}
-
-fn ws_accept_key(key: &str) -> String {
-    let mut combined = key.to_string();
-    combined.push_str("258EAFA5-E914-47DA-95CA-C5AB0DC85B11");
-    let hash = sha1_smol::Sha1::from(&combined).digest().bytes();
-    base64_encode(&hash)
-}
-
-fn base64_encode(data: &[u8]) -> String {
-    const CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut result = String::new();
-    for chunk in data.chunks(3) {
-        let b0 = chunk[0] as u32;
-        let b1 = if chunk.len() > 1 { chunk[1] as u32 } else { 0 };
-        let b2 = if chunk.len() > 2 { chunk[2] as u32 } else { 0 };
-        let n = (b0 << 16) | (b1 << 8) | b2;
-        result.push(CHARS[((n >> 18) & 63) as usize] as char);
-        result.push(CHARS[((n >> 12) & 63) as usize] as char);
-        result.push(if chunk.len() > 1 { CHARS[((n >> 6) & 63) as usize] } else { b'=' } as char);
-        result.push(if chunk.len() > 2 { CHARS[(n & 63) as usize] } else { b'=' } as char);
-    }
-    result
-}
-
-#[cfg(test)]
-#[allow(clippy::unwrap_used)]
-mod tests {
-    use super::*;
-    use lain_identity::Identity;
-    use lain_core::identity::IdentityProvider;
-
-    #[test]
-    fn test_config_defaults() {
-        let c = TransportConfig::default();
-        assert_eq!(c.max_connections, 256);
+    async fn accept(&self) -> Result<Box<dyn Connection>, CoreError> {
+        Transport::accept(self).await
+            .map_err(|e| CoreError::InvalidEndpoint(e.to_string()))
     }
 
-    #[tokio::test]
-    async fn test_new_with_specific_bind_addr() {
-        let _ = rustls::crypto::ring::default_provider().install_default();
-        let t = Transport::new(
-            TransportConfig { bind_addr: "127.0.0.1:0".parse().unwrap(), ..Default::default() },
-            [1u8; 32],
-            PeerId([2u8; 32]),
-            [3u8; 32],
-        ).unwrap();
-        let addr = t.local_addr().unwrap();
-        assert!(addr.port() > 0, "should bind to an available port");
-    }
-
-    #[tokio::test]
-    async fn test_local_addr_returns_bound_port() {
-        let _ = rustls::crypto::ring::default_provider().install_default();
-        let t = Transport::new(
-            TransportConfig { bind_addr: "127.0.0.1:0".parse().unwrap(), ..Default::default() },
-            [4u8; 32],
-            PeerId([5u8; 32]),
-            [6u8; 32],
-        ).unwrap();
-        let addr = t.local_addr().unwrap();
-        assert!(addr.ip().is_loopback());
-        assert!(addr.port() > 0);
-    }
-
-    #[test]
-    fn test_no_verify_client_structure() {
-        use rustls::client::danger::ServerCertVerifier;
-        use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
-
-        let nv = NoVerify;
-        let cert = CertificateDer::from(vec![]);
-        let name = ServerName::try_from("localhost").unwrap();
-        let time = UnixTime::since_unix_epoch(std::time::Duration::from_secs(0));
-
-        // All verify methods must return Ok
-        assert!(nv.verify_server_cert(&cert, &[], &name, &[], time).is_ok());
-        // TLS signature verifiers are no-ops in NoVerify; test they don't panic
-        assert!(nv.supported_verify_schemes().contains(&rustls::SignatureScheme::ED25519));
-
-        // supported_verify_schemes should include common ones
-        let schemes = nv.supported_verify_schemes();
-        assert!(!schemes.is_empty());
-        assert!(schemes.contains(&rustls::SignatureScheme::ED25519));
-    }
-
-    #[tokio::test]
-    async fn test_connect_raw_with_invalid_endpoint() {
-        let _ = rustls::crypto::ring::default_provider().install_default();
-
-        let id = Identity::generate().ok().unwrap();
-        let (ns, _np) = id.noise_keypair();
-
-        let t = Transport::new(
-            TransportConfig {
-                bind_addr: "127.0.0.1:0".parse().unwrap(),
-                traversal_timeout_secs: 1, // short timeout for test
-                ..Default::default()
-            },
-            ns, id.peer_id(), *id.public_key(),
-        ).unwrap();
-
-        // Try connecting to an unreachable port (nothing listening there)
-        let bad_ep = Endpoint::new("127.0.0.1:1".parse().unwrap(), EndpointKind::STUN);
-        let result = t.connect_raw(&[0u8; 32], &[bad_ep]).await;
-        assert!(result.is_err(), "connect to unreachable port should fail");
-    }
-
-    #[tokio::test]
-    async fn test_connect_raw_fallback_to_second_endpoint() {
-        let _ = rustls::crypto::ring::default_provider().install_default();
-
-        let id_a = Identity::generate().ok().unwrap();
-        let id_b = Identity::generate().ok().unwrap();
-        let (ns_a, _np_a) = id_a.noise_keypair();
-        let (ns_b, np_b) = id_b.noise_keypair();
-
-        let t_a = Transport::new(
-            TransportConfig {
-                bind_addr: "127.0.0.1:0".parse().unwrap(),
-                traversal_timeout_secs: 5,
-                ..Default::default()
-            },
-            ns_a, id_a.peer_id(), *id_a.public_key(),
-        ).unwrap();
-
-        let t_b = Arc::new(Transport::new(
-            TransportConfig { bind_addr: "127.0.0.1:0".parse().unwrap(), ..Default::default() },
-            ns_b, id_b.peer_id(), *id_b.public_key(),
-        ).unwrap());
-        let b_port = t_b.local_addr().unwrap().port();
-
-        // B accept
-        let t_b2 = t_b.clone();
-        let (conn_tx, mut conn_rx) = tokio::sync::mpsc::channel::<quinn::Connection>(1);
-        tokio::spawn(async move {
-            if let Ok((conn, _, _)) = t_b2.accept_connection().await {
-                conn_tx.send(conn).await.ok();
-            }
-        });
-
-        // Try: first endpoint is unreachable, second is reachable
-        let bad_ep = Endpoint::new("127.0.0.1:1".parse().unwrap(), EndpointKind::STUN);
-        let good_ep = Endpoint::new(format!("127.0.0.1:{b_port}").parse().unwrap(), EndpointKind::STUN);
-
-        let conn = t_a.connect_raw(&np_b, &[bad_ep, good_ep]).await;
-        assert!(conn.is_ok(), "should connect via second endpoint: {:?}", conn.err());
-
-        let _b_conn = conn_rx.recv().await.unwrap();
-    }
-
-    #[test]
-    fn test_config_custom_values() {
-        let c = TransportConfig {
-            bind_addr: "0.0.0.0:9000".parse().unwrap(),
-            max_connections: 128,
-            idle_timeout_ms: 60000,
-            traversal_timeout_secs: 15,
-            has_ipv6: false,
-        };
-        assert_eq!(c.max_connections, 128);
-        assert_eq!(c.idle_timeout_ms, 60000);
-        assert_eq!(c.traversal_timeout_secs, 15);
-        assert_eq!(c.bind_addr.port(), 9000);
-    }
-
-    #[test]
-    fn test_ts_connect_key_derivation_matches_identity() {
-        let id = Identity::generate().ok().unwrap();
-        let (noise_secret, noise_pubkey) = id.noise_keypair();
-
-        // Re-derive the public key the same way ts_connect does
-        let secret = x25519_dalek::StaticSecret::from(noise_secret);
-        let public = x25519_dalek::PublicKey::from(&secret);
-        let derived_pk = public.to_bytes();
-
-        assert_eq!(derived_pk, noise_pubkey,
-            "X25519 public key derived from noise_secret must match noise_keypair output");
-    }
-
-    #[tokio::test]
-    async fn test_accept_connection_completes_noise_ik() {
-        let _ = rustls::crypto::ring::default_provider().install_default();
-
-        let id_a = Identity::generate().ok().unwrap();
-        let id_b = Identity::generate().ok().unwrap();
-        let (ns_a, _np_a) = id_a.noise_keypair();
-        let (ns_b, np_b) = id_b.noise_keypair();
-
-        let t_a = Transport::new(
-            TransportConfig { bind_addr: "127.0.0.1:0".parse().unwrap(), ..Default::default() },
-            ns_a, id_a.peer_id(), *id_a.public_key(),
-        ).unwrap();
-        let t_b = Arc::new(Transport::new(
-            TransportConfig { bind_addr: "127.0.0.1:0".parse().unwrap(), ..Default::default() },
-            ns_b, id_b.peer_id(), *id_b.public_key(),
-        ).unwrap());
-
-        let b_port = t_b.local_addr().unwrap().port();
-        let b_ep = Endpoint::new(
-            format!("127.0.0.1:{b_port}").parse().unwrap(),
-            EndpointKind::STUN,
-        );
-
-        // B accept loop
-        let t_b2 = t_b.clone();
-        let (conn_tx, mut conn_rx) = tokio::sync::mpsc::channel::<quinn::Connection>(1);
-        tokio::spawn(async move {
-            match t_b2.accept_connection().await {
-                Ok((conn, peer_id, noise_pk)) => {
-                    // PeerId is placeholder [0u8; 32] from accept_connection
-                    assert!(peer_id.0.iter().all(|&b| b == 0),
-                        "accept_connection returns zero placeholder PeerId");
-                    assert!(noise_pk.iter().any(|&b| b != 0),
-                        "Noise remote pubkey should be non-zero");
-                    conn_tx.send(conn).await.ok();
-                }
-                Err(e) => panic!("accept_connection failed: {e}"),
-            }
-        });
-
-        // A connects to B
-        let conn_a = t_a.connect_raw(&np_b, &[b_ep]).await
-            .expect("connect_raw should succeed");
-
-        let conn_b = tokio::time::timeout(
-            std::time::Duration::from_secs(5), conn_rx.recv(),
-        ).await.unwrap().unwrap();
-
-        // Verify both sides can open bi streams and exchange data
-        let (mut a_send, mut a_recv) = conn_a.open_bi().await.unwrap();
-        a_send.write_all(b"hello accept").await.unwrap();
-        a_send.finish().unwrap();
-
-        let (mut b_send, mut b_recv) = conn_b.accept_bi().await.unwrap();
-        let data = b_recv.read_to_end(65536).await.unwrap();
-        assert_eq!(&data, b"hello accept", "data roundtrip through accept_connection");
-
-        b_send.write_all(b"echo").await.unwrap();
-        b_send.finish().unwrap();
-
-        let echo = a_recv.read_to_end(65536).await.unwrap();
-        assert_eq!(&echo, b"echo");
+    fn local_addr(&self) -> Result<SocketAddr, CoreError> {
+        Transport::local_addr(self)
+            .map_err(|e| CoreError::InvalidEndpoint(e.to_string()))
     }
 }

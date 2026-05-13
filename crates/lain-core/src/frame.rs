@@ -111,6 +111,47 @@ pub fn decode_varint(data: &[u8]) -> Option<(u64, usize)> {
     Some((val, len))
 }
 
+// ── Noise IK 握手帧 (§9.7.3) ──
+
+const HANDSHAKE_MAGIC: [u8; 3] = [0x4C, 0x41, 0x49]; // "LAI"
+const HANDSHAKE_VERSION: u8 = 0x01;
+
+pub struct HandshakeFrameHeader {
+    pub step: u8,
+    pub payload_len: usize,
+}
+
+/// 编码 Noise 握手帧
+pub fn encode_handshake_frame(step: u8, payload: &[u8]) -> Vec<u8> {
+    let len = payload.len();
+    let mut frame = Vec::with_capacity(8 + len);
+    frame.extend_from_slice(&HANDSHAKE_MAGIC);
+    frame.push(HANDSHAKE_VERSION);
+    frame.push(step);
+    frame.push(((len >> 16) & 0xFF) as u8);
+    frame.push(((len >> 8) & 0xFF) as u8);
+    frame.push((len & 0xFF) as u8);
+    frame.extend_from_slice(payload);
+    frame
+}
+
+/// 解析 Noise 握手帧头
+pub fn parse_handshake_frame_header(data: &[u8]) -> Result<HandshakeFrameHeader, crate::error::CoreError> {
+    if data.len() < 8 {
+        return Err(crate::error::CoreError::InvalidEndpoint("frame too short".into()));
+    }
+    if data[0..3] != HANDSHAKE_MAGIC {
+        return Err(crate::error::CoreError::InvalidEndpoint("bad magic".into()));
+    }
+    if data[3] != HANDSHAKE_VERSION {
+        return Err(crate::error::CoreError::InvalidEndpoint("bad version".into()));
+    }
+    Ok(HandshakeFrameHeader {
+        step: data[4],
+        payload_len: ((data[5] as usize) << 16) | ((data[6] as usize) << 8) | (data[7] as usize),
+    })
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {

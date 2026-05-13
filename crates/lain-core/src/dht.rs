@@ -1,15 +1,17 @@
 use std::net::SocketAddr;
 
-use crate::endpoint::Endpoint;
 use crate::capabilities::Capabilities;
+use crate::endpoint::Endpoint;
+use crate::error::CoreError;
 use crate::identity::{Ed25519PublicKey, Ed25519Signature};
 use crate::peer::PeerId;
 
-/// DHT 节点基本信息
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct NodeInfo {
+/// Relay 候选节点
+#[derive(Clone, Debug)]
+pub struct RelayInfo {
     pub node_id: PeerId,
     pub address: SocketAddr,
+    pub noise_pubkey: [u8; 32],
 }
 
 /// DHT 中存储的 peer 记录
@@ -95,4 +97,14 @@ impl DhtErrorCode {
             _ => None,
         }
     }
+}
+
+/// DHT 目录服务接口 — 供 daemon 和 test mock 使用
+#[async_trait::async_trait]
+pub trait DhtBackend: Send + Sync {
+    async fn bootstrap(&self, seeds: &[SocketAddr]) -> Result<(), CoreError>;
+    async fn store_self(&self, pubkey: &[u8; 32], noise_pubkey: &[u8; 32], endpoints: &[Endpoint], capabilities: Capabilities) -> Result<(), CoreError>;
+    async fn find_peer(&self, peer_id: &PeerId) -> Result<Option<PeerRecord>, CoreError>;
+    async fn find_relays(&self) -> Result<Vec<RelayInfo>, CoreError>;
+    async fn routing_table_size(&self) -> usize;
 }

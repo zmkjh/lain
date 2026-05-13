@@ -6,7 +6,6 @@ license.workspace = true
 
 [dependencies]
 lain-core = { path = "../lain-core" }
-lain-dht = { path = "../lain-dht" }
 thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true

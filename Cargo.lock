@@ -824,10 +824,7 @@ version = "0.1.2"
 dependencies = [
  "base64",
  "clap",
- "lain-core",
  "lain-daemon",
- "lain-discovery",
- "lain-identity",
  "serde",
  "serde_json",
  "tokio",
@@ -854,6 +851,7 @@ dependencies = [
 name = "lain-daemon"
 version = "0.1.2"
 dependencies = [
+ "async-trait",
  "base64",
  "ed25519-dalek",
  "futures",
@@ -905,7 +903,6 @@ name = "lain-discovery"
 version = "0.1.2"
 dependencies = [
  "lain-core",
- "lain-dht",
  "mdns-sd",
  "thiserror 2.0.18",
  "tokio",
@@ -951,6 +948,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tracing",
+ "x25519-dalek",
 ]
 
 [[package]]
@@ -961,10 +959,7 @@ dependencies = [
  "bytes",
  "ed25519-dalek",
  "lain-core",
- "lain-dht",
  "lain-identity",
- "lain-nat",
- "lain-noise",
  "quinn",
  "rand 0.8.6",
  "rcgen",

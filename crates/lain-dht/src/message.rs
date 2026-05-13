@@ -417,7 +417,7 @@ pub fn parse_endpoints(data: &[u8], ep_data_len: usize) -> Vec<Endpoint> {
         let ttl_bytes = [data[offset], data[offset+1], data[offset+2], data[offset+3]];
         let ttl = u32::from_be_bytes(ttl_bytes);
         offset += 4;
-        endpoints.push(Endpoint { addr, kind, priority: 0, ttl_seconds: ttl });
+        endpoints.push(Endpoint { addr, kind, ttl_seconds: ttl });
     }
     endpoints
 }

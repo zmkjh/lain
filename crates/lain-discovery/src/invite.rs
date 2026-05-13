@@ -213,7 +213,7 @@ fn encode_endpoint_binary(buf: &mut Vec<u8>, ep: &Endpoint) {
         }
     }
     buf.push(ep.kind as u8);
-    buf.push(ep.priority);
+    buf.push(128); // priority (legacy wire format, no longer used by runtime)
     buf.extend_from_slice(&ep.ttl_seconds.to_be_bytes());
 }
 
@@ -254,7 +254,7 @@ fn decode_endpoint_binary(data: &[u8], offset: &mut usize) -> Option<Endpoint> {
     }
     let kind_byte = data[*offset];
     *offset += 1;
-    let priority = data[*offset];
+    let _priority = data[*offset]; // legacy, ignored
     *offset += 1;
     let kind = match kind_byte {
         0 => EndpointKind::IPv6,
@@ -269,7 +269,7 @@ fn decode_endpoint_binary(data: &[u8], offset: &mut usize) -> Option<Endpoint> {
     let ttl_seconds = u32::from_be_bytes(ttl_bytes);
     *offset += 4;
 
-    Some(Endpoint { addr, kind, priority, ttl_seconds })
+    Some(Endpoint { addr, kind, ttl_seconds })
 }
 
 const BASE62_CHARS: &[u8; 62] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
@@ -341,12 +341,10 @@ mod tests {
     fn make_invite() -> InviteCode {
         let peer_id = PeerId([1u8; 32]);
         let pk = [2u8; 32];
-        let endpoint = Endpoint {
-            addr: "192.168.1.1:8080".parse().unwrap(),
-            kind: EndpointKind::LAN,
-            priority: 100,
-            ttl_seconds: 300,
-        };
+        let endpoint = Endpoint::new(
+            "192.168.1.1:8080".parse().unwrap(),
+            EndpointKind::LAN,
+        );
         let sign_fn = |_data: &[u8]| -> [u8; 64] { [3u8; 64] };
         InviteCode::new(peer_id, pk, pk, Capabilities::new(), vec![endpoint], &sign_fn)
     }
@@ -388,10 +386,11 @@ mod tests {
         let peer_id = PeerId([1u8; 32]);
         let pk = [2u8; 32];
         let sign_fn = |_data: &[u8]| -> [u8; 64] { [3u8; 64] };
-        let endpoints = vec![
-            Endpoint { addr: "10.0.0.1:8080".parse().unwrap(), kind: EndpointKind::LAN, priority: 100, ttl_seconds: 300 },
-            Endpoint { addr: "1.2.3.4:9999".parse().unwrap(), kind: EndpointKind::STUN, priority: 80, ttl_seconds: 600 },
-        ];
+        let mut e1 = Endpoint::new("10.0.0.1:8080".parse().unwrap(), EndpointKind::LAN);
+        e1.ttl_seconds = 300;
+        let mut e2 = Endpoint::new("1.2.3.4:9999".parse().unwrap(), EndpointKind::STUN);
+        e2.ttl_seconds = 600;
+        let endpoints = vec![e1, e2];
         let invite = InviteCode::new(peer_id, pk, pk, Capabilities::new(), endpoints, &sign_fn);
         let b62 = invite.to_base62();
         let decoded = InviteCode::from_base62(&b62).unwrap();
@@ -406,8 +405,10 @@ mod tests {
         let ed_pk = [0xBBu8; 32];
         let noise_pk = [0xCCu8; 32]; // different from ed25519_pk (real scenario)
         let caps = Capabilities { bits: 0b1010 };
-        let ep1 = Endpoint { addr: "10.0.0.1:8080".parse().unwrap(), kind: EndpointKind::LAN, priority: 100, ttl_seconds: 300 };
-        let ep2 = Endpoint { addr: "1.2.3.4:9999".parse().unwrap(), kind: EndpointKind::STUN, priority: 80, ttl_seconds: 600 };
+        let mut ep1 = Endpoint::new("10.0.0.1:8080".parse().unwrap(), EndpointKind::LAN);
+        ep1.ttl_seconds = 300;
+        let mut ep2 = Endpoint::new("1.2.3.4:9999".parse().unwrap(), EndpointKind::STUN);
+        ep2.ttl_seconds = 600;
         let sign_fn = |data: &[u8]| -> [u8; 64] {
             let mut sig = [0u8; 64];
             sig[..32].copy_from_slice(&ed_pk);
@@ -426,10 +427,8 @@ mod tests {
         assert_eq!(decoded.endpoints.len(), 2);
         assert_eq!(decoded.endpoints[0].addr.to_string(), "10.0.0.1:8080");
         assert_eq!(decoded.endpoints[0].kind, EndpointKind::LAN);
-        assert_eq!(decoded.endpoints[0].priority, 100);
         assert_eq!(decoded.endpoints[1].addr.to_string(), "1.2.3.4:9999");
         assert_eq!(decoded.endpoints[1].kind, EndpointKind::STUN);
-        assert_eq!(decoded.endpoints[1].priority, 80);
         assert_eq!(decoded.timestamp, invite.timestamp);
         assert_eq!(decoded.signature, invite.signature);
 

@@ -7,9 +7,10 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use lain_core::capabilities::Capabilities;
-use lain_core::dht::{DhtMsgType, NodeInfo};
+use lain_core::dht::{DhtBackend, DhtMsgType, RelayInfo};
 use lain_core::dht::DhtEvent as CoreDhtEvent;
 use lain_core::endpoint::Endpoint;
+use lain_core::error::CoreError;
 use lain_core::peer::PeerId;
 use serde::{Deserialize, Serialize};
 use sha2::Digest;
@@ -78,16 +79,12 @@ pub struct PeerRecord {
 }
 
 pub struct DhtHandle {
-    #[allow(dead_code)]
     peer_id: PeerId,
-    #[allow(dead_code)]
-    public_key: [u8; 32],
     config: DhtConfig,
     routing_table: Arc<RwLock<RoutingTable>>,
     peer_records: Arc<RwLock<HashMap<PeerId, PeerRecord>>>,
     event_tx: broadcast::Sender<CoreDhtEvent>,
     socket: Arc<UdpSocket>,
-    #[allow(dead_code)]
     signing_key: Option<[u8; 32]>,
     pending_queries: Arc<RwLock<HashMap<[u8; 16], tokio::sync::oneshot::Sender<Option<PeerRecord>>>>>,
     peer_ratelimit: Arc<RwLock<HashMap<PeerId, (u128, u32)>>>,
@@ -102,13 +99,12 @@ struct RoutesEntry {
 impl DhtHandle {
     pub fn new(
         peer_id: PeerId,
-        public_key: [u8; 32],
+        _public_key: [u8; 32],
         config: DhtConfig,
     ) -> Result<Self, DhtError> {
         let routing_table = Arc::new(RwLock::new(RoutingTable::new(peer_id, config.k)));
         let peer_records = Arc::new(RwLock::new(HashMap::new()));
         let (event_tx, _rx) = broadcast::channel(64);
-        // Socket will be bound later
         let std_socket = std::net::UdpSocket::bind(config.local_addr)
                 .map_err(|e| DhtError::Network(e.to_string()))?;
             let _ = std_socket.set_nonblocking(true);
@@ -117,7 +113,6 @@ impl DhtHandle {
 
         Ok(Self {
             peer_id,
-            public_key,
             config,
             routing_table,
             peer_records,
@@ -350,11 +345,15 @@ impl DhtHandle {
     }
 
     /// 查找 relay 候选
-    pub async fn find_relays(&self) -> Result<Vec<NodeInfo>, DhtError> {
+    pub async fn find_relays(&self) -> Result<Vec<RelayInfo>, DhtError> {
+        let records = self.peer_records.read().await;
         let rt = self.routing_table.read().await;
         Ok(rt.all_nodes().into_iter()
             .filter(|n| n.node_id != self.peer_id)
-            .map(|n| NodeInfo { node_id: n.node_id, address: n.address })
+            .map(|n| {
+                let npk = records.get(&n.node_id).map(|r| r.noise_pubkey).unwrap_or([0u8; 32]);
+                RelayInfo { node_id: n.node_id, address: n.address, noise_pubkey: npk }
+            })
             .collect())
     }
 
@@ -526,7 +525,7 @@ impl DhtHandle {
                             endpoints: eps,
                             capabilities: Capabilities::new(),
                             ttl_remaining: effective_ttl,
-                            expires_at: std::time::Instant::now(),
+                            expires_at: std::time::Instant::now() + std::time::Duration::from_secs(effective_ttl as u64),
                         }.into_core(&key)));
                     }
                 }
@@ -665,6 +664,31 @@ impl crate::PeerRecord {
             capabilities: self.capabilities,
             ttl_remaining: self.ttl_remaining,
         }
+    }
+}
+
+#[async_trait::async_trait]
+impl DhtBackend for DhtHandle {
+    async fn bootstrap(&self, seeds: &[SocketAddr]) -> Result<(), CoreError> {
+        self.bootstrap(seeds).await.map_err(|e| CoreError::InvalidEndpoint(e.to_string()))
+    }
+
+    async fn store_self(&self, pubkey: &[u8; 32], noise_pubkey: &[u8; 32], endpoints: &[Endpoint], capabilities: Capabilities) -> Result<(), CoreError> {
+        self.store_self(pubkey, noise_pubkey, endpoints, capabilities).await.map_err(|e| CoreError::InvalidEndpoint(e.to_string()))
+    }
+
+    async fn find_peer(&self, peer_id: &PeerId) -> Result<Option<lain_core::dht::PeerRecord>, CoreError> {
+        self.find_peer(peer_id).await
+            .map_err(|e| CoreError::InvalidEndpoint(e.to_string()))
+            .map(|opt| opt.map(|r| r.into_core(peer_id)))
+    }
+
+    async fn find_relays(&self) -> Result<Vec<RelayInfo>, CoreError> {
+        self.find_relays().await.map_err(|e| CoreError::InvalidEndpoint(e.to_string()))
+    }
+
+    async fn routing_table_size(&self) -> usize {
+        self.routing_table_size().await
     }
 }
 

@@ -7,6 +7,7 @@
 //! 本 crate 定义所有其他 crate 共享的基础设施，零外部依赖（除了 thiserror）。
 //! 所有网络 I/O 相关的 trait 使用 `async_trait`（可选依赖）或返回 `Future`。
 
+pub mod crypto;
 pub mod error;
 pub mod identity;
 pub mod peer;
@@ -50,6 +51,3 @@ pub const MOBILE_MAX_STREAMS_PER_CONN: usize = 32;
 
 /// 入站连接等待应用接受的超时
 pub const INCOMING_ACCEPT_TIMEOUT_SECS: u64 = 30;
-
-/// 全局静态 Relay 魔术 key
-pub const RELAY_CAPABILITY_MARKER: &[u8] = b"lain-relay-v1";

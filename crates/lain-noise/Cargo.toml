@@ -11,3 +11,4 @@ rand.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+x25519-dalek.workspace = true
