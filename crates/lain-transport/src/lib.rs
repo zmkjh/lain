@@ -545,3 +545,72 @@ impl TransportTrait for Transport {
             .map_err(|e| CoreError::InvalidEndpoint(e.to_string()))
     }
 }
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+    use lain_core::peer::PeerId;
+
+    struct MockConnection {
+        pid: PeerId,
+        messages: tokio::sync::Mutex<Vec<Vec<u8>>>,
+    }
+
+    impl MockConnection {
+        fn new(msgs: Vec<Vec<u8>>) -> Arc<Self> {
+            Arc::new(Self { pid: PeerId([1u8; 32]), messages: tokio::sync::Mutex::new(msgs) })
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Connection for MockConnection {
+        fn peer_id(&self) -> PeerId { self.pid }
+        fn path(&self) -> PathType { PathType::Direct }
+        async fn send(&self, _data: &[u8]) -> Result<(), CoreError> { Ok(()) }
+        fn close(&self) {}
+
+        async fn recv(&self) -> Result<Vec<u8>, CoreError> {
+            let mut msgs = self.messages.lock().await;
+            if msgs.is_empty() {
+                return Err(CoreError::InvalidEndpoint("no more messages".into()));
+            }
+            Ok(msgs.remove(0))
+        }
+    }
+
+    #[tokio::test]
+    async fn peek_returns_buffered_first() {
+        let data = vec![b"first".to_vec(), b"second".to_vec()];
+        let inner = Box::new(MockConnection { pid: PeerId([1u8; 32]), messages: tokio::sync::Mutex::new(data) }) as Box<dyn Connection>;
+        let peek = PeekConnection::new(inner, b"buffered".to_vec());
+
+        // First recv returns the buffered message
+        assert_eq!(peek.recv().await.unwrap(), b"buffered");
+        // Second recv delegates to inner
+        assert_eq!(peek.recv().await.unwrap(), b"first");
+        // Third recv delegates to inner
+        assert_eq!(peek.recv().await.unwrap(), b"second");
+        // Fourth recv fails (no more messages)
+        assert!(peek.recv().await.is_err());
+    }
+
+    #[tokio::test]
+    async fn peek_delegates_send_close_and_metadata() {
+        let inner = Box::new(MockConnection { pid: PeerId([2u8; 32]), messages: tokio::sync::Mutex::new(vec![]) }) as Box<dyn Connection>;
+        let peek = PeekConnection::new(inner, b"x".to_vec());
+
+        assert_eq!(peek.peer_id(), PeerId([2u8; 32]));
+        assert_eq!(peek.path(), PathType::Direct);
+        assert!(peek.send(b"test").await.is_ok());
+        peek.close();
+    }
+
+    #[tokio::test]
+    async fn peek_into_inner_recovers_arc() {
+        let inner = Box::new(MockConnection { pid: PeerId([3u8; 32]), messages: tokio::sync::Mutex::new(vec![b"data".to_vec()]) }) as Box<dyn Connection>;
+        let peek = PeekConnection::new(inner, b"x".to_vec());
+        let recovered = peek.into_inner();
+        assert_eq!(recovered.recv().await.unwrap(), b"data");
+    }
+}
