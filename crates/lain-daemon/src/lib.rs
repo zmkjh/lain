@@ -8,7 +8,7 @@ pub mod ipc;
 use lain_core::capabilities::Capabilities;
 use lain_core::crypto::CryptoProvider;
 use lain_core::endpoint::{Endpoint, EndpointKind};
-use lain_core::frame::{self, FrameType};
+use lain_core::frame::FrameType;
 use lain_core::identity::IdentityProvider;
 use lain_core::nat::NatProber;
 use lain_core::peer::PeerId;
@@ -143,7 +143,9 @@ impl Daemon {
             let _ = dht.load_routes(&rp).await;
         }
         if !self.config.dht.bootstrap_nodes.is_empty() {
-            let _ = dht.bootstrap(&self.config.dht.bootstrap_nodes).await;
+            if let Err(e) = dht.bootstrap(&self.config.dht.bootstrap_nodes).await {
+                tracing::warn!("DHT bootstrap failed: {e}");
+            }
         }
         let dht = Arc::new(dht);
 
@@ -213,7 +215,8 @@ impl Daemon {
                     IpcCommand::TsoPeer { invite } => {
                         let t = transport.clone(); let e = ipc_ev.clone();
                         let c = connected.clone();
-                        tokio::spawn(async move { tso_cmd(invite, t, e, c).await; });
+                        let rtt = nat.stun_rtt_ms;
+                        tokio::spawn(async move { tso_cmd(invite, t, e, c, rtt).await; });
                     }
                     IpcCommand::FindPeer { peer_id } => {
                         let d = dht.clone(); let t = transport.clone();
@@ -233,7 +236,7 @@ impl Daemon {
                     IpcCommand::SendToPeer { peer_id, data, reply } => {
                         let cons = connected.read().await;
                         match cons.get(&peer_id) {
-                            Some((conn, _)) => match conn.send(&data).await {
+                            Some((conn, _)) => match conn.send(FrameType::Data, &data).await {
                                 Ok(()) => { let _ = reply.send(IpcResponse::Ok {
                                     message: Some("sent".into()), data: None,
                                 }); }
@@ -264,10 +267,11 @@ impl Daemon {
                     }
                     IpcCommand::GetWhoami { reply } => { let _ = reply.send(peer_id.to_string()); }
                     IpcCommand::GetInviteCode { reply } => {
-                        let inv = lain_discovery::InviteCode::new(
+                        let mut inv = lain_discovery::InviteCode::new(
                             peer_id, public_key, noise_pubkey, caps, eps.clone(),
                             &|data| self.identity.sign(data),
                         );
+                        inv.port_delta_hint = nat.port_delta.unwrap_or(0) as u8;
                         let _ = reply.send(format!("lain://{}", inv.to_base62()));
                     }
                 } }
@@ -314,38 +318,17 @@ impl Daemon {
                             let conn = PeekConnection::new(conn, first);
                             let conn = Arc::new(conn) as Arc<dyn Connection>;
                             let (cancel_tx, cancel_rx) = watch::channel(false);
-                            c.write().await.insert(pid, (conn.clone(), ConnectionGuard(cancel_tx)));
+                            if let Some((old, guard)) = c.write().await.insert(pid, (conn.clone(), ConnectionGuard(cancel_tx))) {
+                                guard.disconnect();
+                                old.close();
+                            }
                             k.write().await.insert(pid, Vec::new());
                             let _ = e.send(IpcResponse::Event {
                                 event: "peer_connected".into(),
                                 peer_id: Some(pid.to_string()), data: None,
                             });
-                            let mut cancel = cancel_rx;
-                            tokio::spawn(async move {
-                                let pid = conn.peer_id();
-                                loop {
-                                    tokio::select! {
-                                        data = conn.recv() => match data {
-                                            Ok((_ft, payload)) => {
-                                                use base64::Engine;
-                                                let b64 = base64::engine::general_purpose::STANDARD.encode(&payload);
-                                                let _ = e.send(IpcResponse::Event {
-                                                    event: "data".into(),
-                                                    peer_id: Some(pid.to_string()),
-                                                    data: Some(serde_json::json!({"bytes": b64})),
-                                                });
-                                            }
-                                            Err(_) => break,
-                                        },
-                                        _ = cancel.changed() => break,
-                                    }
-                                }
-                                let _ = e.send(IpcResponse::Event {
-                                    event: "peer_disconnected".into(),
-                                    peer_id: Some(pid.to_string()),
-                                    data: None,
-                                });
-                            });
+                            let cancel = cancel_rx;
+                            spawn_reader(conn, e, Some(cancel));
                         });
                     }
                 }
@@ -388,9 +371,9 @@ async fn handle_relay(
     dht: Arc<DhtHandle>,
     transport: Arc<dyn Transport>,
 ) {
-    if frame_payload.len() < 64 { return; }
+    if frame_payload.len() < 32 { return; }
     let mut target_bytes = [0u8; 32];
-    target_bytes.copy_from_slice(&frame_payload[32..64]);
+    target_bytes.copy_from_slice(&frame_payload[..32]);
     let target = PeerId(target_bytes);
     tracing::info!("relay request for {target}");
 
@@ -411,7 +394,7 @@ async fn handle_relay(
     tokio::spawn(async move {
         loop {
             match rt.recv().await {
-                Ok((_, d)) => { if tt.send(&d).await.is_err() { break; } }
+                Ok((_, d)) => { if tt.send(FrameType::Data, &d).await.is_err() { break; } }
                 Err(_) => break,
             }
         }
@@ -419,7 +402,7 @@ async fn handle_relay(
     tokio::spawn(async move {
         loop {
             match t2.recv().await {
-                Ok((_, d)) => { if r2.send(&d).await.is_err() { break; } }
+                Ok((_, d)) => { if r2.send(FrameType::Data, &d).await.is_err() { break; } }
                 Err(_) => break,
             }
         }
@@ -452,12 +435,12 @@ async fn connect_and_track(
     let conn = <Arc<dyn Connection>>::from(conn);
     let ev = ipc.clone();
     if reconnect {
-        let guard = spawn_reconnect(conn.clone(), ipc, transport, noise_pk, endpoints);
+        let guard = spawn_reconnect(conn.clone(), ipc, transport, noise_pk, endpoints, connected.clone());
         connected.write().await.insert(pid, (conn, guard));
     } else {
         let guard = ConnectionGuard(watch::channel(false).0);
         connected.write().await.insert(pid, (conn.clone(), guard));
-        spawn_reader(conn, ev.clone());
+        spawn_reader(conn, ev.clone(), None);
     }
     let _ = ev.send(IpcResponse::Event {
         event: "peer_connected".into(), peer_id: Some(pid.to_string()),
@@ -490,11 +473,7 @@ async fn connect_cmd(
             if relay.node_id == pid { continue; }
             let ep = [Endpoint::new(relay.address, EndpointKind::STUN)];
             if let Ok(relay_conn) = transport.connect(relay.node_id, &relay.noise_pubkey, &ep).await {
-                let mut payload = Vec::with_capacity(64);
-                payload.extend_from_slice(&code.peer_id.0);
-                payload.extend_from_slice(&pid.0);
-                let frame = frame::encode_frame(1, FrameType::RelayConnect, &payload);
-                if relay_conn.send(&frame).await.is_ok() {
+                if relay_conn.send(FrameType::RelayConnect, &pid.0).await.is_ok() {
                     let conn = <Arc<dyn Connection>>::from(relay_conn);
                     let guard = ConnectionGuard(watch::channel(false).0);
                     connected.write().await.insert(pid, (conn.clone(), guard));
@@ -502,7 +481,7 @@ async fn connect_cmd(
                         event: "peer_connected".into(), peer_id: Some(pid.to_string()),
                         data: Some(serde_json::json!({"via": "relay"})),
                     });
-                    spawn_reader(conn, ipc);
+                    spawn_reader(conn, ipc, None);
                     return;
                 }
             }
@@ -519,12 +498,14 @@ async fn tso_cmd(
     invite: String, transport: Arc<dyn Transport>,
     ipc: broadcast::Sender<IpcResponse>,
     connected: Connections,
+    stun_rtt_ms: Option<u64>,
 ) {
     let code = match parse_invite(&invite) { Some(c) => c, None => { return; } };
     let tso: Vec<SocketAddr> = code.endpoints.iter()
         .filter(|e| e.kind == EndpointKind::TSO).map(|e| e.addr).collect();
     if tso.is_empty() { tracing::warn!("no TSO endpoints"); return; }
-    match transport.connect_tso(code.peer_id, &tso, None, None).await {
+    let port_delta = if code.port_delta_hint > 0 { Some(code.port_delta_hint as u16) } else { None };
+    match transport.connect_tso(code.peer_id, &tso, port_delta, stun_rtt_ms).await {
         Ok(conn) => {
             let conn = <Arc<dyn Connection>>::from(conn);
             let guard = ConnectionGuard(watch::channel(false).0);
@@ -533,7 +514,7 @@ async fn tso_cmd(
                 event: "peer_connected".into(), peer_id: Some(code.peer_id.to_string()),
                 data: Some(serde_json::json!({"via": "TSO"})),
             });
-            spawn_reader(conn, ipc);
+            spawn_reader(conn, ipc, None);
         }
         Err(e) => { let _ = ipc.send(IpcResponse::Event {
             event: "peer_error".into(), peer_id: Some(code.peer_id.to_string()),
@@ -566,11 +547,22 @@ async fn find_cmd(
 fn spawn_reader(
     conn: Arc<dyn Connection>,
     ipc: broadcast::Sender<IpcResponse>,
+    cancel_rx: Option<watch::Receiver<bool>>,
 ) {
     tokio::spawn(async move {
         let pid = conn.peer_id();
+        let mut cancel = cancel_rx;
         loop {
-            match conn.recv().await {
+            let result = match cancel.as_mut() {
+                Some(rx) => {
+                    tokio::select! {
+                        r = conn.recv() => r,
+                        _ = rx.changed() => break,
+                    }
+                }
+                None => conn.recv().await,
+            };
+            match result {
                 Ok((ft, data)) => {
                     if ft != FrameType::Data { continue; }
                     use base64::Engine;
@@ -600,6 +592,7 @@ fn spawn_reconnect(
     transport: Arc<dyn Transport>,
     noise_pubkey: &[u8; 32],
     endpoints: &[Endpoint],
+    connected: Connections,
 ) -> ConnectionGuard {
     let (cancel_tx, mut cancel_rx) = watch::channel(false);
     let npk = *noise_pubkey;
@@ -642,6 +635,9 @@ fn spawn_reconnect(
                 match transport.connect(pid, &npk, &eps).await {
                     Ok(new) => {
                         current = Arc::from(new);
+                        if let Some((existing, _)) = connected.write().await.get_mut(&pid) {
+                            *existing = current.clone();
+                        }
                         let _ = ipc.send(IpcResponse::Event {
                             event: "peer_connected".into(),
                             peer_id: Some(pid.to_string()),
@@ -753,11 +749,10 @@ fn dirs_home() -> Option<PathBuf> {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
-    use lain_core::dht::{DhtBackend, RelayInfo};
     use lain_core::error::CoreError;
     use lain_core::transport::PathType;
     use tokio::sync::broadcast;
-    use std::time::Duration;
+    use lain_core::frame;
 
     // ── Mocks ──
 
@@ -771,7 +766,7 @@ mod tests {
     impl Connection for MockConnection {
         fn peer_id(&self) -> PeerId { self.pid }
         fn path(&self) -> PathType { PathType::Direct }
-        async fn send(&self, _data: &[u8]) -> Result<(), CoreError> { Ok(()) }
+        async fn send(&self, _ft: FrameType, _data: &[u8]) -> Result<(), CoreError> { Ok(()) }
         fn close(&self) {}
         async fn recv(&self) -> Result<(FrameType, Vec<u8>), CoreError> {
             if self.fail_recv { Err(CoreError::InvalidEndpoint("mock fail".into())) }
@@ -808,16 +803,6 @@ mod tests {
         }
     }
 
-    struct MockDht;
-    #[async_trait::async_trait]
-    impl DhtBackend for MockDht {
-        async fn bootstrap(&self, _seeds: &[SocketAddr]) -> Result<(), CoreError> { Ok(()) }
-        async fn store_self(&self, _pk: &[u8; 32], _npk: &[u8; 32], _eps: &[Endpoint], _caps: Capabilities) -> Result<(), CoreError> { Ok(()) }
-        async fn find_peer(&self, _pid: &PeerId) -> Result<Option<lain_core::dht::PeerRecord>, CoreError> { Ok(None) }
-        async fn find_relays(&self) -> Result<Vec<RelayInfo>, CoreError> { Ok(vec![]) }
-        async fn routing_table_size(&self) -> usize { 0 }
-    }
-
     fn make_connected() -> Connections {
         Arc::new(RwLock::new(HashMap::new()))
     }
@@ -837,7 +822,7 @@ mod tests {
     async fn reconnect_stops_on_disconnect() {
         let conn = Arc::new(MockConnection { pid: PeerId([1u8; 32]), fail_recv: true }) as Arc<dyn Connection>;
         let (ipc, _) = broadcast::channel(16);
-        let guard = spawn_reconnect(conn, ipc, MockTransport::new_fail(), &[0u8; 32], &[]);
+        let guard = spawn_reconnect(conn, ipc, MockTransport::new_fail(), &[0u8; 32], &[], make_connected());
         guard.disconnect();
         // guard is dropped at end of scope — task exits via watch channel close
     }

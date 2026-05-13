@@ -36,10 +36,12 @@ pub fn encode_find_node_request_signed(
 /// Build a signed STORE request message
 pub fn encode_store_request_signed(
     sender_id: PeerId,
+    message_id: [u8; 16],
     key: &[u8; 32],
     ttl: u32,
     pubkey: &[u8; 32],
     noise_pubkey: &[u8; 32],
+    capabilities: Capabilities,
     endpoints: &[Endpoint],
     seed: Option<&[u8; 32]>,
 ) -> Vec<u8> {
@@ -48,6 +50,7 @@ pub fn encode_store_request_signed(
     payload.extend_from_slice(&ttl.to_be_bytes());
     payload.extend_from_slice(pubkey);
     payload.extend_from_slice(noise_pubkey);
+    payload.push(capabilities.bits);
     let mut endpoints_data = Vec::new();
     for ep in endpoints {
         encode_endpoint(&mut endpoints_data, ep);
@@ -55,7 +58,7 @@ pub fn encode_store_request_signed(
     let val_len = endpoints_data.len() as u16;
     payload.extend_from_slice(&val_len.to_be_bytes());
     payload.extend_from_slice(&endpoints_data);
-    encode_message(sender_id, rand_msg_id(), DhtMsgType::Store, false, &payload, seed)
+    encode_message(sender_id, message_id, DhtMsgType::Store, false, &payload, seed)
 }
 
 /// Build a signed FIND_VALUE request message
@@ -79,6 +82,7 @@ pub fn encode_ping_response(
     sender_id: PeerId,
     message_id: [u8; 16],
     nodes: &[BucketEntry],
+    seed: Option<&[u8; 32]>,
 ) -> Vec<u8> {
     let mut payload = Vec::new();
     let node_count = nodes.len().min(255) as u8;
@@ -87,7 +91,7 @@ pub fn encode_ping_response(
         payload.extend_from_slice(&entry.node_id.0);
         encode_address(&mut payload, &entry.address);
     }
-    encode_message(sender_id, message_id, DhtMsgType::Ping, true, &payload, None)
+    encode_message(sender_id, message_id, DhtMsgType::Ping, true, &payload, seed)
 }
 
 /// Build a STORE request
@@ -97,6 +101,7 @@ pub fn encode_store_request(
     ttl: u32,
     pubkey: &[u8; 32],
     noise_pubkey: &[u8; 32],
+    capabilities: Capabilities,
     endpoints: &[Endpoint],
 ) -> Vec<u8> {
     let mut payload = Vec::new();
@@ -104,6 +109,7 @@ pub fn encode_store_request(
     payload.extend_from_slice(&ttl.to_be_bytes());
     payload.extend_from_slice(pubkey);
     payload.extend_from_slice(noise_pubkey);
+    payload.push(capabilities.bits);
 
     let mut endpoints_data = Vec::new();
     for ep in endpoints {
@@ -139,6 +145,7 @@ pub fn encode_find_node_response(
     sender_id: PeerId,
     message_id: [u8; 16],
     nodes: &[BucketEntry],
+    seed: Option<&[u8; 32]>,
 ) -> Vec<u8> {
     let mut payload = Vec::new();
     let node_count = nodes.len().min(255) as u8;
@@ -147,7 +154,7 @@ pub fn encode_find_node_response(
         payload.extend_from_slice(&entry.node_id.0);
         encode_address(&mut payload, &entry.address);
     }
-    encode_message(sender_id, message_id, DhtMsgType::FindNode, true, &payload, None)
+    encode_message(sender_id, message_id, DhtMsgType::FindNode, true, &payload, seed)
 }
 
 /// Encode a DHT message to wire format
@@ -265,10 +272,10 @@ fn rand_msg_id() -> [u8; 16] {
 // ── Additional encode/decode helpers ──
 
 /// STORE ACK response
-pub fn encode_store_ack(sender_id: PeerId, message_id: [u8; 16]) -> Vec<u8> {
+pub fn encode_store_ack(sender_id: PeerId, message_id: [u8; 16], seed: Option<&[u8; 32]>) -> Vec<u8> {
     let mut payload = Vec::new();
     payload.push(0u8); // status = ok
-    encode_message(sender_id, message_id, DhtMsgType::Store, true, &payload, None)
+    encode_message(sender_id, message_id, DhtMsgType::Store, true, &payload, seed)
 }
 
 /// FIND_VALUE response with record found
@@ -276,12 +283,14 @@ pub fn encode_find_value_response_with_record(
     sender_id: PeerId,
     message_id: [u8; 16],
     record: &PeerRecord,
+    seed: Option<&[u8; 32]>,
 ) -> Vec<u8> {
     let mut payload = Vec::new();
     payload.push(1u8); // has_value = true
     payload.extend_from_slice(&record.ttl_remaining.to_be_bytes());
     payload.extend_from_slice(&record.pubkey);
     payload.extend_from_slice(&record.noise_pubkey);
+    payload.push(record.capabilities.bits);
     let mut ep_data = Vec::new();
     for ep in &record.endpoints {
         encode_endpoint(&mut ep_data, ep);
@@ -289,7 +298,7 @@ pub fn encode_find_value_response_with_record(
     let ep_len = ep_data.len() as u16;
     payload.extend_from_slice(&ep_len.to_be_bytes());
     payload.extend_from_slice(&ep_data);
-    encode_message(sender_id, message_id, DhtMsgType::FindValue, true, &payload, None)
+    encode_message(sender_id, message_id, DhtMsgType::FindValue, true, &payload, seed)
 }
 
 /// FIND_VALUE response not found (return k-closest)
@@ -297,6 +306,7 @@ pub fn encode_find_value_response_not_found(
     sender_id: PeerId,
     message_id: [u8; 16],
     nodes: &[BucketEntry],
+    seed: Option<&[u8; 32]>,
 ) -> Vec<u8> {
     let mut payload = Vec::new();
     payload.push(0u8); // has_value = false
@@ -306,7 +316,7 @@ pub fn encode_find_value_response_not_found(
         payload.extend_from_slice(&entry.node_id.0);
         encode_address(&mut payload, &entry.address);
     }
-    encode_message(sender_id, message_id, DhtMsgType::FindValue, true, &payload, None)
+    encode_message(sender_id, message_id, DhtMsgType::FindValue, true, &payload, seed)
 }
 
 /// ADDR_REFLECT response
@@ -314,10 +324,11 @@ pub fn encode_addr_reflect_response(
     sender_id: PeerId,
     message_id: [u8; 16],
     observed_addr: &SocketAddr,
+    seed: Option<&[u8; 32]>,
 ) -> Vec<u8> {
     let mut payload = Vec::new();
     encode_address(&mut payload, observed_addr);
-    encode_message(sender_id, message_id, DhtMsgType::AddrReflect, true, &payload, None)
+    encode_message(sender_id, message_id, DhtMsgType::AddrReflect, true, &payload, seed)
 }
 
 /// RELAY_NEEDED response
@@ -325,6 +336,7 @@ pub fn encode_relay_needed_response(
     sender_id: PeerId,
     message_id: [u8; 16],
     relays: &[BucketEntry],
+    seed: Option<&[u8; 32]>,
 ) -> Vec<u8> {
     let mut payload = Vec::new();
     let count = relays.len().min(255) as u8;
@@ -333,7 +345,7 @@ pub fn encode_relay_needed_response(
         payload.extend_from_slice(&entry.node_id.0);
         encode_address(&mut payload, &entry.address);
     }
-    encode_message(sender_id, message_id, DhtMsgType::RelayNeeded, true, &payload, None)
+    encode_message(sender_id, message_id, DhtMsgType::RelayNeeded, true, &payload, seed)
 }
 
 /// ADDR_REFLECT request
@@ -372,22 +384,23 @@ pub fn parse_nodes_from_payload(payload: &[u8]) -> Option<Vec<(PeerId, SocketAdd
 
 /// Parse a PeerRecord from FIND_VALUE response payload (after has_value byte)
 pub fn parse_record_from_payload(payload: &[u8]) -> Option<PeerRecord> {
-    if payload.len() < 70 {
-        return None; // min: ttl(4) + pubkey(32) + noise_pubkey(32) + ep_len(2)
+    if payload.len() < 71 {
+        return None; // min: ttl(4) + pubkey(32) + noise_pubkey(32) + capabilities(1) + ep_len(2)
     }
     let ttl_remaining = u32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]);
     let mut pubkey = [0u8; 32];
     pubkey.copy_from_slice(&payload[4..36]);
     let mut noise_pubkey = [0u8; 32];
     noise_pubkey.copy_from_slice(&payload[36..68]);
-    let ep_len = u16::from_be_bytes([payload[68], payload[69]]) as usize;
-    let endpoints = parse_endpoints(&payload[70..], ep_len);
+    let capabilities = Capabilities { bits: payload[68] };
+    let ep_len = u16::from_be_bytes([payload[69], payload[70]]) as usize;
+    let endpoints = parse_endpoints(&payload[71..], ep_len);
 
     Some(PeerRecord {
         pubkey,
         noise_pubkey,
         endpoints,
-        capabilities: Capabilities::new(),
+        capabilities,
         ttl_remaining,
         expires_at: std::time::Instant::now() + std::time::Duration::from_secs(ttl_remaining as u64),
     })
@@ -540,7 +553,7 @@ mod tests {
             Endpoint::new("10.0.0.1:443".parse().unwrap(), EndpointKind::STUN),
         ];
 
-        let raw = encode_store_request(sender, &key, ttl, &pubkey, &noise_pubkey, &endpoints);
+        let raw = encode_store_request(sender, &key, ttl, &pubkey, &noise_pubkey, Capabilities::new(), &endpoints);
         let msg = decode_message(&raw).expect("should decode STORE");
 
         assert_eq!(msg.msg_type, DhtMsgType::Store);
@@ -591,7 +604,7 @@ mod tests {
         };
 
         let payload = encode_find_value_response_with_record(
-            PeerId([0u8; 32]), [0u8; 16], &record,
+            PeerId([0u8; 32]), [0u8; 16], &record, None,
         );
 
         let msg = decode_message(&payload).expect("should decode");

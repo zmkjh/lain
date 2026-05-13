@@ -37,13 +37,13 @@ impl NatProbe {
     fn stun_once(&self, socket: &UdpSocket, server: SocketAddr) -> Option<ProbeAttempt> {
         for _ in 0..2 {
             let start = Instant::now();
-            let req = build_binding_request();
+            let (req, tid) = build_binding_request();
             if socket.send_to(&req, server).is_err() { continue; }
 
             let mut buf = [0u8; 1024];
             match socket.recv_from(&mut buf) {
                 Ok((len, _)) => {
-                    if let Some(addr) = parse_mapped(&buf[..len]) {
+                    if let Some(addr) = parse_mapped(&buf[..len], &tid) {
                         return Some(ProbeAttempt { mapped: addr, rtt: start.elapsed() });
                     }
                 }
@@ -145,18 +145,22 @@ impl NatProber for NatProbe {
 
 // ── STUN wire format ──
 
-fn build_binding_request() -> Vec<u8> {
+fn build_binding_request() -> (Vec<u8>, [u8; 12]) {
     let mut p = vec![0u8; 20];
     p[0] = 0x00; p[1] = 0x01; // Binding Request
     p[2] = 0x00; p[3] = 0x00; // message length
     p[4..8].copy_from_slice(&[0x21, 0x12, 0xA4, 0x42]); // magic cookie
-    for i in 8..20 { p[i] = rand::random::<u8>(); } // transaction ID
-    p
+    let mut tid = [0u8; 12];
+    for b in &mut tid { *b = rand::random::<u8>(); }
+    p[8..20].copy_from_slice(&tid); // transaction ID
+    (p, tid)
 }
 
-fn parse_mapped(data: &[u8]) -> Option<SocketAddr> {
+fn parse_mapped(data: &[u8], expected_tid: &[u8; 12]) -> Option<SocketAddr> {
     if data.len() < 20 { return None; }
-    if data[0] != 0x01 || data[1] != 0x01 { return None; } // not a response
+    if data[0] != 0x01 || data[1] != 0x01 { return None; }
+    if &data[4..8] != &[0x21, 0x12, 0xA4, 0x42] { return None; }
+    if &data[8..20] != expected_tid { return None; }
 
     let cookie = [0x21, 0x12, 0xA4, 0x42];
     let msg_len = u16::from_be_bytes([data[2], data[3]]) as usize;
@@ -170,14 +174,12 @@ fn parse_mapped(data: &[u8]) -> Option<SocketAddr> {
         let val_end = (off + len).min(data.len());
 
         if ty == 0x0001 || ty == 0x0020 {
-            // MAPPED-ADDRESS (0x0001) or XOR-MAPPED-ADDRESS (0x0020)
             if val_end < off + 4 { return None; }
             let family = data[off + 1];
             let port_raw = u16::from_be_bytes([data[off + 2], data[off + 3]]);
             let port = if ty == 0x0020 { port_raw ^ u16::from_be_bytes([cookie[0], cookie[1]]) } else { port_raw };
 
             if family == 0x01 {
-                // IPv4
                 if val_end < off + 8 { return None; }
                 let ip = if ty == 0x0020 {
                     std::net::Ipv4Addr::new(
@@ -189,7 +191,6 @@ fn parse_mapped(data: &[u8]) -> Option<SocketAddr> {
                 };
                 return Some(SocketAddr::new(std::net::IpAddr::V4(ip), port));
             }
-            // IPv6 not handled for simplicity — STUN servers typically communicate over v4
         }
 
         off = val_end;
@@ -221,6 +222,7 @@ mod tests {
                         resp[0] = 0x01; resp[1] = 0x01;
                         resp[2] = 0x00; resp[3] = 12;
                         resp[4..8].copy_from_slice(&cookie);
+                        resp[8..20].copy_from_slice(&buf[8..20]); // echo transaction ID
                         resp[20] = 0x00; resp[21] = 0x20;
                         resp[22] = 0x00; resp[23] = 0x08;
                         resp[24] = 0x00; resp[25] = 0x01;
@@ -267,12 +269,15 @@ mod tests {
         let mut msg = vec![0u8; 32];
         msg[0] = 0x01; msg[1] = 0x01;
         msg[2] = 0x00; msg[3] = 12;
+        msg[4..8].copy_from_slice(&[0x21, 0x12, 0xA4, 0x42]); // magic cookie
+        let tid = [1u8, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12];
+        msg[8..20].copy_from_slice(&tid);
         msg[20] = 0x00; msg[21] = 0x01;
         msg[22] = 0x00; msg[23] = 0x08;
         msg[24] = 0; msg[25] = 1;
         msg[26..28].copy_from_slice(&8080u16.to_be_bytes());
         msg[28..32].copy_from_slice(&[192, 168, 1, 100]);
-        let r = parse_mapped(&msg).unwrap();
+        let r = parse_mapped(&msg, &tid).unwrap();
         assert_eq!(r.port(), 8080);
     }
 }

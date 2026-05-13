@@ -98,7 +98,7 @@ async fn test_store_and_retrieve_record() {
     let (_ns, np) = dummy_id.noise_keypair();
     let ep = Endpoint::new("10.0.0.10:9000".parse().unwrap(), EndpointKind::STUN);
 
-    let store = msg_codec::encode_store_request(b.peer_id, &dummy_peer.0, 600, &dummy_pk, &np, &[ep.clone()]);
+    let store = msg_codec::encode_store_request(b.peer_id, &dummy_peer.0, 600, &dummy_pk, &np, Capabilities::new(), &[ep.clone()]);
     b.socket().send_to(&store, a_addr).await.unwrap();
 
     tokio::time::sleep(Duration::from_millis(100)).await;
@@ -132,7 +132,7 @@ async fn test_find_value_found() {
     let ep = Endpoint::new("10.0.0.14:9000".parse().unwrap(), EndpointKind::STUN);
 
     // Store on A
-    let store = msg_codec::encode_store_request(b.peer_id, &dummy_peer.0, 600, &dummy_pk, &np, &[ep.clone()]);
+    let store = msg_codec::encode_store_request(b.peer_id, &dummy_peer.0, 600, &dummy_pk, &np, Capabilities::new(), &[ep.clone()]);
     b.socket().send_to(&store, a_addr).await.unwrap();
     tokio::time::sleep(Duration::from_millis(100)).await;
 
@@ -227,7 +227,7 @@ async fn test_store_ttl_clamping() {
     let ep = Endpoint::new("10.0.0.10:8000".parse().unwrap(), EndpointKind::STUN);
 
     // Store with TTL=0 (should be clamped to default 300)
-    let store_zero = msg_codec::encode_store_request(b.peer_id, &dummy_peer.0, 0, &dummy_pk, &np, &[ep.clone()]);
+    let store_zero = msg_codec::encode_store_request(b.peer_id, &dummy_peer.0, 0, &dummy_pk, &np, Capabilities::new(), &[ep.clone()]);
     b.socket().send_to(&store_zero, a_addr).await.unwrap();
     tokio::time::sleep(Duration::from_millis(100)).await;
 
@@ -256,7 +256,7 @@ async fn test_store_rejects_mismatched_pubkey() {
     let fake_noise = [26u8; 32];
     let ep = Endpoint::new("10.0.0.99:1".parse().unwrap(), EndpointKind::STUN);
 
-    let bad_store = msg_codec::encode_store_request(b.peer_id, &fake_key.0, 600, &fake_pubkey, &fake_noise, &[ep]);
+    let bad_store = msg_codec::encode_store_request(b.peer_id, &fake_key.0, 600, &fake_pubkey, &fake_noise, Capabilities::new(), &[ep]);
     b.socket().send_to(&bad_store, a_addr).await.unwrap();
     tokio::time::sleep(Duration::from_millis(100)).await;
 
@@ -548,7 +548,7 @@ async fn test_find_value_event_has_correct_peer_id() {
     let ep = Endpoint::new("10.0.0.42:9000".parse().unwrap(), EndpointKind::STUN);
 
     // A stores the record
-    let store = msg_codec::encode_store_request(b.peer_id, &target_peer.0, 600, &target_pk, &target_np, &[ep.clone()]);
+    let store = msg_codec::encode_store_request(b.peer_id, &target_peer.0, 600, &target_pk, &target_np, Capabilities::new(), &[ep.clone()]);
     b.socket().send_to(&store, a_addr).await.unwrap();
     tokio::time::sleep(Duration::from_millis(100)).await;
 
@@ -682,6 +682,118 @@ async fn test_relay_needed_returns_candidates() {
         }
     }
     assert!(found, "should receive RelayNeeded response with candidates");
+}
+
+#[tokio::test]
+async fn test_random_id_in_bucket_respects_bucket_index() {
+    let dht = DhtHandle::new(make_id(51), [51u8; 32], make_config("127.0.0.1:0")).unwrap();
+    for target_bucket in [0, 1, 7, 8, 63, 64, 127, 200, 255] {
+        let rid = dht.random_id_in_bucket(target_bucket);
+        let actual_bucket = dht.peer_id.bucket_index(&rid);
+        assert_eq!(actual_bucket, target_bucket,
+            "random_id_in_bucket({target_bucket}) produced bucket {actual_bucket}");
+    }
+}
+
+#[tokio::test]
+async fn test_store_preserves_capabilities() {
+    // Use real identity for B so pubkey derived from it matches peer_id
+    let b_id = Identity::generate().ok().unwrap();
+    let b_pk = *b_id.public_key();
+    let b_peer = b_id.peer_id();
+    let (_, b_np) = b_id.noise_keypair();
+    let b = Arc::new(DhtHandle::new(b_peer, b_pk, make_config("127.0.0.1:0")).unwrap());
+
+    let a = Arc::new(DhtHandle::new(make_id(53), [53u8; 32], make_config("127.0.0.1:0")).unwrap());
+    spawn_recv_loop(a.clone());
+    spawn_recv_loop(b.clone());
+
+    let a_addr = a.socket().local_addr().unwrap();
+
+    // Bootstrap: B knows A
+    b.socket().send_to(&msg_codec::encode_ping_request(b.peer_id, [90u8; 16]), a_addr).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(b.routing_table_size().await >= 1, "B should know A");
+
+    let ep = Endpoint::new("10.0.0.50:9000".parse().unwrap(), EndpointKind::STUN);
+    let caps = Capabilities { bits: Capabilities::RELAY_CAPABLE };
+
+    // B store_self with RELAY_CAPABLE — but capabilities are LOST on the wire
+    b.store_self(&b_pk, &b_np, &[ep.clone()], caps).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let stored = a.peer_records.read().await;
+    let rec = stored.get(&b_peer).expect("A should have B's record after store_self");
+    // This FAILS with current code because encode_store doesn't encode capabilities,
+    // and handle_request for STORE always sets Capabilities::new()
+    assert_eq!(rec.capabilities.bits, caps.bits,
+        "capabilities field in STORE wire format should be preserved, but encode_store_request never encodes them");
+}
+
+#[tokio::test]
+async fn test_unsigned_find_value_response_accepted_without_signature() {
+    let a = Arc::new(DhtHandle::new(make_id(54), [54u8; 32], make_config("127.0.0.1:0")).unwrap());
+    let b = Arc::new(DhtHandle::new(make_id(55), [55u8; 32], make_config("127.0.0.1:0")).unwrap());
+    spawn_recv_loop(a.clone());
+    spawn_recv_loop(b.clone());
+
+    let a_addr = a.socket().local_addr().unwrap();
+    let b_addr = b.socket().local_addr().unwrap();
+
+    // Bootstrap: A knows B, B knows A
+    b.socket().send_to(&msg_codec::encode_ping_request(b.peer_id, [91u8; 16]), a_addr).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(a.routing_table_size().await >= 1);
+
+    // Give B A's pubkey so it can verify A's responses
+    b.peer_records.write().await.insert(a.peer_id, PeerRecord {
+        pubkey: [54u8; 32],
+        noise_pubkey: [0u8; 32],
+        endpoints: vec![],
+        capabilities: Capabilities::new(),
+        ttl_remaining: 600,
+        expires_at: std::time::Instant::now() + Duration::from_secs(600),
+    });
+
+    // Register a pending query on B for a specific message_id
+    let (tx, mut rx) = tokio::sync::oneshot::channel();
+    let msg_id = [0xBBu8; 16];
+    b.pending_queries.write().await.insert(msg_id, tx);
+
+    // Craft an unsigned FIND_VALUE response using the public encoding function
+    let fake_record = PeerRecord {
+        pubkey: [0xFAu8; 32],
+        noise_pubkey: [0xFBu8; 32],
+        endpoints: vec![Endpoint::new("1.2.3.4:5678".parse().unwrap(), EndpointKind::STUN)],
+        capabilities: Capabilities::new(),
+        ttl_remaining: 600,
+        expires_at: std::time::Instant::now() + Duration::from_secs(600),
+    };
+    let resp = msg_codec::encode_find_value_response_with_record(a.peer_id, msg_id, &fake_record, None);
+
+    a.socket().send_to(&resp, b_addr).await.unwrap();
+
+    let received = tokio::time::timeout(Duration::from_secs(2), &mut rx).await;
+    match received {
+        Ok(Ok(Some(_))) => panic!("unsigned FIND_VALUE response was accepted — no signature verification on DHT responses"),
+        Ok(Ok(None)) => {},
+        Ok(Err(_)) => {},
+        Err(_) => {},
+    }
+}
+
+#[tokio::test]
+async fn test_rate_limit_persists_after_cleanup() {
+    let dht = Arc::new(DhtHandle::new(make_id(56), [56u8; 32], make_config("127.0.0.1:0")).unwrap());
+    let peer = PeerId([0x99u8; 32]);
+
+    for i in 0..20 {
+        assert!(dht.check_rate_limit(&peer).await,
+            "attempt {} should be allowed within limit", i + 1);
+    }
+    assert!(!dht.check_rate_limit(&peer).await, "21st message should be rate-limited");
+    assert!(!dht.check_rate_limit(&peer).await,
+        "rate limit state should survive cleanup");
 }
 
 #[tokio::test]

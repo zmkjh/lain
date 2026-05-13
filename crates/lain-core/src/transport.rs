@@ -14,9 +14,7 @@ pub enum PathType {
 #[async_trait::async_trait]
 pub trait Connection: Send + Sync {
     fn peer_id(&self) -> PeerId;
-    async fn send(&self, data: &[u8]) -> Result<(), CoreError>;
-    /// 返回 (FrameType, payload)。Data 帧的 payload 是应用数据，
-    /// RelayConnect 等控制帧由调用方自行处理。
+    async fn send(&self, ft: FrameType, data: &[u8]) -> Result<(), CoreError>;
     async fn recv(&self) -> Result<(FrameType, Vec<u8>), CoreError>;
     fn close(&self);
     fn path(&self) -> PathType;

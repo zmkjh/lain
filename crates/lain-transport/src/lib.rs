@@ -42,8 +42,8 @@ impl Connection for QuicConnection {
     fn peer_id(&self) -> PeerId { self.peer_id }
     fn path(&self) -> PathType { PathType::Direct }
 
-    async fn send(&self, data: &[u8]) -> Result<(), CoreError> {
-        let msg = frame::encode_frame(2, FrameType::Data, data);
+    async fn send(&self, ft: FrameType, data: &[u8]) -> Result<(), CoreError> {
+        let msg = frame::encode_frame(2, ft, data);
         let (mut s, _) = self.quic.open_bi().await
             .map_err(|e| CoreError::InvalidEndpoint(e.to_string()))?;
         s.write_all(&msg).await
@@ -124,7 +124,7 @@ impl Connection for TcpConnection {
     fn peer_id(&self) -> PeerId { self.peer_id }
     fn path(&self) -> PathType { PathType::TSO }
 
-    async fn send(&self, data: &[u8]) -> Result<(), CoreError> {
+    async fn send(&self, _ft: FrameType, data: &[u8]) -> Result<(), CoreError> {
         let mut noise = self.inner.noise.lock().await;
         let mut stream = self.inner.stream.lock().await;
         let ct = noise.encrypt(data)?;
@@ -152,7 +152,13 @@ impl Connection for TcpConnection {
         }
     }
 
-    fn close(&self) {}
+    fn close(&self) {
+        let inner = self.inner.clone();
+        tokio::spawn(async move {
+            let mut s = inner.stream.lock().await;
+            let _ = s.shutdown().await;
+        });
+    }
 }
 
 // ── Transport ──
@@ -262,7 +268,7 @@ impl Transport {
 
     pub async fn connect(
         &self,
-        _peer_id: PeerId,
+        peer_id: PeerId,
         noise_pubkey: &[u8; 32],
         endpoints: &[Endpoint],
     ) -> Result<Box<dyn Connection>, TransportError> {
@@ -283,7 +289,11 @@ impl Transport {
         let deadline = tokio::time::sleep(std::time::Duration::from_secs(lain_core::TRAVERSAL_TIMEOUT_SECS));
         tokio::pin!(deadline);
         while let Some(r) = tokio::select! { r = rx.recv() => r, _ = &mut deadline => None } {
-            if let Ok(c) = r { return Ok(c); }
+            if let Ok(c) = r {
+                if c.peer_id() == peer_id {
+                    return Ok(c);
+                }
+            }
         }
         Err(TransportError::NoPath)
     }
@@ -509,7 +519,7 @@ impl Connection for PeekConnection {
     fn path(&self) -> PathType { self.inner.path() }
     fn rtt_ms(&self) -> Option<u64> { self.inner.rtt_ms() }
 
-    async fn send(&self, data: &[u8]) -> Result<(), CoreError> { self.inner.send(data).await }
+    async fn send(&self, ft: FrameType, data: &[u8]) -> Result<(), CoreError> { self.inner.send(ft, data).await }
     fn close(&self) { self.inner.close() }
 
     async fn recv(&self) -> Result<(FrameType, Vec<u8>), CoreError> {
@@ -560,7 +570,7 @@ mod tests {
     impl Connection for MockConnection {
         fn peer_id(&self) -> PeerId { self.pid }
         fn path(&self) -> PathType { PathType::Direct }
-        async fn send(&self, _data: &[u8]) -> Result<(), CoreError> { Ok(()) }
+        async fn send(&self, _ft: FrameType, _data: &[u8]) -> Result<(), CoreError> { Ok(()) }
         fn close(&self) {}
 
         async fn recv(&self) -> Result<(FrameType, Vec<u8>), CoreError> {
@@ -595,7 +605,7 @@ mod tests {
 
         assert_eq!(peek.peer_id(), PeerId([2u8; 32]));
         assert_eq!(peek.path(), PathType::Direct);
-        assert!(peek.send(b"test").await.is_ok());
+        assert!(peek.send(FrameType::Data, b"test").await.is_ok());
         peek.close();
     }
 

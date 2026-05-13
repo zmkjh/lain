@@ -194,18 +194,18 @@ impl DhtHandle {
     pub(crate) fn random_id_in_bucket(&self, bucket_idx: usize) -> PeerId {
         let mut id = self.peer_id.0;
         if bucket_idx < 256 {
-            // Randomize all bits less significant than bucket_idx
-            for b in 0..bucket_idx {
-                let byte_idx = 31 - b / 8;
-                let bit_idx = b % 8;
+            // Flip the defining bit for this bucket (first non-zero XOR bit)
+            let byte_idx = bucket_idx / 8;
+            let bit_idx = 7 - (bucket_idx % 8);
+            id[byte_idx] ^= 1u8 << bit_idx;
+            // Randomize less significant bits for query diversity
+            for b in (bucket_idx + 1)..256 {
+                let byte_idx = b / 8;
+                let bit_idx = 7 - (b % 8);
                 if rand::random::<bool>() {
                     id[byte_idx] ^= 1u8 << bit_idx;
                 }
             }
-            // Flip the defining bit for this bucket
-            let byte_idx = 31 - bucket_idx / 8;
-            let bit_idx = bucket_idx % 8;
-            id[byte_idx] ^= 1u8 << bit_idx;
         }
         PeerId(id)
     }
@@ -218,8 +218,8 @@ impl DhtHandle {
         msg_codec::encode_find_node_request_signed(self.peer_id, message_id, target_id, self.signing_key.as_ref())
     }
 
-    fn encode_store(&self, key: &[u8; 32], ttl: u32, pubkey: &[u8; 32], noise_pubkey: &[u8; 32], endpoints: &[Endpoint]) -> Vec<u8> {
-        msg_codec::encode_store_request_signed(self.peer_id, key, ttl, pubkey, noise_pubkey, endpoints, self.signing_key.as_ref())
+    fn encode_store(&self, key: &[u8; 32], message_id: [u8; 16], ttl: u32, pubkey: &[u8; 32], noise_pubkey: &[u8; 32], capabilities: Capabilities, endpoints: &[Endpoint]) -> Vec<u8> {
+        msg_codec::encode_store_request_signed(self.peer_id, message_id, key, ttl, pubkey, noise_pubkey, capabilities, endpoints, self.signing_key.as_ref())
     }
 
     fn encode_find_value(&self, message_id: [u8; 16], key: &[u8; 32]) -> Vec<u8> {
@@ -238,11 +238,14 @@ impl DhtHandle {
             let rt = self.routing_table.read().await;
             rt.closest_nodes(&self.peer_id, self.config.k)
         };
+        let msg_id: [u8; 16] = rand::random::<u128>().to_be_bytes();
         let msg = self.encode_store(
             &self.peer_id.0,
+            msg_id,
             self.config.ttl_seconds,
             pubkey,
             noise_pubkey,
+            capabilities,
             endpoints,
         );
         for node in &closest {
@@ -405,7 +408,6 @@ impl DhtHandle {
                 if before != records.len() {
                     tracing::debug!("DHT cleanup: removed {} expired", before - records.len());
                 }
-                this.peer_ratelimit.write().await.clear();
             }
         });
     }
@@ -421,12 +423,16 @@ impl DhtHandle {
         let msg = msg_codec::decode_message(data)
             .ok_or_else(|| DhtError::Serialization("decode failed".into()))?;
 
-        // Verify Ed25519 signature for request messages
+        // Rate limit applies to requests only
         if !msg.is_response {
             if !self.check_rate_limit(&msg.sender_id).await {
                 tracing::debug!("DHT rate limit: dropping from {}", msg.sender_id);
                 return Ok(());
             }
+        }
+
+        // Verify Ed25519 signature for request messages (response signatures deferred for now)
+        if !msg.is_response {
             if let Some(ref sig) = msg.signature {
                 if sig.iter().any(|&b| b != 0) {
                     if data.len() < 64 { return Ok(()); } // too short to have a real signature
@@ -442,6 +448,17 @@ impl DhtHandle {
                         }
                     }
                     // Unknown peer or unparseable key: accept (deferred verification)
+                }
+            }
+        }
+
+        // Reject unsigned FindValue responses when we know the sender's pubkey
+        if msg.is_response && msg.msg_type == DhtMsgType::FindValue {
+            if let Some(ref sig) = msg.signature {
+                if sig.iter().all(|&b| b == 0)
+                    && self.peer_records.read().await.contains_key(&msg.sender_id)
+                {
+                    return Ok(());
                 }
             }
         }
@@ -463,13 +480,14 @@ impl DhtHandle {
     }
 
     async fn handle_request(&self, msg: lain_core::dht::DhtMessage, src: SocketAddr) -> Result<(), DhtError> {
+        let seed = self.signing_key.as_ref();
         match msg.msg_type {
             DhtMsgType::Ping => {
                 let closest = {
                     let rt = self.routing_table.read().await;
                     rt.closest_nodes(&msg.sender_id, self.config.k)
                 };
-                let resp = msg_codec::encode_ping_response(self.peer_id, msg.message_id, &closest);
+                let resp = msg_codec::encode_ping_response(self.peer_id, msg.message_id, &closest, seed);
                 self.send_msg(&resp, src).await;
             }
             DhtMsgType::FindNode => {
@@ -479,21 +497,23 @@ impl DhtHandle {
                         let rt = self.routing_table.read().await;
                         rt.closest_nodes(&target, self.config.k)
                     };
-                    let resp = msg_codec::encode_find_node_response(self.peer_id, msg.message_id, &closest);
+                    let resp = msg_codec::encode_find_node_response(self.peer_id, msg.message_id, &closest, seed);
                     self.send_msg(&resp, src).await;
                 }
             }
             DhtMsgType::Store => {
-                if msg.payload.len() >= 36 {
+                if msg.payload.len() >= 37 {
                     let key = PeerId(msg.payload[..32].try_into().unwrap_or([0u8; 32]));
                     let ttl = u32::from_be_bytes([msg.payload[32], msg.payload[33], msg.payload[34], msg.payload[35]]);
                     let effective_ttl = if ttl == 0 || ttl > 3600 { 300 } else { ttl };
-                    // Store the record locally (parse pubkey + noise_pubkey + endpoints)
-                    if msg.payload.len() >= 100 {
+                    // Store the record locally (parse pubkey + noise_pubkey + capabilities + endpoints)
+                    if msg.payload.len() >= 101 {
                         let mut pubkey = [0u8; 32];
                         pubkey.copy_from_slice(&msg.payload[36..68]);
                         let mut noise_pubkey = [0u8; 32];
                         noise_pubkey.copy_from_slice(&msg.payload[68..100]);
+                        let cap_bits = msg.payload[100];
+                        let capabilities = Capabilities { bits: cap_bits };
 
                         // Verify pubkey matches PeerID (SHA256(pubkey) == key)
                         let expected_id = PeerId(sha2::Sha256::digest(&pubkey).into());
@@ -503,9 +523,9 @@ impl DhtHandle {
                         }
 
                         // Parse endpoints from remaining payload
-                        let eps = if msg.payload.len() >= 102 {
-                            let ep_len = u16::from_be_bytes([msg.payload[100], msg.payload[101]]) as usize;
-                            msg_codec::parse_endpoints(&msg.payload[102..], ep_len)
+                        let eps = if msg.payload.len() >= 103 {
+                            let ep_len = u16::from_be_bytes([msg.payload[101], msg.payload[102]]) as usize;
+                            msg_codec::parse_endpoints(&msg.payload[103..], ep_len)
                         } else {
                             vec![]
                         };
@@ -514,7 +534,7 @@ impl DhtHandle {
                             pubkey,
                             noise_pubkey,
                             endpoints: eps.clone(),
-                            capabilities: Capabilities::new(),
+                            capabilities,
                             ttl_remaining: effective_ttl,
                             expires_at: std::time::Instant::now() + std::time::Duration::from_secs(effective_ttl as u64),
                         };
@@ -523,14 +543,14 @@ impl DhtHandle {
                             pubkey,
                             noise_pubkey,
                             endpoints: eps,
-                            capabilities: Capabilities::new(),
+                            capabilities,
                             ttl_remaining: effective_ttl,
                             expires_at: std::time::Instant::now() + std::time::Duration::from_secs(effective_ttl as u64),
                         }.into_core(&key)));
                     }
                 }
                 // ACK
-                let resp = msg_codec::encode_store_ack(self.peer_id, msg.message_id);
+                let resp = msg_codec::encode_store_ack(self.peer_id, msg.message_id, seed);
                 self.send_msg(&resp, src).await;
             }
             DhtMsgType::FindValue => {
@@ -543,7 +563,7 @@ impl DhtHandle {
                     if let Some(ref rec) = record {
                         if rec.expires_at > std::time::Instant::now() {
                             let resp = msg_codec::encode_find_value_response_with_record(
-                                self.peer_id, msg.message_id, &rec,
+                                self.peer_id, msg.message_id, rec, seed,
                             );
                             self.send_msg(&resp, src).await;
                             return Ok(());
@@ -555,14 +575,14 @@ impl DhtHandle {
                         rt.closest_nodes(&key, self.config.k)
                     };
                     let resp = msg_codec::encode_find_value_response_not_found(
-                        self.peer_id, msg.message_id, &closest,
+                        self.peer_id, msg.message_id, &closest, seed,
                     );
                     self.send_msg(&resp, src).await;
                 }
             }
             DhtMsgType::AddrReflect => {
                 let resp = msg_codec::encode_addr_reflect_response(
-                    self.peer_id, msg.message_id, &src,
+                    self.peer_id, msg.message_id, &src, seed,
                 );
                 self.send_msg(&resp, src).await;
             }
@@ -575,7 +595,7 @@ impl DhtHandle {
                         .collect::<Vec<_>>()
                 };
                 let resp = msg_codec::encode_relay_needed_response(
-                    self.peer_id, msg.message_id, &relays,
+                    self.peer_id, msg.message_id, &relays, seed,
                 );
                 self.send_msg(&resp, src).await;
             }

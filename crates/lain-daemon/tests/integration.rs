@@ -65,6 +65,39 @@ async fn connect_ab(a: &TestNode, b: &TestNode) -> (Box<dyn Connection>, Box<dyn
     (conn_a, conn_b)
 }
 
+// ── PeerID 校验 ──
+
+#[tokio::test]
+async fn connect_rejects_mismatched_peer_id() {
+    // Bug #4: transport.connect() ignores the expected peer_id parameter.
+    // Even if the caller passes a wrong peer_id, the connection succeeds
+    // because the function never checks that the remote's claimed identity
+    // matches what was expected.
+    let a = TestNode::new().await;
+    let b = TestNode::new().await;
+    let b_eps = vec![b.endpoint()];
+    let b_t = b.transport.clone();
+    let _b_acc = tokio::spawn(async move {
+        let _ = tokio::time::timeout(Duration::from_secs(10), b_t.accept()).await;
+    });
+
+    let wrong_id = PeerId([0xBBu8; 32]); // does not match b.peer_id
+    let result = tokio::time::timeout(Duration::from_secs(10),
+        a.transport.connect(wrong_id, &b.noise_pk, &b_eps)
+    ).await;
+
+    // CORRECT: connect should return Err when peer_id doesn't match
+    // Current buggy: connect succeeds with mismatched peer_id
+    match result {
+        Ok(Ok(conn)) => panic!(
+            "BUG: connect accepted wrong peer_id {wrong_id}, got {}",
+            conn.peer_id()
+        ),
+        Ok(Err(_)) => {}, // Correct: rejected
+        Err(_) => {},     // Timeout also acceptable (treated as rejection)
+    }
+}
+
 // ── 基础 ──
 
 #[tokio::test]
@@ -73,7 +106,7 @@ async fn connect_and_send_one_message() {
     let b = TestNode::new().await;
     let (conn_a, conn_b) = connect_ab(&a, &b).await;
 
-    conn_a.send(b"ping").await.unwrap();
+    conn_a.send(FrameType::Data, b"ping").await.unwrap();
     let (ft, data) = conn_b.recv().await.unwrap();
     assert_eq!(ft, FrameType::Data);
     assert_eq!(data, b"ping");
@@ -101,7 +134,7 @@ async fn parallel_connect_fallback() {
     let _h = tokio::spawn(async move { let _ = b_t.accept().await; });
     let conn = a.transport.connect(b.peer_id, &b.noise_pk, &eps).await.unwrap();
     assert_eq!(conn.peer_id(), b.peer_id);
-    conn.send(b"ok").await.unwrap();
+    conn.send(FrameType::Data, b"ok").await.unwrap();
 }
 
 // ── 多消息 ──
@@ -115,7 +148,7 @@ async fn multiple_messages_in_order() {
     let count = 10;
     for i in 0..count {
         let msg = format!("msg_{i}");
-        conn_a.send(msg.as_bytes()).await.unwrap();
+        conn_a.send(FrameType::Data, msg.as_bytes()).await.unwrap();
     }
 
     for i in 0..count {
@@ -132,7 +165,7 @@ async fn large_message_100kb() {
     let (conn_a, conn_b) = connect_ab(&a, &b).await;
 
     let payload = vec![0xABu8; 102400]; // 100KB
-    conn_a.send(&payload).await.unwrap();
+    conn_a.send(FrameType::Data, &payload).await.unwrap();
 
     let (ft, data) = conn_b.recv().await.unwrap();
     assert_eq!(ft, FrameType::Data);
@@ -150,10 +183,10 @@ async fn bidirectional_messages() {
 
     // 同时发送
     let b_handle = tokio::spawn(async move {
-        conn_b.send(b"from B").await.unwrap();
+        conn_b.send(FrameType::Data, b"from B").await.unwrap();
         conn_b.recv().await.unwrap()
     });
-    conn_a.send(b"from A").await.unwrap();
+    conn_a.send(FrameType::Data, b"from A").await.unwrap();
     let (ft, data) = conn_a.recv().await.unwrap();
     assert_eq!(ft, FrameType::Data);
     assert_eq!(data, b"from B");
@@ -192,8 +225,8 @@ async fn multiple_connections() {
     assert_eq!(conn_c.peer_id(), a.peer_id);
 
     // 各自发一条
-    conn_ab.send(b"A->B").await.unwrap();
-    conn_ac.send(b"A->C").await.unwrap();
+    conn_ab.send(FrameType::Data, b"A->B").await.unwrap();
+    conn_ac.send(FrameType::Data, b"A->C").await.unwrap();
     let (_, d1) = conn_b.recv().await.unwrap();
     let (_, d2) = conn_c.recv().await.unwrap();
     assert_eq!(d1, b"A->B");
@@ -223,7 +256,7 @@ async fn send_empty_payload() {
     let b = TestNode::new().await;
     let (conn_a, conn_b) = connect_ab(&a, &b).await;
 
-    conn_a.send(b"").await.unwrap();
+    conn_a.send(FrameType::Data, b"").await.unwrap();
     let (ft, data) = conn_b.recv().await.unwrap();
     assert_eq!(ft, FrameType::Data);
     assert!(data.is_empty(), "empty payload should be delivered");
@@ -237,7 +270,7 @@ async fn peek_connection_buffers_first_message() {
     let b = TestNode::new().await;
     let (conn_a, conn_b) = connect_ab(&a, &b).await;
 
-    conn_a.send(b"hello peek").await.unwrap();
+    conn_a.send(FrameType::Data, b"hello peek").await.unwrap();
 
     let (ft, first) = conn_b.recv().await.unwrap();
     assert_eq!(ft, FrameType::Data);
@@ -262,7 +295,7 @@ async fn connection_survives_idle_period() {
     tokio::time::sleep(Duration::from_secs(10)).await;
 
     // 仍然能发数据
-    conn_a.send(b"still alive").await.unwrap();
+    conn_a.send(FrameType::Data, b"still alive").await.unwrap();
     let (ft, data) = conn_b.recv().await.unwrap();
     assert_eq!(ft, FrameType::Data);
     assert_eq!(data, b"still alive");
@@ -300,6 +333,6 @@ async fn tso_handshake() {
     };
 
     assert_eq!(conn.peer_id(), b.peer_id);
-    conn.send(b"tso works").await.unwrap();
+    conn.send(FrameType::Data, b"tso works").await.unwrap();
     h.await.unwrap_or(());
 }

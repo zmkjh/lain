@@ -193,7 +193,7 @@ impl InviteCode {
             .unwrap_or(0);
         let window: u64 = 30 * 60;
         if now < self.timestamp {
-            return false;
+            return true;
         }
         now - self.timestamp > window
     }
@@ -436,6 +436,20 @@ mod tests {
         let payload = decoded.encode_payload();
         let expected_sig = sign_fn(&payload);
         assert_eq!(decoded.signature, expected_sig);
+    }
+
+    #[test]
+    fn test_invite_expired_with_future_timestamp() {
+        let mut invite = make_invite();
+        // Set timestamp 1 hour in the future
+        invite.timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() + 3600)
+            .unwrap_or(u64::MAX);
+        // CORRECT behavior: invites with future timestamps should be treated as expired
+        // Current buggy behavior: is_expired returns false for future timestamps
+        assert!(invite.is_expired(),
+            "BUG: invite with future timestamp should be considered expired");
     }
 
     #[test]
