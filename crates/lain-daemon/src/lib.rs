@@ -147,7 +147,7 @@ impl Daemon {
 
         // ── Transport ──
         let transport: Arc<dyn Transport> = Arc::new(lain_transport::Transport::new(
-            TransportConfig { bind_addr, has_ipv6: ipv6_addr.is_some() },
+            TransportConfig { bind_addr, has_ipv6: ipv6_addr.is_some(), tso_port_start: self.config.transport.tso_port_start },
             crypto, peer_id,
         )?);
         let transport_port = transport.local_addr()?.port();
@@ -173,10 +173,24 @@ impl Daemon {
         if let Some(v6) = ipv6_addr {
             eps.push(Endpoint::new(SocketAddr::new(std::net::IpAddr::V6(v6), transport_port), EndpointKind::IPv6));
         }
+        // 始终添加本地 LAN IPv4 地址作为 TSO 端点（无需 STUN，同网段/同 NAT 可用）
+        if let Ok(ifs) = if_addrs::get_if_addrs() {
+            for iface in &ifs {
+                if let if_addrs::IfAddr::V4(v4) = &iface.addr {
+                    if !v4.ip.is_loopback() {
+                        let ps = self.config.transport.tso_port_start;
+                        for i in 0..8u16 {
+                            eps.push(Endpoint::new(SocketAddr::new(std::net::IpAddr::V4(v4.ip), ps + i), EndpointKind::TSO));
+                        }
+                    }
+                }
+            }
+        }
         if let Some(stun) = nat.mapped_addr {
+            let ps = self.config.transport.tso_port_start;
             eps.push(Endpoint::new(SocketAddr::new(stun.ip(), transport_port), EndpointKind::STUN));
             for i in 0..8u16 {
-                eps.push(Endpoint::new(SocketAddr::new(stun.ip(), 50000 + i), EndpointKind::TSO));
+                eps.push(Endpoint::new(SocketAddr::new(stun.ip(), ps + i), EndpointKind::TSO));
             }
         }
 

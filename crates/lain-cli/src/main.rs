@@ -23,10 +23,33 @@ impl IpcStream {
             use std::os::windows::fs::OpenOptionsExt;
             let file = std::fs::OpenOptions::new()
                 .read(true).write(true)
-                .custom_flags(0x40000000) // FILE_FLAG_OVERLAPPED — non-blocking
+                .custom_flags(0x40000000) // FILE_FLAG_OVERLAPPED
                 .open(path)?;
+            // 设置 pipe 为非阻塞模式，使 read() 返回 WouldBlock
+            set_pipe_nonblocking(&file)?;
             Ok(IpcStream::Pipe(file))
         }
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn set_pipe_nonblocking(file: &std::fs::File) -> std::io::Result<()> {
+    extern "system" {
+        fn SetNamedPipeHandleState(
+            hNamedPipe: *mut std::ffi::c_void,
+            lpMode: *const u32,
+            lpMaxCollectionCount: *const u32,
+            lpCollectDataTimeout: *const u32,
+        ) -> i32;
+    }
+    use std::os::windows::io::AsRawHandle;
+    let handle = file.as_raw_handle() as *mut std::ffi::c_void;
+    let mode: u32 = 0x00000001; // PIPE_NOWAIT
+    let result = unsafe { SetNamedPipeHandleState(handle, &mode, std::ptr::null(), std::ptr::null()) };
+    if result == 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
     }
 }
 

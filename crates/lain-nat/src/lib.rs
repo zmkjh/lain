@@ -46,19 +46,25 @@ impl NatProbe {
 /// 单个 STUN server 独立探测任务
 async fn probe_server(timeout: Duration, server: SocketAddr) -> Option<(SocketAddr, Duration)> {
     let socket = UdpSocket::bind("0.0.0.0:0").await.ok()?;
-    for _ in 0..2 {
+    for attempt in 0..2 {
         let start = Instant::now();
         let (req, tid) = build_binding_request();
-        if socket.send_to(&req, server).await.is_err() { continue; }
+        if socket.send_to(&req, server).await.is_err() {
+            tracing::debug!("STUN send_to {server} failed");
+            continue;
+        }
 
         let mut buf = [0u8; 1024];
         match tokio::time::timeout(timeout, socket.recv_from(&mut buf)).await {
             Ok(Ok((len, _))) => {
                 if let Some(addr) = parse_mapped(&buf[..len], &tid) {
+                    tracing::info!("STUN {server} → {addr} ({:?})", start.elapsed());
                     return Some((addr, start.elapsed()));
                 }
+                tracing::debug!("STUN {server} response parse failed");
             }
-            _ => continue,
+            Ok(Err(e)) => tracing::debug!("STUN {server} recv error: {e}"),
+            Err(_) => tracing::debug!("STUN {server} timeout (attempt {})", attempt + 1),
         }
     }
     None
@@ -72,21 +78,26 @@ impl NatProber for NatProbe {
         let mut rtt_total: u64 = 0;
 
         if !self.servers.is_empty() {
-            let mut handles = Vec::new();
+            let (tx, mut rx) = tokio::sync::mpsc::channel::<(SocketAddr, Duration)>(self.servers.len());
             for &server in &self.servers {
+                let tx = tx.clone();
                 let t = self.timeout;
-                handles.push(tokio::spawn(async move { probe_server(t, server).await }));
+                tokio::spawn(async move {
+                    if let Some(r) = probe_server(t, server).await {
+                        tx.send(r).await.ok();
+                    }
+                });
             }
-            for h in handles {
-                if let Ok(Some((addr, rtt))) = h.await {
-                    rtt_total += rtt.as_millis() as u64;
-                    results.push(ProbeAttempt { mapped: addr, rtt });
-                    if results.len() >= 2 { break; }
-                }
+            drop(tx);
+            while let Some((addr, rtt)) = rx.recv().await {
+                rtt_total += rtt.as_millis() as u64;
+                results.push(ProbeAttempt { mapped: addr, rtt });
+                if results.len() >= 2 { break; }
             }
         }
 
         if results.is_empty() {
+            tracing::warn!("STUN: all servers failed, no mapped address");
             let status = Self::ipv6_status().await;
             return Ok(NatProbeResult {
                 nat_type: NatType::Unknown,
@@ -102,6 +113,14 @@ impl NatProber for NatProbe {
         let base = results[0].mapped;
         let all_same = results.iter().all(|r| r.mapped == base);
         let ip_same = results.iter().all(|r| r.mapped.ip() == base.ip());
+        tracing::info!("STUN: {} results, mapped={base}, type={}, delta={:?}, rtt={avg_rtt}ms",
+            results.len(),
+            if all_same { "Cone" } else if ip_same { "Symmetric(ADF)" } else { "Symmetric(APDF)" },
+            results.get(1).and_then(|r| {
+                let d = base.port().abs_diff(r.mapped.port());
+                if d > 0 { Some(d) } else { None }
+            }),
+        );
 
         let deltas: Vec<u16> = if results.len() >= 2 {
             results.windows(2).filter_map(|w| {

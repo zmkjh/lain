@@ -39,6 +39,8 @@ pub struct TransportConfigFields {
     pub keep_alive_secs: u64,
     #[serde(default, with = "opt_socket_addr")]
     pub bind_addr: Option<SocketAddr>,
+    #[serde(default = "default_tso_port_start")]
+    pub tso_port_start: u16,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -93,6 +95,7 @@ mod vec_socket_addr {
     }
 }
 
+fn default_tso_port_start() -> u16 { 50000 }
 fn default_k() -> usize { 20 }
 fn default_alpha() -> usize { 3 }
 fn default_ttl() -> u32 { 300 }
@@ -139,6 +142,7 @@ impl Default for TransportConfigFields {
             idle_timeout_secs: default_idle(),
             keep_alive_secs: default_keepalive(),
             bind_addr: None,
+            tso_port_start: default_tso_port_start(),
         }
     }
 }

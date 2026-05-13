@@ -164,11 +164,12 @@ impl Connection for TcpConnection {
 pub struct TransportConfig {
     pub bind_addr: SocketAddr,
     pub has_ipv6: bool,
+    pub tso_port_start: u16,
 }
 
 impl Default for TransportConfig {
     fn default() -> Self {
-        Self { bind_addr: "0.0.0.0:0".parse().unwrap(), has_ipv6: false }
+        Self { bind_addr: "0.0.0.0:0".parse().unwrap(), has_ipv6: false, tso_port_start: 50000 }
     }
 }
 
@@ -176,6 +177,7 @@ pub struct Transport {
     endpoint: quinn::Endpoint,
     crypto: Arc<dyn CryptoProvider>,
     peer_id: PeerId,
+    tso_port_start: u16,
 }
 
 impl Transport {
@@ -218,7 +220,7 @@ impl Transport {
             quinn::EndpointConfig::default(), Some(server_cfg), socket, runtime,
         ).map_err(|e| TransportError::Io(e.to_string()))?;
 
-        Ok(Self { endpoint, crypto, peer_id })
+        Ok(Self { endpoint, crypto, peer_id, tso_port_start: config.tso_port_start })
     }
 
     pub fn local_addr(&self) -> Result<SocketAddr, TransportError> {
@@ -316,7 +318,7 @@ impl Transport {
         while std::time::Instant::now() < deadline {
             let (tx, mut rx) = tokio::sync::mpsc::channel::<tokio::net::TcpStream>(1);
             for i in 0..ports {
-                let la = SocketAddr::new(bind_ip, 50000 + i);
+                let la = SocketAddr::new(bind_ip, self.tso_port_start + i);
                 for &ra in tso_endpoints {
                     let tx = tx.clone();
                     tokio::spawn(async move {
@@ -337,7 +339,9 @@ impl Transport {
                 }
             }
             drop(tx);
-            if let Some(stream) = rx.recv().await {
+            let round_timeout = std::time::Duration::from_millis(per_attempt + 100);
+            if let Ok(Some(stream)) = tokio::time::timeout(round_timeout, rx.recv()).await {
+                tracing::info!("TSO connected, starting handshake");
                 return tso_handshake(stream, peer_id, &self.crypto, &self.peer_id, 15).await;
             }
             tokio::time::sleep(std::time::Duration::from_millis(inter_round)).await;
@@ -416,7 +420,8 @@ async fn tso_handshake(
         .map_err(|e| TransportError::Io(e.to_string()))?;
 
     let mut their_info = [0u8; 64];
-    stream.read_exact(&mut their_info).await
+    tokio::time::timeout(std::time::Duration::from_secs(10), stream.read_exact(&mut their_info)).await
+        .map_err(|_| TransportError::Connect("tso_handshake timeout reading peer info".into()))?
         .map_err(|e| TransportError::Io(e.to_string()))?;
 
     let their_id = PeerId(their_info[..32].try_into().unwrap_or([0u8; 32]));
@@ -437,7 +442,8 @@ async fn tso_handshake(
         stream.write_all(&encode_handshake_frame(0, &ik1)).await
             .map_err(|e| TransportError::Io(e.to_string()))?;
         let mut buf = vec![0u8; 4096];
-        let n = stream.read(&mut buf).await
+        let n = tokio::time::timeout(std::time::Duration::from_secs(5), stream.read(&mut buf)).await
+            .map_err(|_| TransportError::Connect("tso_handshake timeout reading ik2".into()))?
             .map_err(|e| TransportError::Io(e.to_string()))?;
         let h = parse_frame_header(&buf[..n])
             .map_err(|e| TransportError::Noise(e.to_string()))?;
@@ -445,7 +451,8 @@ async fn tso_handshake(
             .map_err(|e| TransportError::Noise(e.to_string()))?
     } else {
         let mut buf = vec![0u8; 4096];
-        let n = stream.read(&mut buf).await
+        let n = tokio::time::timeout(std::time::Duration::from_secs(5), stream.read(&mut buf)).await
+            .map_err(|_| TransportError::Connect("tso_handshake timeout reading ik1".into()))?
             .map_err(|e| TransportError::Io(e.to_string()))?;
         let h = parse_frame_header(&buf[..n])
             .map_err(|e| TransportError::Noise(e.to_string()))?;
