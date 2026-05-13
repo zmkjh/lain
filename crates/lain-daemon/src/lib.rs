@@ -27,6 +27,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::time::Duration;
 use thiserror::Error;
 use tokio::sync::{RwLock, broadcast, watch};
 use tracing;
@@ -109,7 +110,25 @@ impl Daemon {
             }
             addrs
         };
-        let nat = NatProbe::new(stun_addrs, 10).probe().await?;
+        let nat = match tokio::time::timeout(
+            Duration::from_secs(6),
+            NatProbe::new(stun_addrs, 3).probe(),
+        ).await {
+            Ok(Ok(n)) => n,
+            Ok(Err(e)) => return Err(DaemonError::Dht(e.to_string())),
+            Err(_) => {
+                tracing::warn!("NAT probe timed out, continuing with Unknown type");
+                let (ipv6_inbound, ipv6_addr) = NatProbe::ipv6_status().await;
+                lain_core::nat::NatProbeResult {
+                    nat_type: lain_core::nat::NatType::Unknown,
+                    ipv6_inbound,
+                    ipv6_addr,
+                    mapped_addr: None,
+                    port_delta: None,
+                    stun_rtt_ms: None,
+                }
+            }
+        };
         let ipv6_desc = nat.ipv6_addr.map(|a| a.to_string()).unwrap_or_else(||
             if nat.ipv6_inbound { "stack only (no global address)".into() } else { "no".into() }
         );

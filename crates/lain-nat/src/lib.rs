@@ -4,8 +4,9 @@
 
 use lain_core::error::CoreError;
 use lain_core::nat::{NatProbeResult, NatProber, NatType};
-use std::net::{SocketAddr, UdpSocket};
+use std::net::SocketAddr;
 use std::time::{Duration, Instant};
+use tokio::net::UdpSocket;
 
 pub struct NatProbe {
     servers: Vec<SocketAddr>,
@@ -25,36 +26,34 @@ struct ProbeAttempt {
 }
 
 impl NatProbe {
-    fn bind_socket(&self) -> Result<UdpSocket, CoreError> {
-        let s = UdpSocket::bind("0.0.0.0:0")
-            .map_err(|e| CoreError::InvalidEndpoint(e.to_string()))?;
-        s.set_read_timeout(Some(self.timeout))
+    async fn bind_socket(&self) -> Result<UdpSocket, CoreError> {
+        let s = UdpSocket::bind("0.0.0.0:0").await
             .map_err(|e| CoreError::InvalidEndpoint(e.to_string()))?;
         Ok(s)
     }
 
-    /// 向单个 STUN server 发 Binding Request，返回 mapped address，重试 1 次
-    fn stun_once(&self, socket: &UdpSocket, server: SocketAddr) -> Option<ProbeAttempt> {
+    /// 向单个 STUN server 并发发 Binding Request，返回 mapped address，重试 1 次
+    async fn stun_once(&self, socket: &UdpSocket, server: SocketAddr) -> Option<ProbeAttempt> {
+        let start = Instant::now();
         for _ in 0..2 {
-            let start = Instant::now();
             let (req, tid) = build_binding_request();
-            if socket.send_to(&req, server).is_err() { continue; }
+            if socket.send_to(&req, server).await.is_err() { continue; }
 
             let mut buf = [0u8; 1024];
-            match socket.recv_from(&mut buf) {
-                Ok((len, _)) => {
+            match tokio::time::timeout(self.timeout, socket.recv_from(&mut buf)).await {
+                Ok(Ok((len, _))) => {
                     if let Some(addr) = parse_mapped(&buf[..len], &tid) {
                         return Some(ProbeAttempt { mapped: addr, rtt: start.elapsed() });
                     }
                 }
-                Err(_) => continue,
+                _ => continue,
             }
         }
         None
     }
 
-    fn ipv6_status() -> (bool, Option<std::net::Ipv6Addr>) {
-        let v6_avail = UdpSocket::bind("[::1]:0").is_ok();
+    pub async fn ipv6_status() -> (bool, Option<std::net::Ipv6Addr>) {
+        let v6_avail = tokio::net::UdpSocket::bind("[::1]:0").await.is_ok();
         let global = if v6_avail {
             if_addrs::get_if_addrs().ok().and_then(|ifs| {
                     ifs.into_iter().find_map(|i| match i.addr {
@@ -73,22 +72,21 @@ impl NatProbe {
 #[async_trait::async_trait]
 impl NatProber for NatProbe {
     async fn probe(&self) -> Result<NatProbeResult, CoreError> {
-        let socket = self.bind_socket()?;
+        let socket = self.bind_socket().await?;
 
-        // 向每个 server 发 Binding Request，收集 mapped address
         let mut results: Vec<ProbeAttempt> = Vec::new();
         let mut rtt_total: u64 = 0;
 
         for &server in &self.servers {
-            if let Some(a) = self.stun_once(&socket, server) {
+            if let Some(a) = self.stun_once(&socket, server).await {
                 rtt_total += a.rtt.as_millis() as u64;
                 results.push(a);
             }
-            if results.len() >= 2 { break; } // 2 个 server 足够判断
+            if results.len() >= 2 { break; }
         }
 
         if results.is_empty() {
-            let status = Self::ipv6_status();
+            let status = Self::ipv6_status().await;
             return Ok(NatProbeResult {
                 nat_type: NatType::Unknown,
                 ipv6_inbound: status.0,
@@ -131,7 +129,7 @@ impl NatProber for NatProbe {
                        else if ip_same { NatType::ADFSymmetric }
                        else { NatType::APDFSymmetric };
 
-        let status = Self::ipv6_status();
+        let status = Self::ipv6_status().await;
         Ok(NatProbeResult {
             nat_type,
             ipv6_inbound: status.0,
@@ -206,7 +204,7 @@ mod tests {
     use std::sync::mpsc;
 
     fn mock_stun(port: u16, ip: [u8; 4]) -> SocketAddr {
-        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
         let addr = socket.local_addr().unwrap();
         let cookie = [0x21, 0x12, 0xA4, 0x42];
         let (tx, rx) = mpsc::channel();
