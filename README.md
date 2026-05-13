@@ -3,7 +3,7 @@
 **零服务器 P2P 网络基础设施。** 无需 bootstrap 节点、无需 DNS、无需 TLS 证书。PeerID 即身份，Invite 即入口，DHT 即拓扑。
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-[![Tests](https://img.shields.io/badge/tests-154-brightgreen.svg)](https://github.com/zmkjh/lain/actions)
+[![Tests](https://img.shields.io/badge/tests-133-brightgreen.svg)](https://github.com/zmkjh/lain/actions)
 ![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-lightgrey)
 
 ## 核心创新
@@ -268,10 +268,9 @@ IPC 协议完整规范见 [PROTOCOL.md §8](PROTOCOL.md#8-ipc-api)。
 
 ```bash
 cargo build --release    # 生产构建
-cargo test               # 154 自动化测试 (0 warning)
-```
+cargo test               # 133 自动化测试 (0 warning)
 
-154 个测试覆盖全部协议层：identity、noise、nat（含全部 NAT 类型分类）、dht（全部消息类型）、discovery、transport（QUIC/TSO/relay/并发）、daemon + 15 个端到端集成测试。
+133 个测试覆盖全部协议层：identity、noise、nat（STUN 探测）、dht（Kademlia 路由表 + 消息编解码）、discovery（invite 编解码 + base62）、transport（PeekConnection + Mock Transport）、daemon（编排函数 + 签名验证 + ConnectionGuard）+ 3 个端到端集成测试（QUIC 连接握手、parallel fallback、PeekConnection）。
 
 ## 许可证
 
@@ -279,19 +278,11 @@ MIT © 2026 zmkjh
 
 ## 最近更新 (2026-05)
 
-### Bug 修复
-- **IPC 事件通知**：修复 Subscribe 命令从不转发事件到客户端的问题（cli `lain monitor` / `lain connect` 现在可正常收到 `peer_connected` 等通知）
-- **Invite 签名验证**：ConnectPeer 和 TsoPeer 现在验证 Ed25519 签名（之前只检查 PeerId 但不验证签名，MITM 可替换 noise_pk 和 endpoints）
-- **TSO 噪声密钥**：ts_connect 现在从 `noise_secret` 正确派生 X25519 公钥
-- **DHT 签名验证**：peers.json 现在验证 Ed25519 签名后再加载
-- **DHT 随机性**：`random_id_in_bucket` 真正随机化后缀位
-- **DHT 查询丢失**：`spawn_cleanup` 不再清空 `pending_queries`（之前每 10 分钟丢弃所有进行中的 find_peer 请求）
-- **STUN CHANGE-REQUEST**：修复 message length 字段始终为 0 的问题
-- **IPC listener 健壮性**：Unix/Windows/HTTP listener 现在在瞬态 accept 错误时 continue 而不是 exit
-
-### 测试增强
-- NAT 类型检测：mock STUN 服务器覆盖 Cone / APDFSymmetric / ADFSymmetric 全部分类
-- TSO 端到端：TCP 同时打开 + Noise IK 握手 + 交叉会话加密验证
-- accept_connection：响应端 Noise IK 完整测试
-- DHT：AddrReflect / RelayNeeded 消息收发
-- DHT：`spawn_bucket_refresh` 后台维护任务
+### 架构重构
+- **Trait 隔离**：`CryptoProvider`、`Transport`、`Connection`、`DhtBackend` 全部定义为 trait，daemon 通过 `Arc<dyn Transport>` 引用实现，transport 不再直接依赖 lain-noise
+- **统一 Connection 接口**：QUIC、TSO、Relay 三种路径统一为 `Connection` trait（`send`/`recv`/`close`/`peer_id`），daemon 只有一个 `spawn_reader`
+- **PeerID 在握手中确定**：Noise IK 握手 payload 携带 PeerID，不需要额外的 DHT_ADDR 协议
+- **自动重连**：指数退避（1s→3s→9s→27s→60s），`ConnectionGuard` 通过 watch channel 优雅取消
+- **NAT 探测重写**：多服务器 Binding Request 比较，不再依赖 CHANGE-REQUEST
+- **Relay 回退**：`find_relays()` 返回 `RelayInfo`（含 noise_pubkey），daemon 层 `recv→send` pipe
+- **1423 行新增 / 3480 行删除**，crate 间死依赖全部清理
