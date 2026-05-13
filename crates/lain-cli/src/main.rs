@@ -191,11 +191,22 @@ fn run_daemon(foreground: bool) {
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .spawn() {
-            Ok(_child) => {
+            Ok(mut child) => {
                 println!("Starting daemon (NAT probe + DHT bootstrap may take a few seconds)...");
-                // Retry IPC until daemon is ready
                 for i in 0..20 {
-                    if i == 5 { eprintln!("still waiting (NAT probe may take a while)..."); }
+                    if i == 4 { eprintln!("still waiting (NAT probe may take a while)..."); }
+                    // Check if child died early (stale pipe, config error, etc.)
+                    match child.try_wait() {
+                        Ok(Some(status)) => {
+                            eprintln!("daemon exited unexpectedly (code: {status})");
+                            return;
+                        }
+                        Err(e) => {
+                            eprintln!("daemon process error: {e}");
+                            return;
+                        }
+                        Ok(None) => {} // still running
+                    }
                     std::thread::sleep(std::time::Duration::from_secs(1));
                     match ipc_req(&socket_path, r#"{"cmd":"Whoami"}"#) {
                         Some(v) => {
