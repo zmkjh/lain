@@ -1,6 +1,6 @@
 use thiserror::Error;
 
-#[derive(Error, Debug)]
+#[derive(Error, Debug, Clone)]
 pub enum CoreError {
     #[error("invalid peer ID: {0}")]
     InvalidPeerId(String),

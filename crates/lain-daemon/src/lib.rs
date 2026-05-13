@@ -752,6 +752,156 @@ fn dirs_home() -> Option<PathBuf> {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+    use lain_core::dht::{DhtBackend, RelayInfo};
+    use lain_core::error::CoreError;
+    use lain_core::transport::PathType;
+    use tokio::sync::broadcast;
+
+    // ── Mocks ──
+
+    #[derive(Clone)]
+    struct MockConnection {
+        pid: PeerId,
+        fail_recv: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl Connection for MockConnection {
+        fn peer_id(&self) -> PeerId { self.pid }
+        fn path(&self) -> PathType { PathType::Direct }
+        async fn send(&self, _data: &[u8]) -> Result<(), CoreError> { Ok(()) }
+        fn close(&self) {}
+        async fn recv(&self) -> Result<Vec<u8>, CoreError> {
+            if self.fail_recv { Err(CoreError::InvalidEndpoint("mock fail".into())) }
+            else { Ok(b"mock data".to_vec()) }
+        }
+    }
+
+    struct MockTransport {
+        connect_result: std::sync::Mutex<Result<MockConnection, CoreError>>,
+    }
+
+    impl MockTransport {
+        fn new_ok() -> Arc<Self> {
+            Arc::new(Self { connect_result: std::sync::Mutex::new(Ok(MockConnection { pid: PeerId([2u8; 32]), fail_recv: false })) })
+        }
+        fn new_fail() -> Arc<Self> {
+            Arc::new(Self { connect_result: std::sync::Mutex::new(Err(CoreError::InvalidEndpoint("mock fail".into()))) })
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Transport for MockTransport {
+        async fn connect(&self, _pid: PeerId, _npk: &[u8; 32], _eps: &[Endpoint]) -> Result<Box<dyn Connection>, CoreError> {
+            self.connect_result.lock().unwrap().clone().map(|c| Box::new(c) as Box<dyn Connection>)
+        }
+        async fn connect_tso(&self, _pid: PeerId, _eps: &[SocketAddr], _pd: Option<u16>, _rtt: Option<u64>) -> Result<Box<dyn Connection>, CoreError> {
+            Err(CoreError::InvalidEndpoint("tso not mocked".into()))
+        }
+        async fn accept(&self) -> Result<Box<dyn Connection>, CoreError> {
+            Err(CoreError::InvalidEndpoint("accept not mocked".into()))
+        }
+        fn local_addr(&self) -> Result<SocketAddr, CoreError> {
+            Err(CoreError::InvalidEndpoint("no addr".into()))
+        }
+    }
+
+    struct MockDht;
+    #[async_trait::async_trait]
+    impl DhtBackend for MockDht {
+        async fn bootstrap(&self, _seeds: &[SocketAddr]) -> Result<(), CoreError> { Ok(()) }
+        async fn store_self(&self, _pk: &[u8; 32], _npk: &[u8; 32], _eps: &[Endpoint], _caps: Capabilities) -> Result<(), CoreError> { Ok(()) }
+        async fn find_peer(&self, _pid: &PeerId) -> Result<Option<lain_core::dht::PeerRecord>, CoreError> { Ok(None) }
+        async fn find_relays(&self) -> Result<Vec<RelayInfo>, CoreError> { Ok(vec![]) }
+        async fn routing_table_size(&self) -> usize { 0 }
+    }
+
+    fn make_connected() -> Connections {
+        Arc::new(RwLock::new(HashMap::new()))
+    }
+
+    fn make_ipc() -> (broadcast::Sender<IpcResponse>, broadcast::Receiver<IpcResponse>) {
+        broadcast::channel(16)
+    }
+
+    // ── connect_and_track ──
+
+    #[tokio::test]
+    async fn connect_and_track_success_inserts_and_sends_event() {
+        let transport = MockTransport::new_ok();
+        let ipc = make_ipc();
+        let mut rx = ipc.1;
+        let connected = make_connected();
+        let pid = PeerId([2u8; 32]);
+        let npk = [0u8; 32];
+        let eps = vec![];
+
+        let ok = connect_and_track(pid, &npk, &eps, transport, ipc.0, connected.clone(), "test", false).await;
+        assert!(ok, "connect should succeed");
+
+        // Check connected map
+        let map = connected.read().await;
+        assert!(map.contains_key(&pid), "pid should be in connected map");
+        assert_eq!(map.get(&pid).unwrap().0.peer_id(), pid);
+
+        // Check IPC event
+        let ev = rx.try_recv().unwrap();
+        match ev {
+            IpcResponse::Event { event, peer_id, data } => {
+                assert_eq!(event, "peer_connected");
+                assert_eq!(peer_id, Some(pid.to_string()));
+                assert_eq!(data, Some(serde_json::json!({"via": "test"})));
+            }
+            _ => panic!("expected Event"),
+        }
+    }
+
+    #[tokio::test]
+    async fn connect_and_track_failure_sends_error_event() {
+        let transport = MockTransport::new_fail();
+        let ipc = make_ipc();
+        let mut rx = ipc.1;
+        let connected = make_connected();
+
+        let ok = connect_and_track(PeerId([3u8; 32]), &[0u8; 32], &[], transport, ipc.0, connected, "", false).await;
+        assert!(!ok, "connect should fail");
+
+        let ev = rx.try_recv().unwrap();
+        match ev {
+            IpcResponse::Event { event, .. } => assert_eq!(event, "peer_error"),
+            _ => panic!("expected Event"),
+        }
+    }
+
+    // ── save_peers ──
+
+    #[test]
+    fn test_save_peers_creates_file() {
+        use std::fs;
+        let tmp = std::env::temp_dir().join("lain-test-peers");
+        let _ = fs::remove_dir_all(&tmp);
+        let prev = std::env::var("LAIN_HOME").ok();
+        unsafe { std::env::set_var("LAIN_HOME", tmp.to_str().unwrap()); }
+
+        let id = Identity::generate().unwrap();
+        let pid = id.peer_id();
+        let mut peers = HashMap::new();
+        peers.insert(pid, vec![Endpoint::new("127.0.0.1:9000".parse().unwrap(), EndpointKind::STUN)]);
+
+        save_peers(&peers, &id);
+
+        let path = dirs_home().unwrap().join(".lain").join("peers.json");
+        assert!(path.exists(), "peers.json should exist");
+        let content = fs::read_to_string(&path).unwrap();
+        assert!(content.contains(&pid.to_hex()), "saved file should contain peer id");
+
+        // Cleanup
+        if let Some(v) = prev { unsafe { std::env::set_var("LAIN_HOME", v); } }
+        else { std::env::remove_var("LAIN_HOME"); }
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    // ── Existing tests ──
 
     #[test]
     fn test_is_relay_request_detects_relay_connect() {
@@ -776,14 +926,12 @@ mod tests {
         let (tx, rx) = watch::channel(false);
         let guard = ConnectionGuard(tx);
         assert!(!*rx.borrow(), "should not be cancelled initially");
-
         guard.disconnect();
         assert!(*rx.borrow(), "should be cancelled after disconnect");
     }
 
     #[test]
     fn test_parse_invite_valid() {
-        // Create a minimal invite with a known signer
         let id = Identity::generate().unwrap();
         let (_, noise_pk) = id.noise_keypair();
         let ep = Endpoint::new("127.0.0.1:9000".parse().unwrap(), EndpointKind::STUN);
@@ -800,10 +948,6 @@ mod tests {
 
     #[test]
     fn test_parse_invite_expired() {
-        // is_expired() is tested in lain-discovery. Here we just verify
-        // that an expired invite (raw construction via from_base62) is rejected.
-        // We can't set a custom timestamp through the public API without
-        // breaking the signature, so this validates that parse_invite calls is_expired.
         let id = Identity::generate().unwrap();
         let (_, noise_pk) = id.noise_keypair();
         let invite = lain_discovery::InviteCode::new(
@@ -812,7 +956,6 @@ mod tests {
             &|data| id.sign(data),
         );
         assert!(!invite.is_expired(), "fresh invite should not be expired");
-        // parse_invite calls is_expired internally — we trust that coverage from lain-discovery
     }
 
     #[test]
@@ -824,7 +967,6 @@ mod tests {
             Capabilities::new(), vec![],
             &|data| id.sign(data),
         );
-        // Corrupt signature
         invite.signature[0] ^= 0xFF;
         let uri = invite.to_uri();
         assert!(parse_invite(&uri).is_none(), "tampered signature should be rejected");
@@ -840,9 +982,7 @@ mod tests {
     fn test_iface_changed_initial_state() {
         let mut cached = vec![];
         let (changed, current) = iface_changed(&mut cached);
-        // First call: cached empty, current has interfaces, so changed=true
         assert!(changed, "first call should detect change");
-        // Second call: same data, no change
         let mut cached2 = current.clone();
         let (changed2, _) = iface_changed(&mut cached2);
         assert!(!changed2, "identical data should not trigger change");

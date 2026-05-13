@@ -557,12 +557,6 @@ mod tests {
         messages: tokio::sync::Mutex<Vec<Vec<u8>>>,
     }
 
-    impl MockConnection {
-        fn new(msgs: Vec<Vec<u8>>) -> Arc<Self> {
-            Arc::new(Self { pid: PeerId([1u8; 32]), messages: tokio::sync::Mutex::new(msgs) })
-        }
-    }
-
     #[async_trait::async_trait]
     impl Connection for MockConnection {
         fn peer_id(&self) -> PeerId { self.pid }
