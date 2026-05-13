@@ -300,10 +300,10 @@ impl Daemon {
                         let c = connected.clone();
                         let k = known_peers.clone();
                         tokio::spawn(async move {
-                            let first = match conn.recv().await {
-                                Ok(d) => d, Err(_) => return,
+                            let (ft, first) = match conn.recv().await {
+                                Ok(r) => r, Err(_) => return,
                             };
-                            if is_relay_request(&first) {
+                            if ft == FrameType::RelayConnect {
                                 handle_relay(conn, &first[8..], d, t).await;
                                 return;
                             }
@@ -322,9 +322,9 @@ impl Daemon {
                                 loop {
                                     tokio::select! {
                                         data = conn.recv() => match data {
-                                            Ok(data) => {
+                                            Ok((_ft, payload)) => {
                                                 use base64::Engine;
-                                                let b64 = base64::engine::general_purpose::STANDARD.encode(&data);
+                                                let b64 = base64::engine::general_purpose::STANDARD.encode(&payload);
                                                 let _ = e.send(IpcResponse::Event {
                                                     event: "data".into(),
                                                     peer_id: Some(pid.to_string()),
@@ -378,12 +378,6 @@ impl Daemon {
 
 // ── Relay ──
 
-fn is_relay_request(data: &[u8]) -> bool {
-    frame::decode_frame_header(data)
-        .map(|(_, ft, _, _)| ft == FrameType::RelayConnect)
-        .unwrap_or(false)
-}
-
 async fn handle_relay(
     requester: Box<dyn Connection>,
     frame_payload: &[u8],
@@ -413,7 +407,7 @@ async fn handle_relay(
     tokio::spawn(async move {
         loop {
             match rt.recv().await {
-                Ok(d) => { if tt.send(&d).await.is_err() { break; } }
+                Ok((_, d)) => { if tt.send(&d).await.is_err() { break; } }
                 Err(_) => break,
             }
         }
@@ -421,7 +415,7 @@ async fn handle_relay(
     tokio::spawn(async move {
         loop {
             match t2.recv().await {
-                Ok(d) => { if r2.send(&d).await.is_err() { break; } }
+                Ok((_, d)) => { if r2.send(&d).await.is_err() { break; } }
                 Err(_) => break,
             }
         }
@@ -573,7 +567,8 @@ fn spawn_reader(
         let pid = conn.peer_id();
         loop {
             match conn.recv().await {
-                Ok(data) => {
+                Ok((ft, data)) => {
+                    if ft != FrameType::Data { continue; }
                     use base64::Engine;
                     let b64 = base64::engine::general_purpose::STANDARD.encode(&data);
                     let _ = ipc.send(IpcResponse::Event {
@@ -615,8 +610,9 @@ fn spawn_reconnect(
             // Reader phase
             loop {
                 tokio::select! {
-                    data = current.recv() => match data {
-                        Ok(data) => {
+                    result = current.recv() => match result {
+                        Ok((ft, data)) => {
+                            if ft != FrameType::Data { continue; }
                             use base64::Engine;
                             let b64 = base64::engine::general_purpose::STANDARD.encode(&data);
                             let _ = ipc.send(IpcResponse::Event {
@@ -771,9 +767,9 @@ mod tests {
         fn path(&self) -> PathType { PathType::Direct }
         async fn send(&self, _data: &[u8]) -> Result<(), CoreError> { Ok(()) }
         fn close(&self) {}
-        async fn recv(&self) -> Result<Vec<u8>, CoreError> {
+        async fn recv(&self) -> Result<(FrameType, Vec<u8>), CoreError> {
             if self.fail_recv { Err(CoreError::InvalidEndpoint("mock fail".into())) }
-            else { Ok(b"mock data".to_vec()) }
+            else { Ok((FrameType::Data, b"mock data".to_vec())) }
         }
     }
 
@@ -906,19 +902,22 @@ mod tests {
     #[test]
     fn test_is_relay_request_detects_relay_connect() {
         let frame = frame::encode_frame(1, FrameType::RelayConnect, &[0u8; 64]);
-        assert!(is_relay_request(&frame));
+        // Accept handler checks ft == FrameType::RelayConnect after recv()
+        let (_, ft, _, _) = frame::decode_frame_header(&frame).unwrap();
+        assert_eq!(ft, FrameType::RelayConnect);
     }
 
     #[test]
     fn test_is_relay_request_rejects_data_frame() {
         let frame = frame::encode_frame(1, FrameType::Data, b"hello");
-        assert!(!is_relay_request(&frame));
+        let (_, ft, _, _) = frame::decode_frame_header(&frame).unwrap();
+        assert_eq!(ft, FrameType::Data);
     }
 
     #[test]
     fn test_is_relay_request_rejects_garbage() {
-        assert!(!is_relay_request(b"not a frame"));
-        assert!(!is_relay_request(&[]));
+        assert!(frame::decode_frame_header(b"not a frame").is_none());
+        assert!(frame::decode_frame_header(&[]).is_none());
     }
 
     #[test]

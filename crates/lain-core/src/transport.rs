@@ -1,5 +1,6 @@
 use crate::endpoint::Endpoint;
 use crate::error::CoreError;
+use crate::frame::FrameType;
 use crate::peer::PeerId;
 use std::net::SocketAddr;
 
@@ -14,7 +15,9 @@ pub enum PathType {
 pub trait Connection: Send + Sync {
     fn peer_id(&self) -> PeerId;
     async fn send(&self, data: &[u8]) -> Result<(), CoreError>;
-    async fn recv(&self) -> Result<Vec<u8>, CoreError>;
+    /// 返回 (FrameType, payload)。Data 帧的 payload 是应用数据，
+    /// RelayConnect 等控制帧由调用方自行处理。
+    async fn recv(&self) -> Result<(FrameType, Vec<u8>), CoreError>;
     fn close(&self);
     fn path(&self) -> PathType;
     fn rtt_ms(&self) -> Option<u64> { None }

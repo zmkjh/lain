@@ -11,6 +11,7 @@ use std::time::Duration;
 
 use lain_core::crypto::CryptoProvider;
 use lain_core::endpoint::{Endpoint, EndpointKind};
+use lain_core::frame::FrameType;
 use lain_core::identity::IdentityProvider;
 use lain_core::peer::PeerId;
 use lain_core::transport::{Connection, Transport};
@@ -81,8 +82,9 @@ async fn quic_connect_and_accept() {
     conn_a.send(msg).await.unwrap();
 
     let conn_b = handle.await.unwrap();
-    let received = conn_b.recv().await.unwrap();
-    assert_eq!(received, msg);
+    let (ft, payload) = conn_b.recv().await.unwrap();
+    assert_eq!(ft, FrameType::Data);
+    assert_eq!(payload, msg);
 }
 
 #[tokio::test]
@@ -126,12 +128,14 @@ async fn peek_connection_replays_first_message() {
     ).await.unwrap().unwrap();
 
     // 模拟 daemon accept handler: 先 recv(), 再 wrap 成 PeekConnection
-    let first = conn.recv().await.unwrap();
-    assert_eq!(&first, b"hello peek", "first message should be payload, not frame");
+    let (ft, first) = conn.recv().await.unwrap();
+    assert_eq!(ft, FrameType::Data, "should receive Data frame");
+    assert_eq!(first, b"hello peek", "first message should be payload, not frame");
 
     let _peeked = PeekConnection::new(conn, first.clone());
     // peeked 第一次 recv 应该返回缓存的消息
-    let replayed = _peeked.recv().await.unwrap();
+    let (ft2, replayed) = _peeked.recv().await.unwrap();
+    assert_eq!(ft2, FrameType::Data);
     assert_eq!(replayed, first);
 
     h.await.unwrap();

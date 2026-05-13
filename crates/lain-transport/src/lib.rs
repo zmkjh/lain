@@ -52,25 +52,20 @@ impl Connection for QuicConnection {
         Ok(())
     }
 
-    async fn recv(&self) -> Result<Vec<u8>, CoreError> {
+    async fn recv(&self) -> Result<(FrameType, Vec<u8>), CoreError> {
         loop {
             let (_, mut recv) = self.quic.accept_bi().await
                 .map_err(|e| CoreError::InvalidEndpoint(e.to_string()))?;
             let data = recv.read_to_end(65536).await
                 .map_err(|e| CoreError::InvalidEndpoint(e.to_string()))?;
-            // Each QUIC stream carries one Lain frame. Decode the header.
-            if let Some((_, ft, plen, hlen)) = frame::decode_frame_header(&data) {
-                if ft == FrameType::Data {
-                    let payload = data.get(hlen..hlen + plen as usize)
-                        .unwrap_or(&[]).to_vec();
-                    return Ok(payload);
-                }
-                // Control frames: skip silently
-                continue;
-            }
-            // Raw data (legacy or empty) — pass through
             if data.is_empty() { continue; }
-            return Ok(data);
+            if let Some((_, ft, plen, hlen)) = frame::decode_frame_header(&data) {
+                let payload = data.get(hlen..hlen + plen as usize)
+                    .unwrap_or(&[]).to_vec();
+                return Ok((ft, payload));
+            }
+            // Legacy: raw data without frame header — treat as Data
+            return Ok((FrameType::Data, data));
         }
     }
 
@@ -138,7 +133,7 @@ impl Connection for TcpConnection {
             .map_err(|e| CoreError::InvalidEndpoint(e.to_string()))
     }
 
-    async fn recv(&self) -> Result<Vec<u8>, CoreError> {
+    async fn recv(&self) -> Result<(FrameType, Vec<u8>), CoreError> {
         loop {
             let mut header = [0u8; 8];
             { let mut s = self.inner.stream.lock().await;
@@ -153,7 +148,7 @@ impl Connection for TcpConnection {
             }
             let data = { let mut n = self.inner.noise.lock().await; n.decrypt(&payload)? };
             if data.is_empty() { continue; }
-            return Ok(data);
+            return Ok((FrameType::Data, data));
         }
     }
 
@@ -513,9 +508,9 @@ impl Connection for PeekConnection {
     async fn send(&self, data: &[u8]) -> Result<(), CoreError> { self.inner.send(data).await }
     fn close(&self) { self.inner.close() }
 
-    async fn recv(&self) -> Result<Vec<u8>, CoreError> {
+    async fn recv(&self) -> Result<(FrameType, Vec<u8>), CoreError> {
         if let Some(data) = self.peek.lock().await.take() {
-            return Ok(data);
+            return Ok((FrameType::Data, data));
         }
         self.inner.recv().await
     }
@@ -564,12 +559,12 @@ mod tests {
         async fn send(&self, _data: &[u8]) -> Result<(), CoreError> { Ok(()) }
         fn close(&self) {}
 
-        async fn recv(&self) -> Result<Vec<u8>, CoreError> {
+        async fn recv(&self) -> Result<(FrameType, Vec<u8>), CoreError> {
             let mut msgs = self.messages.lock().await;
             if msgs.is_empty() {
                 return Err(CoreError::InvalidEndpoint("no more messages".into()));
             }
-            Ok(msgs.remove(0))
+            Ok((FrameType::Data, msgs.remove(0)))
         }
     }
 
@@ -580,11 +575,11 @@ mod tests {
         let peek = PeekConnection::new(inner, b"buffered".to_vec());
 
         // First recv returns the buffered message
-        assert_eq!(peek.recv().await.unwrap(), b"buffered");
+        assert_eq!(peek.recv().await.unwrap(), (FrameType::Data, b"buffered".to_vec()));
         // Second recv delegates to inner
-        assert_eq!(peek.recv().await.unwrap(), b"first");
+        assert_eq!(peek.recv().await.unwrap(), (FrameType::Data, b"first".to_vec()));
         // Third recv delegates to inner
-        assert_eq!(peek.recv().await.unwrap(), b"second");
+        assert_eq!(peek.recv().await.unwrap(), (FrameType::Data, b"second".to_vec()));
         // Fourth recv fails (no more messages)
         assert!(peek.recv().await.is_err());
     }
@@ -605,6 +600,6 @@ mod tests {
         let inner = Box::new(MockConnection { pid: PeerId([3u8; 32]), messages: tokio::sync::Mutex::new(vec![b"data".to_vec()]) }) as Box<dyn Connection>;
         let peek = PeekConnection::new(inner, b"x".to_vec());
         let recovered = peek.into_inner();
-        assert_eq!(recovered.recv().await.unwrap(), b"data");
+        assert_eq!(recovered.recv().await.unwrap(), (FrameType::Data, b"data".to_vec()));
     }
 }
