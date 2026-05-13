@@ -312,8 +312,12 @@ impl Transport {
                 for &ra in tso_endpoints {
                     let tx = tx.clone();
                     tokio::spawn(async move {
-                        use tokio::net::TcpSocket;
-                        if let Ok(s) = TcpSocket::new_v4() {
+                        let s = if ra.is_ipv4() {
+                            tokio::net::TcpSocket::new_v4()
+                        } else {
+                            tokio::net::TcpSocket::new_v6()
+                        };
+                        if let Ok(s) = s {
                             s.set_reuseaddr(true).ok();
                             if s.bind(la).is_ok() {
                                 if let Ok(Ok(s)) = tokio::time::timeout(
