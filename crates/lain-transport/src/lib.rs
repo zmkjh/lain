@@ -106,12 +106,10 @@ impl TcpConnection {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(keepalive_secs));
             loop {
                 interval.tick().await;
-                let ct = {
-                    let mut n = ka.noise.lock().await;
-                    match n.encrypt(b"") { Ok(c) => c, Err(_) => break }
-                };
-                let frame = encode_handshake_frame(0, &ct);
                 let mut s = ka.stream.lock().await;
+                let mut n = ka.noise.lock().await;
+                let ct = match n.encrypt(b"") { Ok(c) => c, Err(_) => break };
+                let frame = encode_handshake_frame(0, &ct);
                 if s.write_all(&frame).await.is_err() { break; }
             }
         });
@@ -125,8 +123,8 @@ impl Connection for TcpConnection {
     fn path(&self) -> PathType { PathType::TSO }
 
     async fn send(&self, _ft: FrameType, data: &[u8]) -> Result<(), CoreError> {
-        let mut noise = self.inner.noise.lock().await;
         let mut stream = self.inner.stream.lock().await;
+        let mut noise = self.inner.noise.lock().await;
         let ct = noise.encrypt(data)?;
         let frame = encode_handshake_frame(0, &ct);
         stream.write_all(&frame).await
@@ -433,7 +431,7 @@ async fn tso_handshake(
             .map_err(|e| TransportError::Noise(e.to_string()))?
     };
 
-    if we_init {
+    let remote_id = if we_init {
         let ik1 = noise.write_message(my_id)
             .map_err(|e| TransportError::Noise(e.to_string()))?;
         stream.write_all(&encode_handshake_frame(0, &ik1)).await
@@ -444,24 +442,28 @@ async fn tso_handshake(
         let h = parse_frame_header(&buf[..n])
             .map_err(|e| TransportError::Noise(e.to_string()))?;
         noise.read_message(&buf[8..8 + h.payload_len.min(n - 8)])
-            .map_err(|e| TransportError::Noise(e.to_string()))?;
+            .map_err(|e| TransportError::Noise(e.to_string()))?
     } else {
         let mut buf = vec![0u8; 4096];
         let n = stream.read(&mut buf).await
             .map_err(|e| TransportError::Io(e.to_string()))?;
         let h = parse_frame_header(&buf[..n])
             .map_err(|e| TransportError::Noise(e.to_string()))?;
-        noise.read_message(&buf[8..8 + h.payload_len.min(n - 8)])
+        let rid = noise.read_message(&buf[8..8 + h.payload_len.min(n - 8)])
             .map_err(|e| TransportError::Noise(e.to_string()))?;
         let ik2 = noise.write_message(my_id)
             .map_err(|e| TransportError::Noise(e.to_string()))?;
         stream.write_all(&encode_handshake_frame(0, &ik2)).await
             .map_err(|e| TransportError::Io(e.to_string()))?;
+        rid
+    };
+    if remote_id != peer_id {
+        return Err(TransportError::Connect("peer_id mismatch".into()));
     }
 
     let session = noise.into_transport()
         .map_err(|e| TransportError::Noise(e.to_string()))?;
-    Ok(Box::new(TcpConnection::new(stream, session, peer_id, keepalive_secs).await))
+    Ok(Box::new(TcpConnection::new(stream, session, remote_id, keepalive_secs).await))
 }
 
 // ── Helpers ──
