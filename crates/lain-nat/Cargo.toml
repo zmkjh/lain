@@ -12,3 +12,4 @@ tokio = { workspace = true, features = ["net"] }
 tracing.workspace = true
 bytes.workspace = true
 rand.workspace = true
+if-addrs.workspace = true

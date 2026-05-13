@@ -108,18 +108,12 @@ impl Daemon {
             addrs
         };
         let nat = NatProbe::new(stun_addrs, 10).probe().await?;
-        tracing::info!("NAT: {:?}, IPv6: {}", nat.nat_type, nat.ipv6_inbound);
+        let ipv6_desc = nat.ipv6_addr.map(|a| a.to_string()).unwrap_or_else(||
+            if nat.ipv6_inbound { "stack only (no global address)".into() } else { "no".into() }
+        );
+        tracing::info!("NAT: {:?}, IPv6: {}", nat.nat_type, ipv6_desc);
 
-        let ipv6_addr = if nat.ipv6_inbound {
-            if_addrs::get_if_addrs().ok().and_then(|ifs| {
-                ifs.into_iter().find_map(|i| match i.addr {
-                    if_addrs::IfAddr::V6(v6) if !v6.ip.is_loopback() && !v6.ip.is_unspecified()
-                        && (v6.ip.segments()[0] & 0xE000) == 0x2000 =>
-                        Some(v6.ip),
-                    _ => None,
-                })
-            })
-        } else { None };
+        let ipv6_addr = nat.ipv6_addr;
 
         let bind_addr = if ipv6_addr.is_some() {
             "[::]:0".parse().unwrap_or(SocketAddr::from(([0,0,0,0], 0)))
@@ -302,7 +296,7 @@ impl Daemon {
                         tokio::spawn(async move {
                             // Skip control frames (HEADERS sent by try_quic) until we
                             // get a Data or RelayConnect message.
-                            let (ft, first) = loop {
+                            let (_, first) = loop {
                                 match conn.recv().await {
                                     Ok((ft, data)) => match ft {
                                         FrameType::RelayConnect => {

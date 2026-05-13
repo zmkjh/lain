@@ -53,8 +53,20 @@ impl NatProbe {
         None
     }
 
-    fn ipv6_available() -> bool {
-        UdpSocket::bind("[::1]:0").is_ok()
+    fn ipv6_status() -> (bool, Option<std::net::Ipv6Addr>) {
+        let v6_avail = UdpSocket::bind("[::1]:0").is_ok();
+        let global = if v6_avail {
+            if_addrs::get_if_addrs().ok().and_then(|ifs| {
+                    ifs.into_iter().find_map(|i| match i.addr {
+                        if_addrs::IfAddr::V6(v6)
+                            if !v6.ip.is_loopback()
+                               && (v6.ip.segments()[0] & 0xE000) == 0x2000 =>
+                            Some(v6.ip),
+                        _ => None,
+                    })
+                })
+        } else { None };
+        (v6_avail, global)
     }
 }
 
@@ -76,9 +88,11 @@ impl NatProber for NatProbe {
         }
 
         if results.is_empty() {
+            let status = Self::ipv6_status();
             return Ok(NatProbeResult {
                 nat_type: NatType::Unknown,
-                ipv6_inbound: Self::ipv6_available(),
+                ipv6_inbound: status.0,
+                ipv6_addr: status.1,
                 mapped_addr: None,
                 port_delta: None,
                 stun_rtt_ms: None,
@@ -117,9 +131,11 @@ impl NatProber for NatProbe {
                        else if ip_same { NatType::ADFSymmetric }
                        else { NatType::APDFSymmetric };
 
+        let status = Self::ipv6_status();
         Ok(NatProbeResult {
             nat_type,
-            ipv6_inbound: Self::ipv6_available(),
+            ipv6_inbound: status.0,
+            ipv6_addr: status.1,
             mapped_addr: Some(base),
             port_delta,
             stun_rtt_ms: Some(rtt),

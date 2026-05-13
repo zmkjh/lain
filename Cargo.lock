@@ -931,6 +931,7 @@ version = "0.1.2"
 dependencies = [
  "async-trait",
  "bytes",
+ "if-addrs",
  "lain-core",
  "rand 0.8.6",
  "thiserror 2.0.18",

@@ -3,13 +3,9 @@ use crate::error::CoreError;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
 pub enum NatType {
-    /// 不可达 / 未探测
     Unknown = 0,
-    /// Endpoint-Independent Mapping (Cone NAT)
     Cone = 1,
-    /// Address-Dependent Filtering + Endpoint-Dependent Mapping
     ADFSymmetric = 2,
-    /// Address+Port-Dependent Filtering + Endpoint-Dependent Mapping
     APDFSymmetric = 3,
 }
 
@@ -17,7 +13,6 @@ impl NatType {
     pub fn is_symmetric(self) -> bool {
         matches!(self, NatType::ADFSymmetric | NatType::APDFSymmetric)
     }
-
     pub fn is_apdf(self) -> bool {
         matches!(self, NatType::APDFSymmetric)
     }
@@ -27,13 +22,12 @@ impl NatType {
 #[derive(Clone, Debug)]
 pub struct NatProbeResult {
     pub nat_type: NatType,
+    /// IPv6 协议栈是否可用（可绑定 loopback）
     pub ipv6_inbound: bool,
+    /// 全局可路由的 IPv6 地址（2000::/3），如果有则 ipv6_inbound 也为 true
+    pub ipv6_addr: Option<std::net::Ipv6Addr>,
     pub mapped_addr: Option<std::net::SocketAddr>,
-    /// NAT port delta: difference between mapped ports of adjacent internal ports.
-    /// Some(1) means port-preserving (ideal for TSO).
-    /// None means couldn't determine.
     pub port_delta: Option<u16>,
-    /// STUN round-trip time in milliseconds
     pub stun_rtt_ms: Option<u64>,
 }
 
