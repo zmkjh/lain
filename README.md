@@ -178,6 +178,32 @@ Known:     1
 | `lain status` | 查看网络状态 |
 | `lain shutdown` | 停止 daemon |
 
+## 配置文件
+
+daemon 启动时自动读取当前目录下的 `lain.toml` 或 `config.toml`。不存在则使用默认值。
+
+```toml
+# STUN 服务器（用于 NAT 探测，获取公网映射地址）
+stun_servers = ["stun.qq.com:3478", "stun.miwifi.com:3478", "stun.l.google.com:19302"]
+
+[dht]
+k = 20                     # 路由表桶大小
+alpha = 3                  # 并行查询数
+bootstrap_nodes = []       # 启动时手动指定种子节点（一般不填）
+
+[transport]
+tso_port_start = 50000     # TSO 端口起始（双方必须一致，运营商封端口时换一个范围）
+```
+
+### 典型场景：TSO 端口被封
+
+两边运营商封锁 50000-50007 时，改为其他范围（双方一致）：
+
+```toml
+[transport]
+tso_port_start = 30000
+```
+
 ## 连接路径
 
 daemon 自动选择最优路径连接 peer：
