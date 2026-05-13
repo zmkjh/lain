@@ -300,13 +300,21 @@ impl Daemon {
                         let c = connected.clone();
                         let k = known_peers.clone();
                         tokio::spawn(async move {
-                            let (ft, first) = match conn.recv().await {
-                                Ok(r) => r, Err(_) => return,
+                            // Skip control frames (HEADERS sent by try_quic) until we
+                            // get a Data or RelayConnect message.
+                            let (ft, first) = loop {
+                                match conn.recv().await {
+                                    Ok((ft, data)) => match ft {
+                                        FrameType::RelayConnect => {
+                                            handle_relay(conn, &data[8..], d, t).await;
+                                            return;
+                                        }
+                                        FrameType::Data => break (ft, data),
+                                        _ => continue,
+                                    }
+                                    Err(_) => return,
+                                }
                             };
-                            if ft == FrameType::RelayConnect {
-                                handle_relay(conn, &first[8..], d, t).await;
-                                return;
-                            }
                             let conn = PeekConnection::new(conn, first);
                             let conn = Arc::new(conn) as Arc<dyn Connection>;
                             let (cancel_tx, cancel_rx) = watch::channel(false);
