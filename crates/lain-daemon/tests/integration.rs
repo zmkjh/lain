@@ -5,6 +5,7 @@
 #![deny(clippy::expect_used)]
 #![deny(clippy::panic)]
 
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -136,33 +137,42 @@ async fn peek_connection_replays_first_message() {
     h.await.unwrap();
 }
 
-/// TSO 需要双方同时 bind+connect，在 localhost 上端口竞争导致不可靠。
-/// 在真实网络（不同 IP）上工作正常。
+/// TSO 依赖 TCP simultaneous open（RFC 793 §3.4）。
+/// Linux 支持，Windows 不支持（SYN 碰撞时返回 WSAECONNREFUSED）。
+/// 此测试在 Linux 上可运行，Windows 上标记忽略。
 #[tokio::test]
-#[ignore]
+#[cfg_attr(target_os = "windows", ignore)]
 async fn tso_handshake() {
-    // 测试 TSO 连接（TCP simultaneous open）
     let a = TestNode::new().await;
     let b = TestNode::new().await;
-    let b_addr = b.transport.local_addr().unwrap();
-    let a_addr = a.transport.local_addr().unwrap();
 
-    // TSO 需要双方同时 connect
+    // TSO 使用端口 50000-50007，双方通过 SO_REUSEADDR 同时 bind+connect
+    let tso_eps: Vec<SocketAddr> = (0..8u16).map(|i| {
+        SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), 50000 + i)
+    }).collect();
+
     let b_t = b.transport.clone();
     let a_t = a.transport.clone();
     let b_pid = b.peer_id;
+    let tso_clone = tso_eps.clone();
 
-    tokio::spawn(async move {
-        // B 发起到 A 的 TSO
-        let _ = tokio::time::timeout(Duration::from_secs(15),
-            b_t.connect_tso(a.peer_id, &[a_addr], None, None)
+    let h = tokio::spawn(async move {
+        let _ = tokio::time::timeout(Duration::from_secs(20),
+            b_t.connect_tso(a.peer_id, &tso_clone, Some(1), Some(10))
         ).await;
     });
 
-    let conn = tokio::time::timeout(Duration::from_secs(15),
-        a_t.connect_tso(b_pid, &[b_addr], None, None)
-    ).await.unwrap().unwrap();
+    let conn = tokio::time::timeout(Duration::from_secs(20),
+        a_t.connect_tso(b_pid, &tso_eps, Some(1), Some(10))
+    ).await;
+
+    let conn = match conn {
+        Ok(Ok(c)) => c,
+        Ok(Err(e)) => { h.await.unwrap_or(()); panic!("TSO A failed: {e}"); }
+        Err(_) => { h.await.unwrap_or(()); panic!("TSO A timed out"); }
+    };
 
     assert_eq!(conn.peer_id(), b.peer_id);
     conn.send(b"tso works").await.unwrap();
+    h.await.unwrap_or(());
 }
