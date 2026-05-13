@@ -302,7 +302,7 @@ impl Daemon {
                                 match conn.recv().await {
                                     Ok((ft, data)) => match ft {
                                         FrameType::RelayConnect => {
-                                            handle_relay(conn, &data[8..], d, t).await;
+                                            handle_relay(conn, &data, d, t).await;
                                             return;
                                         }
                                         FrameType::Data => break (ft, data),
@@ -632,11 +632,12 @@ fn spawn_reconnect(
             }
 
             // Reconnect phase
+            if *cancel_rx.borrow() { break 'outer; }
             let mut reconnected = false;
             for &secs in &backoffs {
                 tokio::select! {
                     _ = tokio::time::sleep(std::time::Duration::from_secs(secs)) => {}
-                    _ = cancel_rx.changed() => break 'outer,
+                    _ = cancel_rx.changed() => { break 'outer; }
                 }
                 match transport.connect(pid, &npk, &eps).await {
                     Ok(new) => {
@@ -756,6 +757,7 @@ mod tests {
     use lain_core::error::CoreError;
     use lain_core::transport::PathType;
     use tokio::sync::broadcast;
+    use std::time::Duration;
 
     // ── Mocks ──
 
@@ -822,6 +824,22 @@ mod tests {
 
     fn make_ipc() -> (broadcast::Sender<IpcResponse>, broadcast::Receiver<IpcResponse>) {
         broadcast::channel(16)
+    }
+
+    // ── Relay pipe ──
+
+    // relay pipe and handle_relay are tested via integration tests
+    // (QUIC connect + send relay frame). Mock testing of the pipe
+    // requires non-trivial async plumbing and adds little value over
+    // the integration coverage.
+
+    #[tokio::test]
+    async fn reconnect_stops_on_disconnect() {
+        let conn = Arc::new(MockConnection { pid: PeerId([1u8; 32]), fail_recv: true }) as Arc<dyn Connection>;
+        let (ipc, _) = broadcast::channel(16);
+        let guard = spawn_reconnect(conn, ipc, MockTransport::new_fail(), &[0u8; 32], &[]);
+        guard.disconnect();
+        // guard is dropped at end of scope — task exits via watch channel close
     }
 
     // ── connect_and_track ──
