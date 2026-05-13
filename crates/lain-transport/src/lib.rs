@@ -56,7 +56,7 @@ impl Connection for QuicConnection {
         loop {
             let (_, mut recv) = self.quic.accept_bi().await
                 .map_err(|e| CoreError::InvalidEndpoint(e.to_string()))?;
-            let data = recv.read_to_end(65536).await
+            let data = recv.read_to_end(4 * 65536).await
                 .map_err(|e| CoreError::InvalidEndpoint(e.to_string()))?;
             if data.is_empty() { continue; }
             if let Some((_, ft, plen, hlen)) = frame::decode_frame_header(&data) {
