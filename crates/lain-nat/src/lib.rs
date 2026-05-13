@@ -26,32 +26,6 @@ struct ProbeAttempt {
 }
 
 impl NatProbe {
-    async fn bind_socket(&self) -> Result<UdpSocket, CoreError> {
-        let s = UdpSocket::bind("0.0.0.0:0").await
-            .map_err(|e| CoreError::InvalidEndpoint(e.to_string()))?;
-        Ok(s)
-    }
-
-    /// 向单个 STUN server 并发发 Binding Request，返回 mapped address，重试 1 次
-    async fn stun_once(&self, socket: &UdpSocket, server: SocketAddr) -> Option<ProbeAttempt> {
-        let start = Instant::now();
-        for _ in 0..2 {
-            let (req, tid) = build_binding_request();
-            if socket.send_to(&req, server).await.is_err() { continue; }
-
-            let mut buf = [0u8; 1024];
-            match tokio::time::timeout(self.timeout, socket.recv_from(&mut buf)).await {
-                Ok(Ok((len, _))) => {
-                    if let Some(addr) = parse_mapped(&buf[..len], &tid) {
-                        return Some(ProbeAttempt { mapped: addr, rtt: start.elapsed() });
-                    }
-                }
-                _ => continue,
-            }
-        }
-        None
-    }
-
     pub async fn ipv6_status() -> (bool, Option<std::net::Ipv6Addr>) {
         let v6_avail = tokio::net::UdpSocket::bind("[::1]:0").await.is_ok();
         let global = if v6_avail {
@@ -69,20 +43,47 @@ impl NatProbe {
     }
 }
 
+/// 单个 STUN server 独立探测任务
+async fn probe_server(timeout: Duration, server: SocketAddr) -> Option<(SocketAddr, Duration)> {
+    let socket = UdpSocket::bind("0.0.0.0:0").await.ok()?;
+    for _ in 0..2 {
+        let start = Instant::now();
+        let (req, tid) = build_binding_request();
+        if socket.send_to(&req, server).await.is_err() { continue; }
+
+        let mut buf = [0u8; 1024];
+        match tokio::time::timeout(timeout, socket.recv_from(&mut buf)).await {
+            Ok(Ok((len, _))) => {
+                if let Some(addr) = parse_mapped(&buf[..len], &tid) {
+                    return Some((addr, start.elapsed()));
+                }
+            }
+            _ => continue,
+        }
+    }
+    None
+}
+
 #[async_trait::async_trait]
 impl NatProber for NatProbe {
     async fn probe(&self) -> Result<NatProbeResult, CoreError> {
-        let socket = self.bind_socket().await?;
-
+        // 并发探测所有服务器，每个服务器独立 socket
         let mut results: Vec<ProbeAttempt> = Vec::new();
         let mut rtt_total: u64 = 0;
 
-        for &server in &self.servers {
-            if let Some(a) = self.stun_once(&socket, server).await {
-                rtt_total += a.rtt.as_millis() as u64;
-                results.push(a);
+        if !self.servers.is_empty() {
+            let mut handles = Vec::new();
+            for &server in &self.servers {
+                let t = self.timeout;
+                handles.push(tokio::spawn(async move { probe_server(t, server).await }));
             }
-            if results.len() >= 2 { break; }
+            for h in handles {
+                if let Ok(Some((addr, rtt))) = h.await {
+                    rtt_total += rtt.as_millis() as u64;
+                    results.push(ProbeAttempt { mapped: addr, rtt });
+                    if results.len() >= 2 { break; }
+                }
+            }
         }
 
         if results.is_empty() {
@@ -97,18 +98,11 @@ impl NatProber for NatProbe {
             });
         }
 
-        let rtt = rtt_total / results.len() as u64;
+        let avg_rtt = rtt_total / results.len() as u64;
         let base = results[0].mapped;
-
-        // 判断 endpoint-independent vs endpoint-dependent mapping
-        //
-        // 原理：向不同服务器发送 Binding Request。
-        //   - 所有服务器返回的 mapped address 相同 → EIM (Cone)
-        //   - 返回的 IP 相同但 port 不同 → EDM (Symmetric)
         let all_same = results.iter().all(|r| r.mapped == base);
         let ip_same = results.iter().all(|r| r.mapped.ip() == base.ip());
 
-        // 端口 delta
         let deltas: Vec<u16> = if results.len() >= 2 {
             results.windows(2).filter_map(|w| {
                 let d = w[0].mapped.port().abs_diff(w[1].mapped.port());
@@ -120,11 +114,6 @@ impl NatProber for NatProbe {
             else if deltas.windows(2).all(|w| w[0] == w[1]) { deltas.first().copied() }
             else { None };
 
-        // Filtering behavior: from single server data we can't determine ADF vs APDF.
-        // The simpler classification (Cone vs Symmetric) is sufficient for routing.
-        // ADF vs APDF only affects whether same-IP-different-port can reach us,
-        // which doesn't change our layer 1/2/3 strategy.
-        // Default to ADFSymmetric (less conservative than APDF) when EDM detected.
         let nat_type = if all_same { NatType::Cone }
                        else if ip_same { NatType::ADFSymmetric }
                        else { NatType::APDFSymmetric };
@@ -136,7 +125,7 @@ impl NatProber for NatProbe {
             ipv6_addr: status.1,
             mapped_addr: Some(base),
             port_delta,
-            stun_rtt_ms: Some(rtt),
+            stun_rtt_ms: Some(avg_rtt),
         })
     }
 }

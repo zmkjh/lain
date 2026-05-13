@@ -8,7 +8,7 @@ license.workspace = true
 lain-core = { path = "../lain-core" }
 thiserror.workspace = true
 async-trait.workspace = true
-tokio = { workspace = true, features = ["net", "time"] }
+tokio = { workspace = true, features = ["net", "time", "rt"] }
 tracing.workspace = true
 bytes.workspace = true
 rand.workspace = true

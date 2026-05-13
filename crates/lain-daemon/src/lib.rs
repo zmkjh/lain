@@ -111,7 +111,7 @@ impl Daemon {
             addrs
         };
         let nat = match tokio::time::timeout(
-            Duration::from_secs(6),
+            Duration::from_secs(4),
             NatProbe::new(stun_addrs, 3).probe(),
         ).await {
             Ok(Ok(n)) => n,
