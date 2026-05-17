@@ -7,7 +7,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use lain_core::capabilities::Capabilities;
-use lain_core::dht::{DhtBackend, DhtMsgType, RelayInfo};
+use lain_core::dht::{DhtBackend, DhtMessage, DhtMsgType, RelayInfo};
 use lain_core::dht::DhtEvent as CoreDhtEvent;
 use lain_core::endpoint::Endpoint;
 use lain_core::error::CoreError;
@@ -265,6 +265,14 @@ impl DhtHandle {
         Ok(())
     }
 
+    /// Cache-only lookup of a peer record (no DHT query).
+    pub async fn get_peer_record(&self, peer_id: &PeerId) -> Option<PeerRecord> {
+        let records = self.peer_records.read().await;
+        records.get(peer_id)
+            .filter(|r| r.expires_at > std::time::Instant::now())
+            .cloned()
+    }
+
     /// FIND_VALUE 查找 peer
     pub async fn find_peer(&self, peer_id: &PeerId) -> Result<Option<PeerRecord>, DhtError> {
         // Check cache
@@ -382,7 +390,7 @@ impl DhtHandle {
             .map(|d| d.as_millis())
             .unwrap_or(0);
         let entry = limits.entry(*peer_id).or_insert((now, 0));
-        if now - entry.0 > 1000 {
+        if now.saturating_sub(entry.0) > 1000 {
             entry.0 = now;
             entry.1 = 1;
             true
@@ -392,6 +400,47 @@ impl DhtHandle {
             entry.1 += 1;
             true
         }
+    }
+
+    /// Verify Ed25519 signature on a DHT message.
+    /// Returns Ok if the signature is cryptographically valid, Err otherwise.
+    /// For STORE messages from unknown peers, extracts the pubkey from the payload.
+    async fn verify_signature(&self, msg: &DhtMessage, body: &[u8]) -> Result<(), DhtError> {
+        let sig = match msg.signature {
+            Some(ref s) => s,
+            None => return Err(DhtError::InvalidSignature { peer_id: msg.sender_id }),
+        };
+
+        // Try known peer records first
+        let records = self.peer_records.read().await;
+        if let Some(rec) = records.get(&msg.sender_id) {
+            if let Ok(vk) = ed25519_dalek::VerifyingKey::from_bytes(&rec.pubkey) {
+                let s = ed25519_dalek::Signature::from_bytes(sig);
+                if vk.verify_strict(body, &s).is_err() {
+                    tracing::warn!("bad signature from {}", msg.sender_id);
+                    return Err(DhtError::InvalidSignature { peer_id: msg.sender_id });
+                }
+                return Ok(());
+            }
+        }
+        drop(records);
+
+        // For STORE requests from unknown peers: extract pubkey from payload and verify
+        if msg.msg_type == DhtMsgType::Store && !msg.is_response && msg.payload.len() >= 101 {
+            let mut store_pk = [0u8; 32];
+            store_pk.copy_from_slice(&msg.payload[36..68]);
+            if let Ok(vk) = ed25519_dalek::VerifyingKey::from_bytes(&store_pk) {
+                let s = ed25519_dalek::Signature::from_bytes(sig);
+                if vk.verify_strict(body, &s).is_err() {
+                    tracing::warn!("bad STORE signature from unknown {}", msg.sender_id);
+                    return Err(DhtError::InvalidSignature { peer_id: msg.sender_id });
+                }
+                return Ok(());
+            }
+        }
+
+        // Unknown peer, can't verify
+        Err(DhtError::InvalidSignature { peer_id: msg.sender_id })
     }
 
     /// 后台清理：每 10 分钟移除过期 peer_records
@@ -431,32 +480,35 @@ impl DhtHandle {
             }
         }
 
-        // Verify Ed25519 signature for request messages (response signatures deferred for now)
-        if !msg.is_response {
-            if let Some(ref sig) = msg.signature {
-                if sig.iter().any(|&b| b != 0) {
-                    if data.len() < 64 { return Ok(()); } // too short to have a real signature
-                    let body = &data[..data.len().saturating_sub(64)];
-                    let records = self.peer_records.read().await;
-                    if let Some(rec) = records.get(&msg.sender_id) {
-                        if let Ok(vk) = ed25519_dalek::VerifyingKey::from_bytes(&rec.pubkey) {
-                            let s = ed25519_dalek::Signature::from_bytes(sig);
-                            if vk.verify_strict(body, &s).is_err() {
-                                tracing::warn!("bad signature from {}", msg.sender_id);
-                                return Err(DhtError::InvalidSignature { peer_id: msg.sender_id });
-                            }
+        // Verify Ed25519 signatures for requests and FIND_VALUE responses
+        if !msg.is_response || msg.msg_type == DhtMsgType::FindValue {
+            let has_sig = msg.signature.as_ref().map_or(false, |s| s.iter().any(|&b| b != 0));
+            if has_sig && data.len() >= 64 {
+                let body = &data[..data.len().saturating_sub(64)];
+                let verified = self.verify_signature(&msg, body).await;
+                match verified {
+                    Ok(()) => {} // signature valid
+                    Err(e) => {
+                        if !msg.is_response && msg.msg_type == DhtMsgType::Store {
+                            // STORE from unknown peer with unverifiable signature: REJECT
+                            return Err(e);
                         }
+                        if msg.is_response {
+                            // FIND_VALUE response from unknown sender: cannot verify, silently drop
+                            tracing::debug!("FIND_VALUE response from {}: signature not verifiable, dropping", msg.sender_id);
+                            return Ok(());
+                        }
+                        // Non-STORE request (PING/FIND_NODE) from unknown peer: accept (deferred)
                     }
-                    // Unknown peer or unparseable key: accept (deferred verification)
                 }
             }
         }
 
-        // Reject unsigned FindValue responses when we know the sender's pubkey
+        // Reject unsigned FindValue responses unless they match a pending query
         if msg.is_response && msg.msg_type == DhtMsgType::FindValue {
             if let Some(ref sig) = msg.signature {
                 if sig.iter().all(|&b| b == 0)
-                    && self.peer_records.read().await.contains_key(&msg.sender_id)
+                    && !self.pending_queries.read().await.contains_key(&msg.message_id)
                 {
                     return Ok(());
                 }

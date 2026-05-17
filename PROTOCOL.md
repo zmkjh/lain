@@ -38,11 +38,16 @@ Lain 是一个零服务器 P2P 网络协议。本规范定义两个接口层：
 
 ### 2.2 Ed25519 → X25519 派生
 
+X25519 私钥通过 SHA-256 领域分离 KDF 从 Ed25519 seed 派生：
+
 ```
-seed_bytes = Ed25519 SigningKey::to_bytes()        # 32 bytes
-x25519_secret = x25519_dalek::StaticSecret::from(seed_bytes)
+ed_seed = Ed25519 SigningKey::to_bytes()            # 32 bytes
+x25519_seed = SHA-256("lain-noise-x25519-v1" || ed_seed)
+x25519_secret = x25519_dalek::StaticSecret::from(x25519_seed)
 x25519_public = x25519_dalek::PublicKey::from(&x25519_secret)
 ```
+
+领域分离标签 `"lain-noise-x25519-v1"` 确保 Ed25519 签名密钥和 X25519 交换密钥在密码学上独立，防止同一 seed 被跨协议不当复用。
 
 **注意：** Ed25519 和 X25519 从同一个 seed 产生不同的标量值（Ed25519 预过 SHA-512）。因此 DHT 同时存储两种公钥，应用不可用 Ed25519 公钥替代 X25519 公钥。
 
@@ -81,6 +86,8 @@ QUIC 流上承载 Lain 帧。帧格式：
          payload_len: VarInt
          payload: [u8; payload_len]
 ```
+
+`payload_len` 上限为 **4 MiB**（`MAX_PAYLOAD_SIZE = 4 * 1024 * 1024`）。超过此值的帧头将被拒绝，防止恶意超大分配。
 
 **帧类型：**
 
@@ -189,7 +196,7 @@ QUIC 连接建立后，节点根据 Noise IK 握手确定的 PeerID，将对方�
 
 非响应消息必须携带 Ed25519 签名（消息末尾 64 bytes）。验证逻辑：
 
-1. 签名全零 → 跳过验证（未签名的消息）
+1. 签名全零 → 跳过验证（未签名的消息）。例外：FIND_VALUE 响应若签名全零且 `message_id` 不匹配任何本地待处理查询（`pending_queries`），直接丢弃以防御签名绕过攻击。
 2. 本地 peer_records 中有 sender_id → 用其 Ed25519 pubkey verify_strict(body, sig)
 3. 本地没有 sender_id → 接受（deferred verification，后续 STORE 记录会提供 pubkey）
 

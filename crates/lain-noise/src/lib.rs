@@ -117,7 +117,6 @@ impl CryptoProvider for NoiseProvider {
     }
 }
 
-pub use lain_core::frame::{encode_handshake_frame, parse_handshake_frame_header as parse_frame_header, HandshakeFrameHeader as FrameHeader};
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]

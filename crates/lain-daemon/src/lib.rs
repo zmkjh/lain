@@ -2,6 +2,62 @@
 #![deny(clippy::expect_used)]
 #![deny(clippy::panic)]
 
+//! # Lain Daemon -- Integration Hub
+//!
+//! ## Module Role
+//! daemon orchestrates all crates, initializes each module and wires them together.
+//! It does not implement protocol logic itself, only manages lifecycles and state transitions.
+//!
+//! ## Dependency Graph
+//! ```text
+//! daemon depends on all lower crates:
+//!   lain-core     -> all traits and shared types (IdentityProvider, CryptoProvider,
+//!                    Transport, Connection, DhtBackend, NatProber, InviteCode)
+//!   lain-identity -> Ed25519 identity, X25519 key derivation
+//!   lain-noise    -> CryptoProvider impl (NoiseProvider)
+//!   lain-nat      -> NatProber impl (NatProbe)
+//!   lain-dht      -> DhtBackend impl (DhtHandle), routing table + peer record cache
+//!   lain-discovery -> InviteCode create/parse/verify, mDNS LAN discovery
+//!   lain-transport -> Transport impl (QUIC + TSO), Noise handshake
+//! ```
+//!
+//! ## Connection Lifecycle
+//!
+//! ### Active Connections (connect_cmd / tso_cmd / find_cmd)
+//! 1. Parse invite code or DHT record -> get PeerId + noise_pk + endpoints
+//! 2. Call `transport.connect(pid, noise_pk, endpoints)` or `transport.connect_tso(...)`
+//! 3. Connection succeeds -> Arc::from(Box<dyn Connection>) -> insert into `connected` map
+//! 4. `Arc::ptr_eq` checks old entry ownership, then emit peer_connected event
+//! 5. spawn_reader (read loop) or spawn_reconnect (read loop + reconnect on disconnect)
+//!
+//! ### Passive Accept (transport.accept)
+//! 1. QUIC accept -> Noise IK handshake -> PeerId + X25519 public key
+//! 2. **Identity check** (best-effort): `noise_pubkey()` vs DHT cache
+//!    - DHT record exists and matches -> accept
+//!    - DHT record does not exist -> silently accept (trust Noise handshake)
+//!    - DHT record exists but X25519 mismatch -> reject
+//! 3. Skip CONTROL frames (HEADERS), wait for Data or RelayConnect
+//! 4. insert into `connected` map -> emit peer_connected
+//!
+//! ### Disconnect Cleanup
+//! - `spawn_reader`/`spawn_reconnect` exit: `Arc::ptr_eq` confirms ownership -> remove + emit peer_disconnected
+//! - `DisconnectPeer` command: remove from map -> disconnect guard -> close connection -> emit peer_disconnected
+//! - Connection replacement: insert returns old entry -> `old_guard.disconnect()` + `old.close()`
+//!
+//! ## Key Sources and Trust Chain
+//! | Connection Path | noise_pubkey Source | Trust Verification |
+//! |-----------------|---------------------|--------------------|
+//! | invite code (parse_invite -> connect) | Ed25519 signed field in invite code | Ed25519 signature verification (`verify()` + PeerId check) |
+//! | DHT find_peer -> connect | DHT self-reported record | **None** (self-reported) |
+//! | relay fallback | DHT cached relay node | **None** |
+//! | incoming accept | Noise IK handshake decryption | DHT cache comparison (best-effort) |
+//! | TSO connect | **Not provided** noise_pubkey | PeerId authenticated via Noise payload |
+//!
+//! ## State Management
+//! - `connected: Arc<RwLock<HashMap<PeerId, (Arc<dyn Connection>, ConnectionGuard)>>>` -> current connections
+//! - `known_peers: Arc<RwLock<HashMap<PeerId, Vec<Endpoint>>>>` -> known peer endpoints
+//! - `ConnectionGuard`: watch::Sender<bool> -- `disconnect()` sends cancel signal to reader/reconnect
+
 pub mod config;
 pub mod ipc;
 
@@ -22,7 +78,6 @@ use lain_nat::NatProbe;
 use lain_noise::NoiseProvider;
 use lain_transport::{TransportConfig, PeekConnection};
 use serde::{Deserialize, Serialize};
-use sha2::Digest;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::net::SocketAddr;
@@ -31,6 +86,9 @@ use std::time::Duration;
 use thiserror::Error;
 use tokio::sync::{RwLock, broadcast, watch};
 use tracing;
+
+const TSO_PORT_COUNT: u16 = 8;
+const MAPPABLE_RANGE_SIZE: u16 = 256;
 
 pub use config::DaemonConfig;
 
@@ -136,11 +194,16 @@ impl Daemon {
 
         let ipv6_addr = nat.ipv6_addr;
 
-        let bind_addr = if ipv6_addr.is_some() {
-            "[::]:0".parse().unwrap_or(SocketAddr::from(([0,0,0,0], 0)))
-        } else {
-            "0.0.0.0:0".parse::<SocketAddr>().unwrap()
-        };
+        // Bind address: prefer transport config, then DHT config, then derive from IP stack
+        let bind_addr = self.config.transport.bind_addr
+            .or(self.config.dht.local_addr)
+            .unwrap_or_else(|| {
+                if ipv6_addr.is_some() {
+                    "[::]:0".parse().unwrap_or(SocketAddr::from(([0,0,0,0], 0)))
+                } else {
+                    SocketAddr::from(([0,0,0,0], 0))
+                }
+            });
 
         let (noise_secret, noise_pubkey) = self.identity.noise_keypair();
         let crypto: Arc<dyn CryptoProvider> = Arc::new(NoiseProvider::new(noise_secret));
@@ -153,8 +216,9 @@ impl Daemon {
         let transport_port = transport.local_addr()?.port();
 
         // ── DHT ──
+        let dht_local = self.config.dht.local_addr.unwrap_or(bind_addr);
         let mut dht = DhtHandle::new(peer_id, public_key, lain_dht::DhtConfig {
-            local_addr: bind_addr, ..Default::default()
+            local_addr: dht_local, ..Default::default()
         }).map_err(|e| DaemonError::Dht(e.to_string()))?;
         dht.set_signer(self.identity.signing_seed());
 
@@ -179,7 +243,7 @@ impl Daemon {
                 if let if_addrs::IfAddr::V4(v4) = &iface.addr {
                     if !v4.ip.is_loopback() {
                         let ps = self.config.transport.tso_port_start;
-                        for i in 0..8u16 {
+                        for i in 0..TSO_PORT_COUNT {
                             eps.push(Endpoint::new(SocketAddr::new(std::net::IpAddr::V4(v4.ip), ps + i), EndpointKind::TSO));
                         }
                     }
@@ -189,7 +253,7 @@ impl Daemon {
         if let Some(stun) = nat.mapped_addr {
             let ps = self.config.transport.tso_port_start;
             eps.push(Endpoint::new(SocketAddr::new(stun.ip(), transport_port), EndpointKind::STUN));
-            for i in 0..8u16 {
+            for i in 0..TSO_PORT_COUNT {
                 eps.push(Endpoint::new(SocketAddr::new(stun.ip(), ps + i), EndpointKind::TSO));
             }
         }
@@ -203,7 +267,10 @@ impl Daemon {
         dht.spawn_cleanup();
 
         // ── mDNS ──
-        let dht_port = dht.socket().local_addr().map(|a| a.port()).unwrap_or(53617);
+        let dht_port = dht.socket().local_addr().map(|a| a.port()).unwrap_or_else(|_| {
+            tracing::warn!("DHT socket local_addr failed, mDNS will not work correctly");
+            0
+        });
         let dht_mdns = dht.clone();
         tokio::spawn(async move { let _ = mdns_loop(peer_id, dht_port, dht_mdns).await; });
 
@@ -228,7 +295,6 @@ impl Daemon {
         // ── Main loop ──
         let mut dht_buf = vec![0u8; 2048];
         let mut heartbeat = tokio::time::interval(std::time::Duration::from_secs(300));
-        let mut ev_rx = ipc_ev.subscribe();
         loop {
             tokio::select! {
                 recv = dht_socket.recv_from(&mut dht_buf) => {
@@ -260,11 +326,11 @@ impl Daemon {
                         if let Some((conn, guard)) = connected.write().await.remove(&peer_id) {
                             guard.disconnect();
                             conn.close();
+                            let _ = ipc_ev.send(IpcResponse::Event {
+                                event: "peer_disconnected".into(),
+                                peer_id: Some(peer_id.to_string()), data: None,
+                            });
                         }
-                        let _ = ipc_ev.send(IpcResponse::Event {
-                            event: "peer_disconnected".into(),
-                            peer_id: Some(peer_id.to_string()), data: None,
-                        });
                     }
                     IpcCommand::SendToPeer { peer_id, data, reply } => {
                         let cons = connected.read().await;
@@ -300,29 +366,23 @@ impl Daemon {
                     }
                     IpcCommand::GetWhoami { reply } => { let _ = reply.send(peer_id.to_string()); }
                     IpcCommand::GetInviteCode { reply } => {
-                        let mut inv = lain_discovery::InviteCode::new(
+                        let ps = self.config.transport.tso_port_start;
+                        let delta = nat.port_delta.unwrap_or(0);
+                        let pd_hint = if delta > 255 {
+                            tracing::warn!("port_delta {delta} > 255, using 0 in invite");
+                            0u8
+                        } else {
+                            delta as u8
+                        };
+                        let inv = lain_discovery::InviteCode::new(
                             peer_id, public_key, noise_pubkey, caps, eps.clone(),
+                            ps, ps.saturating_add(MAPPABLE_RANGE_SIZE), pd_hint,
                             &|data| self.identity.sign(data),
                         );
-                        inv.port_delta_hint = nat.port_delta.unwrap_or(0) as u8;
                         let _ = reply.send(format!("lain://{}", inv.to_base62()));
                     }
                 } }
                 }
-                result = ev_rx.recv() => {
-                    if let Ok(ev) = result {
-                        if let IpcResponse::Event { event, peer_id, .. } = ev {
-                            if event == "peer_disconnected" {
-                                if let Some(pid_str) = peer_id {
-                                    if let Ok(pid) = PeerId::from_hex(&pid_str) {
-                                        connected.write().await.remove(&pid);
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-
                 // ── Incoming connection: peek → relay or data ──
                 result = transport.accept() => {
                     if let Ok(conn) = result {
@@ -333,6 +393,16 @@ impl Daemon {
                         let c = connected.clone();
                         let k = known_peers.clone();
                         tokio::spawn(async move {
+                            // Verify X25519 key against DHT record if available
+                            if let Some(noise_pk) = conn.noise_pubkey() {
+                                if let Some(rec) = d.get_peer_record(&pid).await {
+                                    if rec.noise_pubkey != noise_pk {
+                                        tracing::warn!("X25519 key mismatch for {pid}: rejecting incoming connection");
+                                        conn.close();
+                                        return;
+                                    }
+                                }
+                            }
                             // Skip control frames (HEADERS sent by try_quic) until we
                             // get a Data or RelayConnect message.
                             let (_, first) = loop {
@@ -361,7 +431,7 @@ impl Daemon {
                                 peer_id: Some(pid.to_string()), data: None,
                             });
                             let cancel = cancel_rx;
-                            spawn_reader(conn, e, Some(cancel));
+                            spawn_reader(conn, e, Some(cancel), c.clone(), pid);
                         });
                     }
                 }
@@ -384,7 +454,9 @@ impl Daemon {
                         let _ = dht.store_self(&public_key, &noise_pubkey, &eps, caps).await;
                     }
                     // Drop stale connections silently
-                    let _ = dht.clone().save_routes(&dirs_home().map(|d| d.join(".lain").join("routes.json")).unwrap_or(PathBuf::from("/dev/null"))).await;
+                    if let Some(path) = dirs_home().map(|d| d.join(".lain").join("routes.json")) {
+                        let _ = dht.clone().save_routes(&path).await;
+                    }
                 }
 
                 _ = tokio::signal::ctrl_c() => break,
@@ -469,11 +541,18 @@ async fn connect_and_track(
     let ev = ipc.clone();
     if reconnect {
         let guard = spawn_reconnect(conn.clone(), ipc, transport, noise_pk, endpoints, connected.clone());
-        connected.write().await.insert(pid, (conn, guard));
+        if let Some((old, old_guard)) = connected.write().await.insert(pid, (conn, guard)) {
+            old_guard.disconnect();
+            old.close();
+        }
     } else {
-        let guard = ConnectionGuard(watch::channel(false).0);
-        connected.write().await.insert(pid, (conn.clone(), guard));
-        spawn_reader(conn, ev.clone(), None);
+        let (cancel_tx, cancel_rx) = watch::channel(false);
+        let guard = ConnectionGuard(cancel_tx);
+        if let Some((old, old_guard)) = connected.write().await.insert(pid, (conn.clone(), guard)) {
+            old_guard.disconnect();
+            old.close();
+        }
+        spawn_reader(conn, ev.clone(), Some(cancel_rx), connected.clone(), pid);
     }
     let _ = ev.send(IpcResponse::Event {
         event: "peer_connected".into(), peer_id: Some(pid.to_string()),
@@ -491,7 +570,16 @@ async fn connect_cmd(
     dht: Arc<DhtHandle>,
     known: KnownPeers,
 ) {
-    let code = match parse_invite(&invite) { Some(c) => c, None => { return; } };
+    let code = match parse_invite(&invite) {
+        Some(c) => c,
+        None => {
+            let _ = ipc.send(IpcResponse::Event {
+                event: "peer_error".into(), peer_id: None,
+                data: Some(serde_json::json!({"error": "invalid or expired invite code"})),
+            });
+            return;
+        }
+    };
     let pid = code.peer_id;
     known.write().await.insert(pid, code.endpoints.clone());
 
@@ -508,13 +596,17 @@ async fn connect_cmd(
             if let Ok(relay_conn) = transport.connect(relay.node_id, &relay.noise_pubkey, &ep).await {
                 if relay_conn.send(FrameType::RelayConnect, &pid.0).await.is_ok() {
                     let conn = <Arc<dyn Connection>>::from(relay_conn);
-                    let guard = ConnectionGuard(watch::channel(false).0);
-                    connected.write().await.insert(pid, (conn.clone(), guard));
+                    let (cancel_tx, cancel_rx) = watch::channel(false);
+                    let guard = ConnectionGuard(cancel_tx);
+                    if let Some((old, old_guard)) = connected.write().await.insert(pid, (conn.clone(), guard)) {
+                        old_guard.disconnect();
+                        old.close();
+                    }
                     let _ = ipc.send(IpcResponse::Event {
                         event: "peer_connected".into(), peer_id: Some(pid.to_string()),
                         data: Some(serde_json::json!({"via": "relay"})),
                     });
-                    spawn_reader(conn, ipc, None);
+                    spawn_reader(conn, ipc, Some(cancel_rx), connected.clone(), pid);
                     return;
                 }
             }
@@ -533,21 +625,41 @@ async fn tso_cmd(
     connected: Connections,
     stun_rtt_ms: Option<u64>,
 ) {
-    let code = match parse_invite(&invite) { Some(c) => c, None => { return; } };
+    let code = match parse_invite(&invite) {
+        Some(c) => c,
+        None => {
+            let _ = ipc.send(IpcResponse::Event {
+                event: "peer_error".into(), peer_id: None,
+                data: Some(serde_json::json!({"error": "invalid or expired invite code"})),
+            });
+            return;
+        }
+    };
     let tso: Vec<SocketAddr> = code.endpoints.iter()
         .filter(|e| e.kind == EndpointKind::TSO).map(|e| e.addr).collect();
-    if tso.is_empty() { tracing::warn!("no TSO endpoints"); return; }
+    if tso.is_empty() {
+        let _ = ipc.send(IpcResponse::Event {
+            event: "peer_error".into(),
+            peer_id: Some(code.peer_id.to_string()),
+            data: Some(serde_json::json!({"error": "no TSO endpoints in invite"})),
+        });
+        return;
+    }
     let port_delta = if code.port_delta_hint > 0 { Some(code.port_delta_hint as u16) } else { None };
-    match transport.connect_tso(code.peer_id, &tso, port_delta, stun_rtt_ms).await {
+    match transport.connect_tso(code.peer_id, &tso, port_delta, stun_rtt_ms, code.mappable_port_start, code.mappable_port_end).await {
         Ok(conn) => {
             let conn = <Arc<dyn Connection>>::from(conn);
-            let guard = ConnectionGuard(watch::channel(false).0);
-            connected.write().await.insert(code.peer_id, (conn.clone(), guard));
+            let (cancel_tx, cancel_rx) = watch::channel(false);
+            let guard = ConnectionGuard(cancel_tx);
+            if let Some((old, old_guard)) = connected.write().await.insert(code.peer_id, (conn.clone(), guard)) {
+                old_guard.disconnect();
+                old.close();
+            }
             let _ = ipc.send(IpcResponse::Event {
                 event: "peer_connected".into(), peer_id: Some(code.peer_id.to_string()),
                 data: Some(serde_json::json!({"via": "TSO"})),
             });
-            spawn_reader(conn, ipc, None);
+            spawn_reader(conn, ipc, Some(cancel_rx), connected.clone(), code.peer_id);
         }
         Err(e) => { let _ = ipc.send(IpcResponse::Event {
             event: "peer_error".into(), peer_id: Some(code.peer_id.to_string()),
@@ -562,7 +674,14 @@ async fn find_cmd(
     connected: Connections,
 ) {
     let pid = match PeerId::from_hex(&hex) {
-        Ok(p) => p, Err(_) => { tracing::warn!("invalid peer_id: {hex}"); return; }
+        Ok(p) => p,
+        Err(_) => {
+            let _ = ipc.send(IpcResponse::Event {
+                event: "peer_error".into(), peer_id: None,
+                data: Some(serde_json::json!({"error": format!("invalid peer_id: {hex}")})),
+            });
+            return;
+        }
     };
     let record = match dht.find_peer(&pid).await {
         Ok(Some(r)) => r,
@@ -572,7 +691,13 @@ async fn find_cmd(
                 data: Some(serde_json::json!({"error": "not found"})),
             }); return;
         }
-        Err(e) => { tracing::warn!("DHT find {pid}: {e}"); return; }
+        Err(e) => {
+            let _ = ipc.send(IpcResponse::Event {
+                event: "peer_error".into(), peer_id: Some(hex),
+                data: Some(serde_json::json!({"error": format!("DHT error: {e}")})),
+            });
+            return;
+        }
     };
     connect_and_track(pid, &record.noise_pubkey, &record.endpoints, transport, ipc, connected, "dht", true).await;
 }
@@ -581,9 +706,10 @@ fn spawn_reader(
     conn: Arc<dyn Connection>,
     ipc: broadcast::Sender<IpcResponse>,
     cancel_rx: Option<watch::Receiver<bool>>,
+    connected: Connections,
+    pid: PeerId,
 ) {
     tokio::spawn(async move {
-        let pid = conn.peer_id();
         let mut cancel = cancel_rx;
         loop {
             let result = match cancel.as_mut() {
@@ -609,11 +735,17 @@ fn spawn_reader(
                 Err(_) => break,
             }
         }
-        let _ = ipc.send(IpcResponse::Event {
-            event: "peer_disconnected".into(),
-            peer_id: Some(pid.to_string()),
-            data: None,
-        });
+        let mut conns = connected.write().await;
+        if let Some((existing, _guard)) = conns.get(&pid) {
+            if Arc::ptr_eq(&conn, existing) {
+                conns.remove(&pid);
+                let _ = ipc.send(IpcResponse::Event {
+                    event: "peer_disconnected".into(),
+                    peer_id: Some(pid.to_string()),
+                    data: None,
+                });
+            }
+        }
     });
 }
 
@@ -667,6 +799,10 @@ fn spawn_reconnect(
                 }
                 match transport.connect(pid, &npk, &eps).await {
                     Ok(new) => {
+                        if *cancel_rx.borrow() {
+                            new.close();
+                            break 'outer;
+                        }
                         current = Arc::from(new);
                         if let Some((existing, _)) = connected.write().await.get_mut(&pid) {
                             *existing = current.clone();
@@ -686,11 +822,17 @@ fn spawn_reconnect(
             break 'outer;
         }
 
-        let _ = ipc.send(IpcResponse::Event {
-            event: "peer_disconnected".into(),
-            peer_id: Some(pid.to_string()),
-            data: None,
-        });
+        let mut conns = connected.write().await;
+        if let Some((existing, _guard)) = conns.get(&pid) {
+            if Arc::ptr_eq(&current, existing) {
+                conns.remove(&pid);
+                let _ = ipc.send(IpcResponse::Event {
+                    event: "peer_disconnected".into(),
+                    peer_id: Some(pid.to_string()),
+                    data: None,
+                });
+            }
+        }
     });
     ConnectionGuard(cancel_tx)
 }
@@ -732,14 +874,9 @@ fn iface_changed(cached: &mut Vec<SocketAddr>) -> (bool, Vec<SocketAddr>) {
 fn parse_invite(s: &str) -> Option<lain_discovery::InviteCode> {
     let code = s.strip_prefix("lain://")
         .and_then(|c| lain_discovery::InviteCode::from_base62(c).ok())?;
-    let expected = PeerId(sha2::Sha256::digest(&code.ed25519_pk).into());
+    let expected = PeerId::from_pubkey(&code.ed25519_pk);
     if expected != code.peer_id || code.noise_pk.iter().all(|&b| b == 0) { return None; }
-    if !code.verify(&|pk, data, sig| {
-        ed25519_dalek::VerifyingKey::from_bytes(pk).ok()
-            .and_then(|vk| ed25519_dalek::Signature::from_slice(sig).ok()
-                .map(|s| vk.verify_strict(data, &s).is_ok()))
-            .unwrap_or(false)
-    }) { return None; }
+    if !code.verify(&|pk, data, sig| lain_identity::verify_ed25519(pk, data, sig)) { return None; }
     if code.is_expired() { return None; }
     Some(code)
 }
@@ -825,7 +962,7 @@ mod tests {
         async fn connect(&self, _pid: PeerId, _npk: &[u8; 32], _eps: &[Endpoint]) -> Result<Box<dyn Connection>, CoreError> {
             self.connect_result.lock().unwrap().clone().map(|c| Box::new(c) as Box<dyn Connection>)
         }
-        async fn connect_tso(&self, _pid: PeerId, _eps: &[SocketAddr], _pd: Option<u16>, _rtt: Option<u64>) -> Result<Box<dyn Connection>, CoreError> {
+        async fn connect_tso(&self, _pid: PeerId, _eps: &[SocketAddr], _pd: Option<u16>, _rtt: Option<u64>, _mps: u16, _mpe: u16) -> Result<Box<dyn Connection>, CoreError> {
             Err(CoreError::InvalidEndpoint("tso not mocked".into()))
         }
         async fn accept(&self) -> Result<Box<dyn Connection>, CoreError> {
@@ -977,6 +1114,7 @@ mod tests {
         let invite = lain_discovery::InviteCode::new(
             id.peer_id(), *id.public_key(), noise_pk,
             Capabilities::new(), vec![ep],
+            54000, 54255, 0,
             &|data| id.sign(data),
         );
         let uri = invite.to_uri();
@@ -992,6 +1130,7 @@ mod tests {
         let invite = lain_discovery::InviteCode::new(
             id.peer_id(), *id.public_key(), noise_pk,
             Capabilities::new(), vec![],
+            0, 0, 0,
             &|data| id.sign(data),
         );
         assert!(!invite.is_expired(), "fresh invite should not be expired");
@@ -1004,6 +1143,7 @@ mod tests {
         let mut invite = lain_discovery::InviteCode::new(
             id.peer_id(), *id.public_key(), noise_pk,
             Capabilities::new(), vec![],
+            0, 0, 0,
             &|data| id.sign(data),
         );
         invite.signature[0] ^= 0xFF;

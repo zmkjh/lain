@@ -3,7 +3,7 @@
 **零服务器 P2P 网络基础设施。** 无需 bootstrap 节点、无需 DNS、无需 TLS 证书。PeerID 即身份，Invite 即入口，DHT 即拓扑。
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-[![Tests](https://img.shields.io/badge/tests-133-brightgreen.svg)](https://github.com/zmkjh/lain/actions)
+[![Tests](https://img.shields.io/badge/tests-148-brightgreen.svg)](https://github.com/zmkjh/lain/actions)
 ![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-lightgrey)
 
 ## 核心创新
@@ -183,6 +183,9 @@ Known:     1
 daemon 启动时自动读取当前目录下的 `lain.toml` 或 `config.toml`。不存在则使用默认值。
 
 ```toml
+# 绑定地址（默认 0.0.0.0:0，即全接口随机端口）
+bind_addr = "0.0.0.0:0"
+
 # STUN 服务器（用于 NAT 探测，获取公网映射地址）
 stun_servers = ["stun.qq.com:3478", "stun.miwifi.com:3478", "stun.l.google.com:19302"]
 
@@ -190,6 +193,7 @@ stun_servers = ["stun.qq.com:3478", "stun.miwifi.com:3478", "stun.l.google.com:1
 k = 20                     # 路由表桶大小
 alpha = 3                  # 并行查询数
 bootstrap_nodes = []       # 启动时手动指定种子节点（一般不填）
+local_addr = "0.0.0.0:0"  # DHT UDP socket 绑定地址
 
 [transport]
 tso_port_start = 50000     # TSO 端口起始（双方必须一致，运营商封端口时换一个范围）
@@ -294,9 +298,9 @@ IPC 协议完整规范见 [PROTOCOL.md §8](PROTOCOL.md#8-ipc-api)。
 
 ```bash
 cargo build --release    # 生产构建
-cargo test               # 133 自动化测试 (0 warning)
+cargo test               # 148 自动化测试 (0 warning)
 
-133 个测试覆盖全部协议层：identity、noise、nat、dht、discovery、transport（PeekConnection + Mock Transport）、daemon（编排函数 + 签名验证 + ConnectionGuard）+ 12 个端到端集成测试（连接握手、多消息、双向通信、并发连接、大消息、生存时间、连接关闭、PeerID 校验）。
+148 个测试覆盖全部协议层：identity、noise、nat、dht、discovery、transport（PeekConnection + Mock Transport）、daemon（编排函数 + 签名验证 + ConnectionGuard）+ 12 个端到端集成测试（连接握手、多消息、双向通信、并发连接、大消息、生存时间、连接关闭、PeerID 校验）。
 
 ## 许可证
 

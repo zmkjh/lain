@@ -45,6 +45,9 @@ impl InviteCode {
         noise_pk: [u8; 32],
         capabilities: Capabilities,
         endpoints: Vec<Endpoint>,
+        mappable_port_start: u16,
+        mappable_port_end: u16,
+        port_delta_hint: u8,
         sign_fn: &dyn Fn(&[u8]) -> [u8; 64],
     ) -> Self {
         let timestamp = SystemTime::now()
@@ -58,9 +61,9 @@ impl InviteCode {
             ed25519_pk: pubkey,
             noise_pk,
             capabilities,
-            mappable_port_start: 1024,
-            mappable_port_end: 65535,
-            port_delta_hint: 0,
+            mappable_port_start,
+            mappable_port_end,
+            port_delta_hint,
             endpoints,
             timestamp,
             signature: [0u8; 64],
@@ -346,7 +349,7 @@ mod tests {
             EndpointKind::LAN,
         );
         let sign_fn = |_data: &[u8]| -> [u8; 64] { [3u8; 64] };
-        InviteCode::new(peer_id, pk, pk, Capabilities::new(), vec![endpoint], &sign_fn)
+        InviteCode::new(peer_id, pk, pk, Capabilities::new(), vec![endpoint], 0, 0, 0, &sign_fn)
     }
 
     #[test]
@@ -391,7 +394,7 @@ mod tests {
         let mut e2 = Endpoint::new("1.2.3.4:9999".parse().unwrap(), EndpointKind::STUN);
         e2.ttl_seconds = 600;
         let endpoints = vec![e1, e2];
-        let invite = InviteCode::new(peer_id, pk, pk, Capabilities::new(), endpoints, &sign_fn);
+        let invite = InviteCode::new(peer_id, pk, pk, Capabilities::new(), endpoints, 0, 0, 0, &sign_fn);
         let b62 = invite.to_base62();
         let decoded = InviteCode::from_base62(&b62).unwrap();
         assert_eq!(decoded.endpoints.len(), 2);
@@ -416,7 +419,7 @@ mod tests {
             sig
         };
 
-        let invite = InviteCode::new(peer_id, ed_pk, noise_pk, caps, vec![ep1, ep2], &sign_fn);
+        let invite = InviteCode::new(peer_id, ed_pk, noise_pk, caps, vec![ep1, ep2], 50000, 50250, 5, &sign_fn);
         let b62 = invite.to_base62();
         let decoded = InviteCode::from_base62(&b62).unwrap();
 
@@ -424,6 +427,9 @@ mod tests {
         assert_eq!(decoded.ed25519_pk, ed_pk);
         assert_eq!(decoded.noise_pk, noise_pk, "noise_pk should survive roundtrip");
         assert_eq!(decoded.capabilities.bits, caps.bits);
+        assert_eq!(decoded.mappable_port_start, 50000);
+        assert_eq!(decoded.mappable_port_end, 50250);
+        assert_eq!(decoded.port_delta_hint, 5);
         assert_eq!(decoded.endpoints.len(), 2);
         assert_eq!(decoded.endpoints[0].addr.to_string(), "10.0.0.1:8080");
         assert_eq!(decoded.endpoints[0].kind, EndpointKind::LAN);

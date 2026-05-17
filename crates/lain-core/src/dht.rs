@@ -1,9 +1,33 @@
+//! # DHT 目录服务 — trait contract（边界模块）
+//!
+//! ## 模块角色
+//! 本模块定义 DHT 抽象接口和共享数据结构，供 daemon（调用方）和 lain-dht（实现方）使用。
+//!
+//! ## 关键数据结构
+//!
+//! ### PeerRecord — DHT 中存储的对端记录
+//! - `pubkey: Ed25519PublicKey` — 对端的 Ed25519 公钥（用于验证签名）
+//! - `noise_pubkey: X25519PublicKey` — 对端的 X25519 公钥（用于 Noise IK 握手）
+//! - **重要**：DHT 记录是**自报告**的（`store_self`），未经 Ed25519 签名验证
+//!   - 任何节点都可以声称任意的 X25519 公钥
+//!   - 调用方（daemon）在使用 `noise_pubkey` 前必须通过 invite code 签名或上层协议验证
+//!
+//! ### RelayInfo — Relay 候选节点
+//! - `noise_pubkey: [u8; 32]` — 原始 X25519 字节（未使用类型别名以兼容 wire 格式）
+//!
+//! ## 调用方约定
+//! - daemon 通过 `DhtHandle`（lain-dht 的具体实现）间接使用 DHT
+//! - `store_self` 用于注册本节点的端点信息（IPv6、STUN、TSO 端口）
+//! - `find_peer` 返回 `lain_dht::PeerRecord`（自报告的，含 `expires_at` 本地字段）
+//! - `get_peer_record` 仅查本地缓存，不触发网络查找
+//! - `find_relays` 从路由表 + 缓存组合 relay 候选（`noise_pubkey` 可能为全零）
+
 use std::net::SocketAddr;
 
 use crate::capabilities::Capabilities;
 use crate::endpoint::Endpoint;
 use crate::error::CoreError;
-use crate::identity::{Ed25519PublicKey, Ed25519Signature};
+use crate::identity::{Ed25519PublicKey, Ed25519Signature, X25519PublicKey};
 use crate::peer::PeerId;
 
 /// Relay 候选节点
@@ -14,11 +38,11 @@ pub struct RelayInfo {
     pub noise_pubkey: [u8; 32],
 }
 
-/// DHT 中存储的 peer 记录
+/// DHT 中存储的 peer 记录（**自报告**，未经 Ed25519 签名验证）
 #[derive(Clone, Debug)]
 pub struct PeerRecord {
     pub pubkey: Ed25519PublicKey,
-    pub noise_pubkey: Ed25519PublicKey,  // X25519 for Noise IK
+    pub noise_pubkey: X25519PublicKey,  // X25519 for Noise IK
     pub endpoints: Vec<Endpoint>,
     pub capabilities: Capabilities,
     pub ttl_remaining: u32,

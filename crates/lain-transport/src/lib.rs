@@ -2,16 +2,60 @@
 #![deny(clippy::expect_used)]
 #![deny(clippy::panic)]
 
+//! # Lain Transport — Transport + Connection 实现
+//!
+//! ## 模块角色
+//! 实现 `lain_core::transport::Transport` 和 `Connection` trait。
+//! 提供两条传输路径：QUIC（Universal）和 TSO（TCP 端口预测）。
+//!
+//! ## 连接类型
+//!
+//! ### QuicConnection（QUIC + Noise IK）
+//! - QUIC TLS 使用 `NoVerify`（不验证证书，所有身份由 Noise 层处理）
+//! - Noise IK handshake over QUIC bi-directional stream:
+//!   - Initiator: 预载对端 X25519 公钥 → send ik1 → recv ik2 → `remote_pubkey()`
+//!   - Responder: recv ik1 → `remote_pubkey()` → send ik2
+//! - `noise_pubkey()` 返回 `try_quic` 中 `noise.remote_pubkey()` 的返回值（握手验证后的 X25519 公钥）
+//! - 数据帧走 QUIC 流，使用 `lain_core::frame` 编解码
+//!
+//! ### TcpConnection（TSO + Noise IK）
+//! - TCP connect via mapped port prediction（多对 (local_ip:port, remote_ip:port) 并行探测）
+//! - Noise IK handshake over TCP:
+//!   - 先交换明文 identity claim（PeerId + X25519 pk，64 字节）
+//!   - 根据 PeerId 字典序决定 initiator/responder 角色
+//!   - 握手完成后验证 Noise payload 中的 PeerId 匹配
+//! - `noise_pubkey()` 返回 `None`（TSO 不暴露 X25519 公钥给上层）
+//! - 内置 TCP keepalive（Noise 空消息加密发送）
+//!
+//! ## 与上层模块的契约
+//! - `Transport::connect(pid, noise_pk, endpoints)`: 调用方提供待连接端点的 X25519 公钥
+//!   - 实现方用其作为 Noise IK pre-message，握手加密验证
+//!   - 返回的 Connection 的 `noise_pubkey()` 为 `verified_pk`（握手验证后的值）
+//! - `Transport::connect_tso(pid, ..., mappable_port_start, mappable_port_end)`:
+//!   - **不**接受 noise_pubkey 参数
+//!   - 实现方在 TCP 上独立完成 Noise IK，身份仅由 PeerId 认证
+//! - `Transport::accept()`: 返回的 QuicConnection 包含 Noise IK 握手解密出的 X25519 公钥
+//!
+//! ## 导出类型
+//! - `Transport` — Transport trait 实现
+//! - `TransportConfig` — QUIC 绑定地址 + TSO 端口配置
+//! - `PeekConnection` — 缓冲首条消息的 Connection 包装器
+//! - `TransportError` — 传输层错误（可实现 From for CoreError）
+
 use lain_core::crypto::{CryptoProvider, NoiseHandshake, NoiseTransport};
 use lain_core::endpoint::{Endpoint, EndpointKind};
 use lain_core::error::CoreError;
 use lain_core::frame::{self, encode_handshake_frame, parse_handshake_frame_header as parse_frame_header, FrameType};
 use lain_core::peer::PeerId;
 use lain_core::transport::{Connection, PathType, Transport as TransportTrait};
+use std::collections::HashSet;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use thiserror::Error;
+use rand::Rng;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::sync::Mutex;
 
 #[derive(Error, Debug)]
@@ -35,11 +79,13 @@ impl From<TransportError> for CoreError {
 struct QuicConnection {
     peer_id: PeerId,
     quic: quinn::Connection,
+    noise_pubkey: Option<[u8; 32]>,
 }
 
 #[async_trait::async_trait]
 impl Connection for QuicConnection {
     fn peer_id(&self) -> PeerId { self.peer_id }
+    fn noise_pubkey(&self) -> Option<[u8; 32]> { self.noise_pubkey }
     fn path(&self) -> PathType { PathType::Direct }
 
     async fn send(&self, ft: FrameType, data: &[u8]) -> Result<(), CoreError> {
@@ -81,13 +127,15 @@ impl Connection for QuicConnection {
 // ── TcpConnection ──
 
 struct TcpInner {
-    stream: Mutex<tokio::net::TcpStream>,
+    read: Mutex<OwnedReadHalf>,
+    write: Mutex<OwnedWriteHalf>,
     noise: Mutex<Box<dyn NoiseTransport>>,
 }
 
 struct TcpConnection {
     peer_id: PeerId,
     inner: Arc<TcpInner>,
+    keepalive_alive: Arc<AtomicBool>,
 }
 
 impl TcpConnection {
@@ -97,23 +145,37 @@ impl TcpConnection {
         peer_id: PeerId,
         keepalive_secs: u64,
     ) -> Self {
+        let (read, write) = stream.into_split();
         let inner = Arc::new(TcpInner {
-            stream: Mutex::new(stream),
+            read: Mutex::new(read),
+            write: Mutex::new(write),
             noise: Mutex::new(noise),
         });
+        let keepalive_alive = Arc::new(AtomicBool::new(true));
+        let ka_alive = keepalive_alive.clone();
         let ka = inner.clone();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(keepalive_secs));
             loop {
                 interval.tick().await;
-                let mut s = ka.stream.lock().await;
-                let mut n = ka.noise.lock().await;
-                let ct = match n.encrypt(b"") { Ok(c) => c, Err(_) => break };
+                if !ka_alive.load(Ordering::Relaxed) {
+                    break;
+                }
+                let ct = {
+                    let mut n = ka.noise.lock().await;
+                    match n.encrypt(b"") {
+                        Ok(c) => c,
+                        Err(_) => break,
+                    }
+                };
                 let frame = encode_handshake_frame(0, &ct);
-                if s.write_all(&frame).await.is_err() { break; }
+                let mut w = ka.write.lock().await;
+                if w.write_all(&frame).await.is_err() {
+                    break;
+                }
             }
         });
-        Self { peer_id, inner }
+        Self { peer_id, inner, keepalive_alive }
     }
 }
 
@@ -123,27 +185,36 @@ impl Connection for TcpConnection {
     fn path(&self) -> PathType { PathType::TSO }
 
     async fn send(&self, _ft: FrameType, data: &[u8]) -> Result<(), CoreError> {
-        let mut stream = self.inner.stream.lock().await;
-        let mut noise = self.inner.noise.lock().await;
-        let ct = noise.encrypt(data)?;
+        let ct = {
+            let mut noise = self.inner.noise.lock().await;
+            noise.encrypt(data)?
+        };
         let frame = encode_handshake_frame(0, &ct);
-        stream.write_all(&frame).await
-            .map_err(|e| CoreError::InvalidEndpoint(e.to_string()))
+        let mut write = self.inner.write.lock().await;
+        match write.write_all(&frame).await {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                // Must close: Noise has advanced but peer never received this frame.
+                drop(write);
+                self.close();
+                Err(CoreError::InvalidEndpoint(e.to_string()))
+            }
+        }
     }
 
     async fn recv(&self) -> Result<(FrameType, Vec<u8>), CoreError> {
         loop {
+            let mut r = self.inner.read.lock().await;
             let mut header = [0u8; 8];
-            { let mut s = self.inner.stream.lock().await;
-              s.read_exact(&mut header).await
-                .map_err(|e| CoreError::InvalidEndpoint(e.to_string()))?; }
+            r.read_exact(&mut header).await
+                .map_err(|e| CoreError::InvalidEndpoint(e.to_string()))?;
             let plen = ((header[5] as usize) << 16) | ((header[6] as usize) << 8) | (header[7] as usize);
             let mut payload = vec![0u8; plen];
             if plen > 0 {
-                let mut s = self.inner.stream.lock().await;
-                s.read_exact(&mut payload).await
+                r.read_exact(&mut payload).await
                     .map_err(|e| CoreError::InvalidEndpoint(e.to_string()))?;
             }
+            drop(r);
             let data = { let mut n = self.inner.noise.lock().await; n.decrypt(&payload)? };
             if data.is_empty() { continue; }
             return Ok((FrameType::Data, data));
@@ -151,10 +222,11 @@ impl Connection for TcpConnection {
     }
 
     fn close(&self) {
+        self.keepalive_alive.store(false, Ordering::Relaxed);
         let inner = self.inner.clone();
         tokio::spawn(async move {
-            let mut s = inner.stream.lock().await;
-            let _ = s.shutdown().await;
+            let mut w = inner.write.lock().await;
+            let _ = w.shutdown().await;
         });
     }
 }
@@ -169,7 +241,7 @@ pub struct TransportConfig {
 
 impl Default for TransportConfig {
     fn default() -> Self {
-        Self { bind_addr: "0.0.0.0:0".parse().unwrap(), has_ipv6: false, tso_port_start: 50000 }
+        Self { bind_addr: SocketAddr::from(([0u8; 4], 0)), has_ipv6: false, tso_port_start: 50000 }
     }
 }
 
@@ -236,17 +308,24 @@ impl Transport {
         let (mut send, mut recv) = conn.accept_bi().await
             .map_err(|e| TransportError::Connect(e.to_string()))?;
 
-        let mut buf = vec![0u8; 4096];
-        let n = recv.read(&mut buf).await
-            .map_err(|e| TransportError::Connect(e.to_string()))?
-            .ok_or_else(|| TransportError::Noise("no ik1".into()))?;
-
-        let hdr = parse_frame_header(&buf[..n])
+        let mut header = [0u8; 8];
+        recv.read_exact(&mut header).await
+            .map_err(|e| TransportError::Connect(e.to_string()))?;
+        let hdr = parse_frame_header(&header)
             .map_err(|e| TransportError::Noise(e.to_string()))?;
+        if hdr.payload_len > 65536 {
+            return Err(TransportError::Noise("ik1 payload too large".into()));
+        }
+        let mut payload = vec![0u8; hdr.payload_len];
+        if hdr.payload_len > 0 {
+            recv.read_exact(&mut payload).await
+                .map_err(|e| TransportError::Connect(e.to_string()))?;
+        }
         let mut noise = self.crypto.new_responder()
             .map_err(|e| TransportError::Noise(e.to_string()))?;
-        let remote_id = noise.read_message(&buf[8..8 + hdr.payload_len.min(n - 8)])
+        let remote_id = noise.read_message(&payload)
             .map_err(|e| TransportError::Noise(e.to_string()))?;
+        let remote_pk = noise.remote_pubkey();
 
         let ik2 = noise.write_message(&self.peer_id)
             .map_err(|e| TransportError::Noise(e.to_string()))?;
@@ -263,7 +342,7 @@ impl Transport {
             hd_s.finish().ok();
         }
 
-        Ok(Box::new(QuicConnection { peer_id: remote_id, quic: conn }))
+        Ok(Box::new(QuicConnection { peer_id: remote_id, quic: conn, noise_pubkey: remote_pk }))
     }
 
     pub async fn connect(
@@ -281,7 +360,7 @@ impl Transport {
             let qep = self.endpoint.clone();
             tokio::spawn(async move {
                 let r = try_quic(addr, npk, cry, my, qep).await;
-                tx.send(r.map(|(pid, q)| Box::new(QuicConnection { peer_id: pid, quic: q }) as Box<dyn Connection>)).await.ok();
+                tx.send(r.map(|(pid, q, verified_pk)| Box::new(QuicConnection { peer_id: pid, quic: q, noise_pubkey: verified_pk }) as Box<dyn Connection>)).await.ok();
             });
         }
         drop(tx);
@@ -304,6 +383,8 @@ impl Transport {
         tso_endpoints: &[SocketAddr],
         port_delta: Option<u16>,
         stun_rtt_ms: Option<u64>,
+        mappable_port_start: u16,
+        mappable_port_end: u16,
     ) -> Result<Box<dyn Connection>, TransportError> {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(102);
         let bind_ip = self.endpoint.local_addr()
@@ -311,41 +392,132 @@ impl Transport {
 
         let is_pp = port_delta == Some(1);
         let rtt = stun_rtt_ms.unwrap_or(200);
-        let ports: u16 = if is_pp { 4 } else { 8 };
-        let per_attempt = if rtt < 100 { 200 } else if rtt < 300 { 400 } else { 600 };
-        let inter_round = if is_pp { 200 } else { 300 };
+        let local_ports: u16 = if is_pp { 4 } else { 8 };
 
-        while std::time::Instant::now() < deadline {
-            let (tx, mut rx) = tokio::sync::mpsc::channel::<tokio::net::TcpStream>(1);
-            for i in 0..ports {
-                let la = SocketAddr::new(bind_ip, self.tso_port_start + i);
-                for &ra in tso_endpoints {
-                    let tx = tx.clone();
-                    tokio::spawn(async move {
-                        let s = if ra.is_ipv4() {
-                            tokio::net::TcpSocket::new_v4()
-                        } else {
-                            tokio::net::TcpSocket::new_v6()
-                        };
-                        if let Ok(s) = s {
-                            s.set_reuseaddr(true).ok();
-                            if s.bind(la).is_ok() {
-                                if let Ok(Ok(s)) = tokio::time::timeout(
-                                    std::time::Duration::from_millis(per_attempt), s.connect(ra),
-                                ).await { tx.send(s).await.ok(); }
-                            }
-                        }
-                    });
+        // Per-connect timeout: 20×RTT clamped to [5s, 10s].
+        // This gives TCP at least one full retransmission cycle (SYN → 1s → SYN-RTX)
+        // instead of killing the attempt before the first retry.
+        let connect_timeout_ms: u64 = (rtt * 20).clamp(5000, 10000);
+
+        // Stagger spawns at ~25 connects/sec — well below typical CGNAT
+        // SYN-flood thresholds (50-100/sec on China Mobile NAT4 devices).
+        let stagger_ms: u64 = 40;
+
+        let mappable_range = if mappable_port_end > mappable_port_start && !is_pp {
+            Some(mappable_port_start..mappable_port_end)
+        } else {
+            None
+        };
+
+        // Build remote address list once (same logic as before).
+        let remote_addrs: Vec<SocketAddr> = if let Some(ref range) = mappable_range {
+            let mut addrs = tso_endpoints.to_vec();
+            for _ in 0..local_ports as usize {
+                let random_port = range.start.wrapping_add(
+                    (rand::random::<u32>() % ((range.end - range.start) as u32)) as u16,
+                );
+                if let Some(base) = tso_endpoints.first() {
+                    addrs.push(SocketAddr::new(base.ip(), random_port));
                 }
             }
-            drop(tx);
-            let round_timeout = std::time::Duration::from_millis(per_attempt + 100);
-            if let Ok(Some(stream)) = tokio::time::timeout(round_timeout, rx.recv()).await {
-                tracing::info!("TSO connected, starting handshake");
-                return tso_handshake(stream, peer_id, &self.crypto, &self.peer_id, 15).await;
+            addrs
+        } else {
+            tso_endpoints.to_vec()
+        };
+
+        // Pre-compute all (local_addr, remote_addr) pairs.
+        let pairs: Vec<(SocketAddr, SocketAddr)> = (0..local_ports)
+            .flat_map(|i| {
+                let la = SocketAddr::new(bind_ip, self.tso_port_start + i);
+                remote_addrs.iter().map(move |&ra| (la, ra))
+            })
+            .collect();
+
+        let stream_result: Arc<Mutex<Option<tokio::net::TcpStream>>> =
+            Arc::new(Mutex::new(None));
+
+        // Track which (local_port, remote_addr) pairs are currently in-flight
+        // to avoid spawning duplicate 4-tuple connections.
+        let in_flight: Arc<Mutex<HashSet<(u16, SocketAddr)>>> =
+            Arc::new(Mutex::new(HashSet::new()));
+
+        // ── Continuous staggered flow ──
+        // Instead of burst-sleep rounds, we keep ~all pairs continuously alive:
+        // each spawn is staggered by stagger_ms, each lives for connect_timeout_ms,
+        // and as one dies it is immediately re-spawned.  No dead zones.
+        while std::time::Instant::now() < deadline {
+            if stream_result.lock().await.is_some() {
+                break;
             }
-            tokio::time::sleep(std::time::Duration::from_millis(inter_round)).await;
+
+            // Pick a random free pair (not currently in-flight).
+            let pair = {
+                let locked = in_flight.lock().await;
+                let free: Vec<_> = pairs
+                    .iter()
+                    .filter(|(la, ra)| !locked.contains(&(la.port(), *ra)))
+                    .copied()
+                    .collect();
+                if free.is_empty() {
+                    // All pairs busy — wait a bit for some to complete, then retry.
+                    drop(locked);
+                    tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+                    continue;
+                }
+                let idx = rand::thread_rng().gen_range(0..free.len());
+                free[idx]
+            };
+
+            let (la, ra) = pair;
+
+            // Mark this pair as in-flight *before* spawning.
+            in_flight.lock().await.insert((la.port(), ra));
+
+            let sr = stream_result.clone();
+            let infl = in_flight.clone();
+            tokio::spawn(async move {
+                // Quick bail if another task already won.
+                if sr.lock().await.is_some() {
+                    infl.lock().await.remove(&(la.port(), ra));
+                    return;
+                }
+
+                let s = if ra.is_ipv4() {
+                    tokio::net::TcpSocket::new_v4()
+                } else {
+                    tokio::net::TcpSocket::new_v6()
+                };
+
+                if let Ok(s) = s {
+                    s.set_reuseaddr(true).ok();
+                    if s.bind(la).is_ok() {
+                        if let Ok(Ok(stream)) = tokio::time::timeout(
+                            std::time::Duration::from_millis(connect_timeout_ms),
+                            s.connect(ra),
+                        )
+                        .await
+                        {
+                            let mut res = sr.lock().await;
+                            if res.is_none() {
+                                *res = Some(stream);
+                            }
+                        }
+                    }
+                }
+
+                // Always release the in-flight slot on completion.
+                infl.lock().await.remove(&(la.port(), ra));
+            });
+
+            // Stagger the next spawn.
+            tokio::time::sleep(std::time::Duration::from_millis(stagger_ms)).await;
         }
+
+        if let Some(stream) = stream_result.lock().await.take() {
+            tracing::info!("TSO connected, starting handshake");
+            return tso_handshake(stream, peer_id, &self.crypto, &self.peer_id, 15).await;
+        }
+
         Err(TransportError::Connect("TSO timeout".into()))
     }
 }
@@ -357,7 +529,7 @@ impl Transport {
 async fn try_quic(
     addr: SocketAddr, noise_pubkey: [u8; 32], crypto: Arc<dyn CryptoProvider>, my_id: PeerId,
     endpoint: quinn::Endpoint,
-) -> Result<(PeerId, quinn::Connection), TransportError> {
+) -> Result<(PeerId, quinn::Connection, Option<[u8; 32]>), TransportError> {
     let client_crypto = rustls::ClientConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
         .dangerous()
         .with_custom_certificate_verifier(Arc::new(NoVerify))
@@ -385,14 +557,22 @@ async fn try_quic(
     send.write_all(&encode_handshake_frame(0, &ik1)).await
         .map_err(|e| TransportError::Io(e.to_string()))?;
 
-    let mut buf = vec![0u8; 4096];
-    let n = recv.read(&mut buf).await
-        .map_err(|e| TransportError::Connect(e.to_string()))?
-        .ok_or_else(|| TransportError::Noise("no ik2".into()))?;
-    let hdr = parse_frame_header(&buf[..n])
+    let mut header = [0u8; 8];
+    recv.read_exact(&mut header).await
+        .map_err(|e| TransportError::Connect(e.to_string()))?;
+    let hdr = parse_frame_header(&header)
         .map_err(|e| TransportError::Noise(e.to_string()))?;
-    let pid = noise.read_message(&buf[8..8 + hdr.payload_len.min(n - 8)])
+    if hdr.payload_len > 65536 {
+        return Err(TransportError::Noise("ik2 payload too large".into()));
+    }
+    let mut payload = vec![0u8; hdr.payload_len];
+    if hdr.payload_len > 0 {
+        recv.read_exact(&mut payload).await
+            .map_err(|e| TransportError::Connect(e.to_string()))?;
+    }
+    let pid = noise.read_message(&payload)
         .map_err(|e| TransportError::Noise(e.to_string()))?;
+    let verified_pk = noise.remote_pubkey();
     // Snow requires into_transport_mode to finalize the handshake,
     // even though QUIC handles encryption after this point.
     let _sess = noise.into_transport()
@@ -402,7 +582,7 @@ async fn try_quic(
         .map_err(|e| TransportError::Connect(e.to_string()))?;
     ctrl.write_all(&frame::encode_frame(1, FrameType::Headers, b"{}")).await.ok();
     ctrl.finish().ok();
-    Ok((pid, conn))
+    Ok((pid, conn, verified_pk))
 }
 
 async fn tso_handshake(
@@ -420,7 +600,7 @@ async fn tso_handshake(
         .map_err(|e| TransportError::Io(e.to_string()))?;
 
     let mut their_info = [0u8; 64];
-    tokio::time::timeout(std::time::Duration::from_secs(10), stream.read_exact(&mut their_info)).await
+    tokio::time::timeout(std::time::Duration::from_secs(15), stream.read_exact(&mut their_info)).await
         .map_err(|_| TransportError::Connect("tso_handshake timeout reading peer info".into()))?
         .map_err(|e| TransportError::Io(e.to_string()))?;
 
@@ -441,22 +621,40 @@ async fn tso_handshake(
             .map_err(|e| TransportError::Noise(e.to_string()))?;
         stream.write_all(&encode_handshake_frame(0, &ik1)).await
             .map_err(|e| TransportError::Io(e.to_string()))?;
-        let mut buf = vec![0u8; 4096];
-        let n = tokio::time::timeout(std::time::Duration::from_secs(5), stream.read(&mut buf)).await
-            .map_err(|_| TransportError::Connect("tso_handshake timeout reading ik2".into()))?
+        let mut header = [0u8; 8];
+        tokio::time::timeout(std::time::Duration::from_secs(5), stream.read_exact(&mut header)).await
+            .map_err(|_| TransportError::Connect("tso_handshake timeout reading ik2 header".into()))?
             .map_err(|e| TransportError::Io(e.to_string()))?;
-        let h = parse_frame_header(&buf[..n])
+        let h = parse_frame_header(&header)
             .map_err(|e| TransportError::Noise(e.to_string()))?;
-        noise.read_message(&buf[8..8 + h.payload_len.min(n - 8)])
+        if h.payload_len > 65536 {
+            return Err(TransportError::Noise("ik2 payload too large".into()));
+        }
+        let mut payload = vec![0u8; h.payload_len];
+        if h.payload_len > 0 {
+            tokio::time::timeout(std::time::Duration::from_secs(5), stream.read_exact(&mut payload)).await
+                .map_err(|_| TransportError::Connect("tso_handshake timeout reading ik2 payload".into()))?
+                .map_err(|e| TransportError::Io(e.to_string()))?;
+        }
+        noise.read_message(&payload)
             .map_err(|e| TransportError::Noise(e.to_string()))?
     } else {
-        let mut buf = vec![0u8; 4096];
-        let n = tokio::time::timeout(std::time::Duration::from_secs(5), stream.read(&mut buf)).await
-            .map_err(|_| TransportError::Connect("tso_handshake timeout reading ik1".into()))?
+        let mut header = [0u8; 8];
+        tokio::time::timeout(std::time::Duration::from_secs(5), stream.read_exact(&mut header)).await
+            .map_err(|_| TransportError::Connect("tso_handshake timeout reading ik1 header".into()))?
             .map_err(|e| TransportError::Io(e.to_string()))?;
-        let h = parse_frame_header(&buf[..n])
+        let h = parse_frame_header(&header)
             .map_err(|e| TransportError::Noise(e.to_string()))?;
-        let rid = noise.read_message(&buf[8..8 + h.payload_len.min(n - 8)])
+        if h.payload_len > 65536 {
+            return Err(TransportError::Noise("ik1 payload too large".into()));
+        }
+        let mut payload = vec![0u8; h.payload_len];
+        if h.payload_len > 0 {
+            tokio::time::timeout(std::time::Duration::from_secs(5), stream.read_exact(&mut payload)).await
+                .map_err(|_| TransportError::Connect("tso_handshake timeout reading ik1 payload".into()))?
+                .map_err(|e| TransportError::Io(e.to_string()))?;
+        }
+        let rid = noise.read_message(&payload)
             .map_err(|e| TransportError::Noise(e.to_string()))?;
         let ik2 = noise.write_message(my_id)
             .map_err(|e| TransportError::Noise(e.to_string()))?;
@@ -525,6 +723,7 @@ impl PeekConnection {
 #[async_trait::async_trait]
 impl Connection for PeekConnection {
     fn peer_id(&self) -> PeerId { self.inner.peer_id() }
+    fn noise_pubkey(&self) -> Option<[u8; 32]> { self.inner.noise_pubkey() }
     fn path(&self) -> PathType { self.inner.path() }
     fn rtt_ms(&self) -> Option<u64> { self.inner.rtt_ms() }
 
@@ -548,8 +747,8 @@ impl TransportTrait for Transport {
             .map_err(|e| CoreError::InvalidEndpoint(e.to_string()))
     }
 
-    async fn connect_tso(&self, peer_id: PeerId, tso_endpoints: &[SocketAddr], port_delta: Option<u16>, stun_rtt_ms: Option<u64>) -> Result<Box<dyn Connection>, CoreError> {
-        Transport::connect_tso(self, peer_id, tso_endpoints, port_delta, stun_rtt_ms).await
+    async fn connect_tso(&self, peer_id: PeerId, tso_endpoints: &[SocketAddr], port_delta: Option<u16>, stun_rtt_ms: Option<u64>, mappable_port_start: u16, mappable_port_end: u16) -> Result<Box<dyn Connection>, CoreError> {
+        Transport::connect_tso(self, peer_id, tso_endpoints, port_delta, stun_rtt_ms, mappable_port_start, mappable_port_end).await
             .map_err(|e| CoreError::InvalidEndpoint(e.to_string()))
     }
 

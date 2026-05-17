@@ -252,7 +252,10 @@ fn run_daemon(foreground: bool) {
         return;
     }
 
-    let rt = tokio::runtime::Runtime::new().expect("tokio");
+    let rt = match tokio::runtime::Runtime::new() {
+        Ok(rt) => rt,
+        Err(e) => { eprintln!("cannot create tokio runtime: {e}"); return; }
+    };
     rt.block_on(async {
         let config = lain_daemon::config::DaemonConfig::load_or_default().unwrap_or_default();
         match lain_daemon::Daemon::new(config).await {

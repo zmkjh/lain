@@ -320,12 +320,12 @@ async fn tso_handshake() {
 
     let h = tokio::spawn(async move {
         let _ = tokio::time::timeout(Duration::from_secs(20),
-            b_t.connect_tso(a.peer_id, &tso_clone, Some(1), Some(10))
+            b_t.connect_tso(a.peer_id, &tso_clone, Some(1), Some(10), 50000, 50008)
         ).await;
     });
 
     let conn = match tokio::time::timeout(Duration::from_secs(20),
-        a_t.connect_tso(b_pid, &tso_eps, Some(1), Some(10))
+        a_t.connect_tso(b_pid, &tso_eps, Some(1), Some(10), 50000, 50008)
     ).await {
         Ok(Ok(c)) => c,
         Ok(Err(e)) => { h.await.unwrap_or(()); panic!("TSO failed: {e}"); }

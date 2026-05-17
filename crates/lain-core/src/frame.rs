@@ -33,6 +33,7 @@ impl FrameType {
 }
 
 pub const MAGIC: [u8; 3] = [0x4C, 0x41, 0x49]; // "LAI"
+pub const MAX_PAYLOAD_SIZE: u64 = 4 * 1024 * 1024; // 4 MiB
 
 /// 编码 Lain 帧
 pub fn encode_frame(stream_id: u64, frame_type: FrameType, payload: &[u8]) -> Vec<u8> {
@@ -51,9 +52,15 @@ pub fn decode_frame_header(data: &[u8]) -> Option<(u64, FrameType, u64, usize)> 
         return None;
     }
     let (sid, s_off) = decode_varint(&data[3..])?;
-    let (ft, f_off) = decode_varint(&data[3 + s_off..])?;
+    let (ft_raw, f_off) = decode_varint(&data[3 + s_off..])?;
     let (plen, p_off) = decode_varint(&data[3 + s_off + f_off..])?;
-    let ft = FrameType::from_u8(ft as u8)?;
+    if ft_raw > u8::MAX as u64 {
+        return None;
+    }
+    let ft = FrameType::from_u8(ft_raw as u8)?;
+    if plen > MAX_PAYLOAD_SIZE {
+        return None;
+    }
     let header_len = 3 + s_off + f_off + p_off;
     Some((sid, ft, plen, header_len))
 }
@@ -70,14 +77,16 @@ pub fn encode_varint(value: u64, buf: &mut Vec<u8>) {
         buf.push((value >> 8) as u8);
         buf.push(value as u8);
     } else {
-        buf.push(0xC0 | ((value >> 56) as u8 & 0x3F));
-        buf.push((value >> 48) as u8);
-        buf.push((value >> 40) as u8);
-        buf.push((value >> 32) as u8);
-        buf.push((value >> 24) as u8);
-        buf.push((value >> 16) as u8);
-        buf.push((value >> 8) as u8);
-        buf.push(value as u8);
+        // 8-byte QUIC varint has 62 usable bits; saturate to avoid silent truncation.
+        let v = value.min((1u64 << 62) - 1);
+        buf.push(0xC0 | ((v >> 56) as u8 & 0x3F));
+        buf.push((v >> 48) as u8);
+        buf.push((v >> 40) as u8);
+        buf.push((v >> 32) as u8);
+        buf.push((v >> 24) as u8);
+        buf.push((v >> 16) as u8);
+        buf.push((v >> 8) as u8);
+        buf.push(v as u8);
     }
 }
 
@@ -113,7 +122,6 @@ pub fn decode_varint(data: &[u8]) -> Option<(u64, usize)> {
 
 // ── Noise IK 握手帧 (§9.7.3) ──
 
-const HANDSHAKE_MAGIC: [u8; 3] = [0x4C, 0x41, 0x49]; // "LAI"
 const HANDSHAKE_VERSION: u8 = 0x01;
 
 pub struct HandshakeFrameHeader {
@@ -125,7 +133,7 @@ pub struct HandshakeFrameHeader {
 pub fn encode_handshake_frame(step: u8, payload: &[u8]) -> Vec<u8> {
     let len = payload.len();
     let mut frame = Vec::with_capacity(8 + len);
-    frame.extend_from_slice(&HANDSHAKE_MAGIC);
+    frame.extend_from_slice(&MAGIC);
     frame.push(HANDSHAKE_VERSION);
     frame.push(step);
     frame.push(((len >> 16) & 0xFF) as u8);
@@ -140,7 +148,7 @@ pub fn parse_handshake_frame_header(data: &[u8]) -> Result<HandshakeFrameHeader,
     if data.len() < 8 {
         return Err(crate::error::CoreError::InvalidEndpoint("frame too short".into()));
     }
-    if data[0..3] != HANDSHAKE_MAGIC {
+    if data[0..3] != MAGIC {
         return Err(crate::error::CoreError::InvalidEndpoint("bad magic".into()));
     }
     if data[3] != HANDSHAKE_VERSION {
@@ -278,5 +286,58 @@ mod tests {
         for v in 0x0A..=0x7Fu8 {
             assert!(FrameType::from_u8(v).is_none(), "frame type 0x{v:02X} should be invalid");
         }
+    }
+
+    #[test]
+    fn test_decode_frame_rejects_oversized_payload() {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&MAGIC);
+        encode_varint(1, &mut buf); // stream_id
+        encode_varint(FrameType::Data as u64, &mut buf); // frame_type
+        encode_varint(MAX_PAYLOAD_SIZE + 1, &mut buf); // oversized payload
+        assert!(decode_frame_header(&buf).is_none(), "should reject payload > MAX_PAYLOAD_SIZE");
+    }
+
+    #[test]
+    fn test_decode_frame_rejects_type_gte_256() {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&MAGIC);
+        encode_varint(1, &mut buf);
+        encode_varint(256, &mut buf); // frame_type = 256
+        encode_varint(0, &mut buf);
+        assert!(decode_frame_header(&buf).is_none(), "should reject frame_type >= 256");
+    }
+
+    #[test]
+    fn test_varint_roundtrip_boundary() {
+        // Value 2^62-1 should roundtrip correctly
+        let v = (1u64 << 62) - 1;
+        let mut buf = Vec::new();
+        encode_varint(v, &mut buf);
+        let (decoded, _) = decode_varint(&buf).unwrap();
+        assert_eq!(v, decoded, "varint 2^62-1 should roundtrip");
+    }
+
+    #[test]
+    fn test_varint_saturates_at_max() {
+        // Values >= 2^62 saturate to 2^62-1 (8-byte QUIC varint ceiling)
+        let v = (1u64 << 62) + 1;
+        let max = (1u64 << 62) - 1;
+        let mut buf = Vec::new();
+        encode_varint(v, &mut buf);
+        let (decoded, _) = decode_varint(&buf).unwrap();
+        assert_eq!(decoded, max, "varint >= 2^62 should saturate to 2^62-1");
+        // u64::MAX should also saturate, not panic
+        let mut buf2 = Vec::new();
+        encode_varint(u64::MAX, &mut buf2);
+        let (decoded2, _) = decode_varint(&buf2).unwrap();
+        assert_eq!(decoded2, max, "u64::MAX should saturate to 2^62-1");
+    }
+
+    #[test]
+    fn test_handshake_frame_uses_magic() {
+        let frame = encode_handshake_frame(0, b"test");
+        assert_eq!(&frame[0..3], &MAGIC, "handshake frame should use MAGIC constant");
+        assert!(parse_handshake_frame_header(&frame).is_ok());
     }
 }

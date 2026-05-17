@@ -81,7 +81,7 @@ S_ADF 和 S_APDF 的区分至关重要：两者在传统分类法中都是"对�
 
 **A5（独立性）**：IPv6 可达性与 IPv4 NAT 类型视为独立随机变量。IPv6 部署和 IPv4 CGNAT 政策由运营商内不同团队管理，演化节奏不同，此假设合理。
 
-**A6（穿透能力完备）**：P2P 协议栈正确实现了所有允许的穿透技术，包括非连接式 UDP socket（Cone × S_APDF 非对称路由所需）、STUN CHANGE-REQUEST 行为分类、16 端口 TSO + Birthday Attack，以及完整的三层 fallback 链（直连 → relay → TSO）。
+**A6（穿透能力完备）**：P2P 协议栈正确实现了所有允许的穿透技术，包括非连接式 UDP socket（Cone × S_APDF 非对称路由所需）、STUN CHANGE-REQUEST 行为分类、TSO + Birthday Attack，以及完整的三层 fallback 链（直连 → relay → TSO）。实际实现使用 K=8 端口（`TSO_PORT_COUNT = 8`），本文分析使用 K=16 作为理论最优配置。覆盖估计按 K=16 计算，K=8 的覆盖略低于此值。
 
 ---
 

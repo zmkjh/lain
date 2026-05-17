@@ -22,7 +22,6 @@ impl NatProbe {
 /// STUN probe 的一次尝试结果
 struct ProbeAttempt {
     mapped: SocketAddr,
-    rtt: Duration,
 }
 
 impl NatProbe {
@@ -91,7 +90,7 @@ impl NatProber for NatProbe {
             drop(tx);
             while let Some((addr, rtt)) = rx.recv().await {
                 rtt_total += rtt.as_millis() as u64;
-                results.push(ProbeAttempt { mapped: addr, rtt });
+                results.push(ProbeAttempt { mapped: addr });
                 if results.len() >= 2 { break; }
             }
         }

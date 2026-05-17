@@ -159,6 +159,8 @@ async fn listen_local(
                 let tx = cmd_tx.clone();
                 let ev = ev_tx.clone();
                 tokio::spawn(handle_client(r, w, tx, ev));
+                // Let OS release the previous pipe instance before creating a new one
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
             }
             Err(e) => { tracing::error!("NamedPipe connect: {e}"); continue; }
         }

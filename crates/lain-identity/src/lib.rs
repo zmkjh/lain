@@ -55,8 +55,14 @@ impl Identity {
 
     /// 导出用于 Noise IK 的 X25519 密钥对
     pub fn noise_keypair(&self) -> ([u8; 32], [u8; 32]) {
-        let seed = self.signing_key.to_bytes();
-        let secret = x25519_dalek::StaticSecret::from(seed);
+        use sha2::Digest;
+        let ed_seed = self.signing_key.to_bytes();
+        // Domain separation: derive X25519 key from Ed25519 seed via simple KDF
+        let mut hasher = sha2::Sha256::new();
+        hasher.update(b"lain-noise-x25519-v1");
+        hasher.update(ed_seed);
+        let x25519_seed: [u8; 32] = hasher.finalize().into();
+        let secret = x25519_dalek::StaticSecret::from(x25519_seed);
         let public = x25519_dalek::PublicKey::from(&secret);
         (secret.to_bytes(), public.to_bytes())
     }
@@ -147,6 +153,15 @@ impl IdentityProvider for Identity {
     fn sign(&self, data: &[u8]) -> Ed25519Signature {
         self.signing_key.sign(data).to_bytes()
     }
+}
+
+/// 验证 Ed25519 签名（任意公钥，不依赖自身身份）。
+/// 用于 daemon 层验证 invite code 等外部签名。
+pub fn verify_ed25519(pk: &[u8; 32], data: &[u8], sig: &[u8; 64]) -> bool {
+    ed25519_dalek::VerifyingKey::from_bytes(pk).ok()
+        .and_then(|vk| ed25519_dalek::Signature::from_slice(sig).ok()
+            .map(|s| vk.verify_strict(data, &s).is_ok()))
+        .unwrap_or(false)
 }
 
 fn dirs_next() -> Option<PathBuf> {

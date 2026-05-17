@@ -10,25 +10,27 @@ fn main() {
         let _ = rustls::crypto::ring::default_provider().install_default();
     }
 
-    let rt = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
+    let rt = match tokio::runtime::Runtime::new() {
+        Ok(rt) => rt,
+        Err(e) => { tracing::error!("Failed to create tokio runtime: {e}"); return; }
+    };
 
     rt.block_on(async {
-        let config = lain_daemon::config::DaemonConfig::load_or_default()
-            .map_err(|e| {
+        let config = match lain_daemon::config::DaemonConfig::load_or_default() {
+            Ok(c) => c,
+            Err(e) => {
                 tracing::error!("Config error: {e}");
                 std::process::exit(1);
-            })
-            .ok()
-            .unwrap();
+            }
+        };
 
-        let daemon = lain_daemon::Daemon::new(config)
-            .await
-            .map_err(|e| {
+        let daemon = match lain_daemon::Daemon::new(config).await {
+            Ok(d) => d,
+            Err(e) => {
                 tracing::error!("Daemon init error: {e}");
                 std::process::exit(1);
-            })
-            .ok()
-            .unwrap();
+            }
+        };
 
         if let Err(e) = daemon.run().await {
             tracing::error!("Daemon error: {e}");

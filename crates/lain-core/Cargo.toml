@@ -6,9 +6,7 @@ license.workspace = true
 
 [dependencies]
 thiserror.workspace = true
-bytes.workspace = true
 async-trait = "0.1"
-tokio = { workspace = true, features = ["sync"] }
 tracing.workspace = true
 serde = { workspace = true, features = ["derive"] }
 hex = "0.4"
