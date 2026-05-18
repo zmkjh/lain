@@ -496,19 +496,32 @@ async fn handle_relay(
     let tt: Arc<dyn Connection> = Arc::from(target_conn);
     let t2 = tt.clone();
     let r2 = rt.clone();
+    let (cancel_tx, mut cancel_rx) = tokio::sync::watch::channel(false);
+    let mut cancel_rx1 = cancel_rx.clone();
+    let cancel_tx2 = cancel_tx.clone();
     tokio::spawn(async move {
         loop {
-            match rt.recv().await {
-                Ok((_, d)) => { if tt.send(FrameType::Data, &d).await.is_err() { break; } }
-                Err(_) => break,
+            tokio::select! {
+                r = rt.recv() => {
+                    match r {
+                        Ok((_, d)) => { if tt.send(FrameType::Data, &d).await.is_err() { let _ = cancel_tx.send(true); break; } }
+                        Err(_) => { let _ = cancel_tx.send(true); break; }
+                    }
+                }
+                _ = cancel_rx1.changed() => break,
             }
         }
     });
     tokio::spawn(async move {
         loop {
-            match t2.recv().await {
-                Ok((_, d)) => { if r2.send(FrameType::Data, &d).await.is_err() { break; } }
-                Err(_) => break,
+            tokio::select! {
+                r = t2.recv() => {
+                    match r {
+                        Ok((_, d)) => { if r2.send(FrameType::Data, &d).await.is_err() { let _ = cancel_tx2.send(true); break; } }
+                        Err(_) => { let _ = cancel_tx2.send(true); break; }
+                    }
+                }
+                _ = cancel_rx.changed() => break,
             }
         }
     });
@@ -804,8 +817,12 @@ fn spawn_reconnect(
                             break 'outer;
                         }
                         current = Arc::from(new);
-                        if let Some((existing, _)) = connected.write().await.get_mut(&pid) {
-                            *existing = current.clone();
+                        let mut conns = connected.write().await;
+                        if let Some((entry, _)) = conns.get_mut(&pid) {
+                            *entry = current.clone();
+                        } else {
+                            // Peer was removed from tracking map while reconnecting
+                            break 'outer;
                         }
                         let _ = ipc.send(IpcResponse::Event {
                             event: "peer_connected".into(),

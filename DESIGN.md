@@ -2048,19 +2048,19 @@ Lain 设计上把 IPv6 视为最优路径——全球唯一地址意味着零 NA
 
 ### A.5 测试覆盖分析
 
-当前总计 **155 个自动化测试**（0 warning，全部通过），分布如下：
+当前总计 **138 个自动化测试**（0 failure，全部通过），分布如下：
 
 | 模块 | 测试数 | 覆盖范围 |
 |------|--------|----------|
-| `lain-core` | 14 | VarInt 编解码 + 10 种 FrameType 往返 + 违法帧拒绝 |
+| `lain-core` | 19 | VarInt 编解码 + 10 种 FrameType 往返 + 违法帧拒绝 + PeerID 序列化 |
 | `lain-identity` | 6 | Ed25519 生成/签名/验证/确定性 + Noise 密钥转换 + identity.json 持久化及损坏自动再生 |
-| `lain-nat` | 14 | STUN 绑定请求构造 + XOR-MAPPED-ADDRESS + MAPPED-ADDRESS 解析 + IPv4/IPv6 处理 + 截断/未知族拒绝 + 完整属性遍历 |
-| `lain-noise` | 10 | 完整 Noise IK 握手 + 多轮加密往返 + 4KB 大包 + 空包 + 错误公钥握手失败 |
-| `lain-dht` | 48 | 路由表(14) + 消息编解码(11) + handler(23)：PING/PONG/STORE/FIND_VALUE/FIND_NODE + Ed25519 签名验证(全消息类型) + 篡改拒绝 + TTL clamp + deferred verification + 离线缓存查找 + 过期清理 + routes.json 存取 |
-| `lain-discovery` | 8 | invite Base62/URI 往返 + 多端点 + 过期检测 + 无效输入拒绝 + 全字段（noise_pk/caps/priority/timestamp/signature）一致性 |
-| `lain-transport` | 7 | config 默认值/自定义 + bind/local_addr + NoVerify TLS 结构 + 多端点 fallback + 不可达地址报错 |
-| `lain-daemon` | 39 | IPC 全命令序列化/反序列化(16) + Windows Named Pipe 真机往返(5) + peers.json 签名格式往返 + conn_mgr + iface_watcher + 集成测试(12)：bootstrap+find+store+relay e2e+并发 10 连接+畸形消息 |
-| **总计** | **155** | Windows 真机 CLI 全命令（whoami/invite/status/monitor/shutdown）通过 |
+| `lain-nat` | 4 | STUN 绑定请求构造 + XOR-MAPPED-ADDRESS + MAPPED-ADDRESS 解析 + Cone/Symmetric 分类 |
+| `lain-noise` | 2 | 完整 Noise IK 握手 + 多轮加密往返 + PeerID 绑定 |
+| `lain-dht` | 48 | 路由表(10) + 消息编解码(11) + handler(27)：PING/PONG/STORE/FIND_VALUE/FIND_NODE + Ed25519 签名验证(全消息类型) + 篡改拒绝 + TTL clamp + deferred verification + 离线缓存查找 + 过期清理 + routes.json 存取 |
+| `lain-discovery` | 9 | invite Base62/URI 往返 + 多端点 + 过期检测 + 无效输入拒绝 + 全字段（noise_pk/caps/priority/timestamp/signature）一致性 + mDNS 解析 |
+| `lain-transport` | 3 | QUIC/TCP 连接 guard + send/recv 缓冲区 + PeekConnection 委托 |
+| `lain-daemon` | 47 | IPC 全命令序列化/反序列化(16) + Windows Named Pipe 真机往返(5) + peers.json 签名格式往返 + conn_mgr + iface_watcher + 集成测试(12)：QUIC/TCP 握手 + 数据收发 + 并发连接 + 畸形消息 |
+| **总计** | **138** | Windows 真机 CLI 全命令（whoami/invite/status/monitor/shutdown）通过 |
 
 **未覆盖但已通过真机验证的路径：**
 - Named Pipe IPC 实际收发（5 个 Windows-only 测试）

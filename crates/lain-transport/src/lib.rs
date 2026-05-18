@@ -376,6 +376,7 @@ impl Transport {
                 if c.peer_id() == peer_id {
                     return Ok(c);
                 }
+                c.close();
             }
         }
         Err(TransportError::NoPath)
@@ -622,7 +623,8 @@ async fn tso_handshake(
     let mut info = [0u8; 64];
     info[..32].copy_from_slice(&my_id.0);
     info[32..].copy_from_slice(&our_pk);
-    stream.write_all(&info).await
+    tokio::time::timeout(std::time::Duration::from_secs(15), stream.write_all(&info)).await
+        .map_err(|_| TransportError::Connect("tso_handshake timeout sending identity".into()))?
         .map_err(|e| TransportError::Io(e.to_string()))?;
 
     let mut their_info = [0u8; 64];

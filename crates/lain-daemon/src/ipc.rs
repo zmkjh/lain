@@ -147,10 +147,20 @@ async fn listen_local(
     use tokio::net::windows::named_pipe::ServerOptions;
     let pipe_name = pipe_path.to_string_lossy().to_string();
 
+    tracing::info!("pipe listener starting on {:?}", pipe_name);
     loop {
         let server = match ServerOptions::new().create(&pipe_name) {
-            Ok(s) => s,
-            Err(e) => { tracing::error!("NamedPipe create: {e}"); break; }
+            Ok(s) => {
+                tracing::info!("NamedPipe instance created, waiting for client...");
+                s
+            }
+            // ERROR_PIPE_BUSY: previous instance hasn't been released yet by
+            // a slow handle_client task. Retry instead of killing the IPC server.
+            Err(e) => {
+                tracing::warn!("NamedPipe create: {e} (will retry)");
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                continue;
+            }
         };
 
         match server.connect().await {
@@ -160,7 +170,7 @@ async fn listen_local(
                 let ev = ev_tx.clone();
                 tokio::spawn(handle_client(r, w, tx, ev));
                 // Let OS release the previous pipe instance before creating a new one
-                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
             }
             Err(e) => { tracing::error!("NamedPipe connect: {e}"); continue; }
         }

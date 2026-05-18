@@ -20,12 +20,11 @@ impl IpcStream {
         { std::os::unix::net::UnixStream::connect(path).map(IpcStream::Unix) }
         #[cfg(target_os = "windows")]
         {
-            use std::os::windows::fs::OpenOptionsExt;
             let file = std::fs::OpenOptions::new()
                 .read(true).write(true)
-                .custom_flags(0x40000000) // FILE_FLAG_OVERLAPPED
                 .open(path)?;
-            // 设置 pipe 为非阻塞模式，使 read() 返回 WouldBlock
+            // Set non-blocking mode so read() returns ERROR_NO_DATA (232)
+            // instead of blocking when no data is available yet.
             set_pipe_nonblocking(&file)?;
             Ok(IpcStream::Pipe(file))
         }
@@ -123,10 +122,17 @@ fn main() {
     let socket_path = ipc_socket(&cli.socket);
 
     // Set up logging
-    if cli.foreground {
+    // Three cases:
+    //  1. Interactive foreground daemon (-f):       stdout (terminal)
+    //  2. Daemon child process (LAIN_DAEMON_CHILD): file   (persistent log)
+    //  3. CLI parent process (lain daemon, etc.):   stderr (avoids file lock
+    //     conflict with daemon child)
+    let is_daemon_child = std::env::var("LAIN_DAEMON_CHILD").is_ok();
+    if cli.foreground && !is_daemon_child {
+        // Case 1: interactive foreground — write to stderr (visible in terminal)
         tracing_subscriber::fmt::init();
-    } else {
-        // Log to file in Lain config directory
+    } else if is_daemon_child {
+        // Case 2: daemon child — persistent file logging
         let log_path = {
             let mut d = if let Ok(h) = std::env::var("LAIN_HOME") {
                 PathBuf::from(h)
@@ -152,6 +158,9 @@ fn main() {
         } else {
             tracing_subscriber::fmt::init();
         }
+    } else {
+        // Case 3: CLI parent — stderr (no file lock contention with daemon child)
+        tracing_subscriber::fmt().with_writer(std::io::stderr).with_ansi(false).init();
     }
 
     match cli.command.unwrap_or(Command::Status) {
@@ -211,6 +220,7 @@ fn run_daemon(foreground: bool) {
         let exe = std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("lain"));
         match std::process::Command::new(&exe)
             .arg("-f").arg("daemon")
+            .env("LAIN_DAEMON_CHILD", "1")
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .spawn() {
@@ -284,6 +294,13 @@ fn read_line_timeout(reader: &mut BufReader<IpcStream>, timeout_secs: u64) -> st
         // Read one byte at a time with a short wait between retries
         match reader.get_mut().read(&mut buf) {
             Ok(0) => {
+                // On Windows PIPE_NOWAIT, ReadFile returns ERROR_NO_DATA (232)
+                // when no data is available yet. Rust std maps this to Ok(0).
+                // If we haven't read anything yet, retry instead of failing.
+                if line.is_empty() && start.elapsed().as_secs() < timeout_secs {
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                    continue;
+                }
                 if line.is_empty() { return Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "eof")); }
                 return Ok(line);
             }
@@ -291,7 +308,11 @@ fn read_line_timeout(reader: &mut BufReader<IpcStream>, timeout_secs: u64) -> st
                 line.push(buf[0] as char);
                 if buf[0] == b'\n' { return Ok(line); }
             }
-            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+            // On Windows PIPE_NOWAIT, read() returns ERROR_NO_DATA (232) when
+            // no data is available yet. Rust maps this to BrokenPipe, but it's
+            // a transient "try again" condition, NOT a real pipe closure.
+            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock
+                       || e.kind() == std::io::ErrorKind::BrokenPipe => {
                 std::thread::sleep(std::time::Duration::from_millis(100));
                 continue;
             }
@@ -305,8 +326,9 @@ fn ipc_req(socket_path: &PathBuf, json: &str) -> Option<serde_json::Value> {
     let req = json.to_string() + "\n";
     stream.write_all(req.as_bytes()).ok()?;
     let mut reader = BufReader::new(stream);
-    let mut response = String::new();
-    reader.read_line(&mut response).ok()?;
+    // On Windows PIPE_NOWAIT mode, read() returns Ok(0) when no data is
+    // available yet. read_line_timeout handles this by retrying.
+    let response = read_line_timeout(&mut reader, 5).ok()?;
     serde_json::from_str(&response).ok()
 }
 
