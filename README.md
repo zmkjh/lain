@@ -3,7 +3,7 @@
 **零服务器 P2P 网络基础设施。** 无需 bootstrap 节点、无需 DNS、无需 TLS 证书。PeerID 即身份，Invite 即入口，DHT 即拓扑。
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-[![Tests](https://img.shields.io/badge/tests-148-brightgreen.svg)](https://github.com/zmkjh/lain/actions)
+[![Tests](https://img.shields.io/badge/tests-155-brightgreen.svg)](https://github.com/zmkjh/lain/actions)
 ![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-lightgrey)
 
 ## 核心创新

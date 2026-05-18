@@ -80,7 +80,7 @@ Lain 是一个零服务器、零配置的 P2P 网络基础设施，以 daemon �
 pub trait IdentityProvider: Send + Sync {
     fn peer_id(&self) -> PeerId;                 // SHA256(公钥)
     fn public_key(&self) -> &Ed25519PublicKey;
-    fn sign(&self, data: &[u8]) -> Ed25519Signature;
+    fn sign(&self, data: &[u8]) -> Result<Ed25519Signature, CoreError>;
 }
 
 // ── lain-core/src/crypto.rs
@@ -809,7 +809,7 @@ insert_node(new):
 
 超时 5s，重试 2 次。
 
-**签名策略**：请求端对所有 RPC 请求 Ed25519 签名（防篡改 + 防重放）。响应端仅对包含可验证数据 payload 的响应签名（如 FIND_VALUE 返回的 value / STORE 返回的 key 确认）。空 payload 响应（如 PING 的 k-closest 列表、STORE 的 ok）无需签名——接收方通过 message_id 关联到原始请求即可验证响应合法性。
+**签名策略**：所有携带非零签名的消息均进行 Ed25519 验证。请求端对所有 RPC 请求签名（防篡改 + 防重放）。响应端签名覆盖所有类型（PING k-closest 列表、FIND_NODE 响应、FIND_VALUE 结果），不再区分"有 payload"和"空 payload"。
 
 ### 9.4 Bootstrap
 
@@ -1437,6 +1437,10 @@ INFO  NAT probed: Cone, ipv6=available
 └── logs/lain.log        # 可选日志文件
 ```
 
+#### identity.json
+
+**损坏处理**：`identity.json` 损坏或格式错误 → WARN 日志，自动重新生成新 identity，覆盖损坏文件。不影响 daemon 启动。
+
 #### routes.json (DHT 路由表)
 
 **写入时机**：
@@ -2044,19 +2048,19 @@ Lain 设计上把 IPv6 视为最优路径——全球唯一地址意味着零 NA
 
 ### A.5 测试覆盖分析
 
-当前总计 **135 个自动化测试**（0 warning，全部通过），分布如下：
+当前总计 **155 个自动化测试**（0 warning，全部通过），分布如下：
 
 | 模块 | 测试数 | 覆盖范围 |
 |------|--------|----------|
 | `lain-core` | 14 | VarInt 编解码 + 10 种 FrameType 往返 + 违法帧拒绝 |
-| `lain-identity` | 6 | Ed25519 生成/签名/验证/确定性 + Noise 密钥转换 + identity.json 持久化及损坏拒绝 |
+| `lain-identity` | 6 | Ed25519 生成/签名/验证/确定性 + Noise 密钥转换 + identity.json 持久化及损坏自动再生 |
 | `lain-nat` | 14 | STUN 绑定请求构造 + XOR-MAPPED-ADDRESS + MAPPED-ADDRESS 解析 + IPv4/IPv6 处理 + 截断/未知族拒绝 + 完整属性遍历 |
 | `lain-noise` | 10 | 完整 Noise IK 握手 + 多轮加密往返 + 4KB 大包 + 空包 + 错误公钥握手失败 |
-| `lain-dht` | 38 | 路由表(10) + 消息编解码(11) + handler(17)：PING/PONG/STORE/FIND_VALUE/FIND_NODE + Ed25519 签名 verify_strict + 篡改拒绝 + TTL clamp + deferred verification + 离线缓存查找 + 过期清理 + routes.json 存取 |
+| `lain-dht` | 48 | 路由表(14) + 消息编解码(11) + handler(23)：PING/PONG/STORE/FIND_VALUE/FIND_NODE + Ed25519 签名验证(全消息类型) + 篡改拒绝 + TTL clamp + deferred verification + 离线缓存查找 + 过期清理 + routes.json 存取 |
 | `lain-discovery` | 8 | invite Base62/URI 往返 + 多端点 + 过期检测 + 无效输入拒绝 + 全字段（noise_pk/caps/priority/timestamp/signature）一致性 |
 | `lain-transport` | 7 | config 默认值/自定义 + bind/local_addr + NoVerify TLS 结构 + 多端点 fallback + 不可达地址报错 |
 | `lain-daemon` | 39 | IPC 全命令序列化/反序列化(16) + Windows Named Pipe 真机往返(5) + peers.json 签名格式往返 + conn_mgr + iface_watcher + 集成测试(12)：bootstrap+find+store+relay e2e+并发 10 连接+畸形消息 |
-| **总计** | **135** | Windows 真机 CLI 全命令（whoami/invite/status/monitor/shutdown）通过 |
+| **总计** | **155** | Windows 真机 CLI 全命令（whoami/invite/status/monitor/shutdown）通过 |
 
 **未覆盖但已通过真机验证的路径：**
 - Named Pipe IPC 实际收发（5 个 Windows-only 测试）
