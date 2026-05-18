@@ -166,7 +166,7 @@ fn encode_message(
     payload: &[u8],
     sign_seed: Option<&[u8; 32]>,
 ) -> Vec<u8> {
-    let mut msg = Vec::with_capacity(83 + payload.len() + 64);
+    let mut msg = Vec::with_capacity(53 + payload.len() + 64);
     msg.push(PROTOCOL_VERSION);
     msg.extend_from_slice(&message_id);
     let type_byte = msg_type as u8 | if is_response { 0x80 } else { 0 };
@@ -370,7 +370,7 @@ pub fn parse_nodes_from_payload(payload: &[u8]) -> Option<Vec<(PeerId, SocketAdd
 
     for _ in 0..count {
         if offset + 32 > payload.len() {
-            break;
+            return None; // declared count larger than available data
         }
         let mut id_bytes = [0u8; 32];
         id_bytes.copy_from_slice(&payload[offset..offset + 32]);
@@ -425,7 +425,7 @@ pub fn parse_endpoints(data: &[u8], ep_data_len: usize) -> Vec<Endpoint> {
             3 => EndpointKind::WebSocket,
             4 => EndpointKind::Relay,
             5 => EndpointKind::TSO,
-            _ => EndpointKind::STUN,
+            _ => return vec![], // unknown kind, stop parsing
         };
         let ttl_bytes = [data[offset], data[offset+1], data[offset+2], data[offset+3]];
         let ttl = u32::from_be_bytes(ttl_bytes);

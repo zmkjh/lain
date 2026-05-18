@@ -48,10 +48,13 @@ impl NoiseHandshake for Handshake {
     }
 
     fn remote_pubkey(&self) -> Option<[u8; 32]> {
-        self.state.get_remote_static().map(|k| {
+        self.state.get_remote_static().and_then(|k| {
+            if k.len() != 32 {
+                return None;
+            }
             let mut pk = [0u8; 32];
-            pk.copy_from_slice(&k[..32.min(k.len())]);
-            pk
+            pk.copy_from_slice(k);
+            Some(pk)
         })
     }
 }

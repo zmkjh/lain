@@ -83,7 +83,9 @@ impl MdnsDiscovery {
                     .and_then(|p| std::str::from_utf8(p.val()?).ok())?;
 
                 let peer_id = PeerId::from_hex(peer_id_str).ok()?;
-                let addr = info.get_addresses().iter().next()?;
+                let addrs = info.get_addresses();
+                let addr = addrs.iter().find(|a| a.is_ipv4())
+                    .or_else(|| addrs.iter().next())?;
                 let port = info.get_port();
 
                 Some((peer_id, SocketAddr::new(*addr, port), port))

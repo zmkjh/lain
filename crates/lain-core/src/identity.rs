@@ -8,5 +8,5 @@ pub type Ed25519Signature = [u8; 64];
 pub trait IdentityProvider: Send + Sync {
     fn peer_id(&self) -> PeerId;
     fn public_key(&self) -> &Ed25519PublicKey;
-    fn sign(&self, data: &[u8]) -> Ed25519Signature;
+    fn sign(&self, data: &[u8]) -> Result<Ed25519Signature, crate::error::CoreError>;
 }

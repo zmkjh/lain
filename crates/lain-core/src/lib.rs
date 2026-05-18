@@ -20,7 +20,7 @@ pub mod frame;
 
 // 协议常量
 pub const PROTOCOL_VERSION: u8 = 1;
-pub const MAGIC: [u8; 3] = [0x4C, 0x41, 0x49]; // "LAI"
+pub use frame::MAGIC;  // re-export from frame.rs (single source of truth)
 
 /// DHT 参数默认值
 pub const DHT_K: usize = 20;

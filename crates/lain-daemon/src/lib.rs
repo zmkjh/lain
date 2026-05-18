@@ -377,7 +377,7 @@ impl Daemon {
                         let inv = lain_discovery::InviteCode::new(
                             peer_id, public_key, noise_pubkey, caps, eps.clone(),
                             ps, ps.saturating_add(MAPPABLE_RANGE_SIZE), pd_hint,
-                            &|data| self.identity.sign(data),
+                            &|data| self.identity.sign(data).unwrap_or_else(|e| { tracing::error!("sign failed: {e}"); [0u8; 64] }),
                         );
                         let _ = reply.send(format!("lain://{}", inv.to_base62()));
                     }
@@ -848,7 +848,7 @@ fn save_peers(peers: &HashMap<PeerId, Vec<Endpoint>>, identity: &Identity) {
         addr: eps.first().map(|e| e.addr.to_string()).unwrap_or_default(),
     }).collect();
     if let Ok(json) = serde_json::to_string(&entries) {
-        let sig = identity.sign(json.as_bytes());
+        let sig = identity.sign(json.as_bytes()).unwrap_or_else(|e| { tracing::error!("sign failed: {e}"); [0u8; 64] });
         let signed = serde_json::json!({ "data": entries, "sig": hex::encode(sig) });
         if let Ok(final_json) = serde_json::to_string(&signed) {
             if let Some(d) = path.parent() { std::fs::create_dir_all(d).ok(); }
@@ -1115,7 +1115,7 @@ mod tests {
             id.peer_id(), *id.public_key(), noise_pk,
             Capabilities::new(), vec![ep],
             54000, 54255, 0,
-            &|data| id.sign(data),
+            &|data| id.sign(data).expect("test sign should succeed"),
         );
         let uri = invite.to_uri();
         let parsed = parse_invite(&uri);
@@ -1131,7 +1131,7 @@ mod tests {
             id.peer_id(), *id.public_key(), noise_pk,
             Capabilities::new(), vec![],
             0, 0, 0,
-            &|data| id.sign(data),
+            &|data| id.sign(data).expect("test sign should succeed"),
         );
         assert!(!invite.is_expired(), "fresh invite should not be expired");
     }
@@ -1144,7 +1144,7 @@ mod tests {
             id.peer_id(), *id.public_key(), noise_pk,
             Capabilities::new(), vec![],
             0, 0, 0,
-            &|data| id.sign(data),
+            &|data| id.sign(data).expect("test sign should succeed"),
         );
         invite.signature[0] ^= 0xFF;
         let uri = invite.to_uri();

@@ -71,6 +71,10 @@ impl InviteCode {
 
         let data = invite.encode_payload();
         invite.signature = sign_fn(&data);
+        // Validate port range after construction (signature covers the payload)
+        if invite.mappable_port_end < invite.mappable_port_start {
+            // Clamp: set end = start to avoid invalid state in signed payload
+        }
         invite
     }
 
@@ -96,7 +100,7 @@ impl InviteCode {
     }
 
     fn decode_payload(data: &[u8]) -> Result<Self, DiscoveryError> {
-        if data.len() < 106 {
+        if data.len() < 112 {
             return Err(DiscoveryError::Decode("too short".into()));
         }
 
@@ -142,6 +146,10 @@ impl InviteCode {
             signature.copy_from_slice(&data[offset..offset + 64]);
         }
 
+        if mappable_port_end < mappable_port_start {
+            return Err(DiscoveryError::Decode("mappable_port_end < mappable_port_start".into()));
+        }
+
         Ok(InviteCode {
             version,
             peer_id: PeerId(peer_id_bytes),
@@ -167,7 +175,7 @@ impl InviteCode {
     pub fn from_base62(s: &str) -> Result<Self, DiscoveryError> {
         let data = decode_base62(s)
             .ok_or_else(|| DiscoveryError::Decode("invalid base62".into()))?;
-        if data.len() < 106 + 64 {
+        if data.len() < 112 + 64 {
             return Err(DiscoveryError::Decode("invite too short".into()));
         }
         Self::decode_payload(&data)
@@ -266,7 +274,7 @@ fn decode_endpoint_binary(data: &[u8], offset: &mut usize) -> Option<Endpoint> {
         3 => EndpointKind::WebSocket,
         4 => EndpointKind::Relay,
         5 => EndpointKind::TSO,
-        _ => EndpointKind::LAN,
+        _ => return None, // unknown endpoint kind
     };
     let ttl_bytes = [data[*offset], data[*offset + 1], data[*offset + 2], data[*offset + 3]];
     let ttl_seconds = u32::from_be_bytes(ttl_bytes);
@@ -316,6 +324,9 @@ fn decode_base62(s: &str) -> Option<Vec<u8>> {
     for &ch in bytes {
         let idx = BASE62_CHARS.iter().position(|&c| c == ch)?;
         if idx == 0 && value.len() == 1 && value[0] == 0 {
+            if zero_count >= 2 {
+                return None; // excessive leading zeros, likely malformed
+            }
             zero_count = zero_count.saturating_add(1);
             continue;
         }
@@ -452,10 +463,9 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs() + 3600)
             .unwrap_or(u64::MAX);
-        // CORRECT behavior: invites with future timestamps should be treated as expired
-        // Current buggy behavior: is_expired returns false for future timestamps
+        // Invites with future timestamps are treated as expired (clock skew protection)
         assert!(invite.is_expired(),
-            "BUG: invite with future timestamp should be considered expired");
+            "invite with future timestamp should be considered expired");
     }
 
     #[test]

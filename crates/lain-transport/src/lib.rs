@@ -56,7 +56,7 @@ use thiserror::Error;
 use rand::Rng;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, watch};
 
 #[derive(Error, Debug)]
 pub enum TransportError {
@@ -102,10 +102,14 @@ impl Connection for QuicConnection {
         loop {
             let (_, mut recv) = self.quic.accept_bi().await
                 .map_err(|e| CoreError::InvalidEndpoint(e.to_string()))?;
-            let data = recv.read_to_end(4 * 65536).await
+            let data = recv.read_to_end(lain_core::frame::MAX_PAYLOAD_SIZE as usize).await
                 .map_err(|e| CoreError::InvalidEndpoint(e.to_string()))?;
             if data.is_empty() { continue; }
             if let Some((_, ft, plen, hlen)) = frame::decode_frame_header(&data) {
+                // Skip control frames; the caller only sees Data/application frames.
+                if matches!(ft, FrameType::Headers) {
+                    continue;
+                }
                 let payload = data.get(hlen..hlen + plen as usize)
                     .unwrap_or(&[]).to_vec();
                 return Ok((ft, payload));
@@ -351,7 +355,7 @@ impl Transport {
         noise_pubkey: &[u8; 32],
         endpoints: &[Endpoint],
     ) -> Result<Box<dyn Connection>, TransportError> {
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<Result<Box<dyn Connection>, TransportError>>(4);
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Result<Box<dyn Connection>, TransportError>>(16);
 
         for ep in endpoints {
             if !matches!(ep.kind, EndpointKind::IPv6 | EndpointKind::STUN) { continue; }
@@ -386,7 +390,8 @@ impl Transport {
         mappable_port_start: u16,
         mappable_port_end: u16,
     ) -> Result<Box<dyn Connection>, TransportError> {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(102);
+        const TSO_DEADLINE_SECS: u64 = 102;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(TSO_DEADLINE_SECS);
         let bind_ip = self.endpoint.local_addr()
             .map(|a| a.ip()).unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED));
 
@@ -413,9 +418,9 @@ impl Transport {
         let remote_addrs: Vec<SocketAddr> = if let Some(ref range) = mappable_range {
             let mut addrs = tso_endpoints.to_vec();
             for _ in 0..local_ports as usize {
-                let random_port = range.start.wrapping_add(
-                    (rand::random::<u32>() % ((range.end - range.start) as u32)) as u16,
-                );
+                let range_len = (range.end - range.start) as u32;
+                let offset = if range_len > 0 { rand::random::<u32>() % range_len } else { 0 };
+                let random_port = range.start + offset as u16;
                 if let Some(base) = tso_endpoints.first() {
                     addrs.push(SocketAddr::new(base.ip(), random_port));
                 }
@@ -440,6 +445,11 @@ impl Transport {
         // to avoid spawning duplicate 4-tuple connections.
         let in_flight: Arc<Mutex<HashSet<(u16, SocketAddr)>>> =
             Arc::new(Mutex::new(HashSet::new()));
+
+        // ── Cancellation signal ──
+        // When connect_tso returns (success or timeout), the sender is dropped
+        // and all spawned tasks receive the cancellation signal.
+        let (cancel_tx, cancel_rx) = watch::channel(false);
 
         // ── Continuous staggered flow ──
         // Instead of burst-sleep rounds, we keep ~all pairs continuously alive:
@@ -475,6 +485,7 @@ impl Transport {
 
             let sr = stream_result.clone();
             let infl = in_flight.clone();
+            let mut cancel_rx_clone = cancel_rx.clone();
             tokio::spawn(async move {
                 // Quick bail if another task already won.
                 if sr.lock().await.is_some() {
@@ -491,15 +502,27 @@ impl Transport {
                 if let Ok(s) = s {
                     s.set_reuseaddr(true).ok();
                     if s.bind(la).is_ok() {
-                        if let Ok(Ok(stream)) = tokio::time::timeout(
+                        let connect_fut = tokio::time::timeout(
                             std::time::Duration::from_millis(connect_timeout_ms),
                             s.connect(ra),
-                        )
-                        .await
-                        {
-                            let mut res = sr.lock().await;
-                            if res.is_none() {
-                                *res = Some(stream);
+                        );
+                        tokio::select! {
+                            biased;
+                            _ = cancel_rx_clone.changed() => {
+                                // Cancellation: parent returned, stop immediately
+                            }
+                            result = connect_fut => {
+                                if let Ok(Ok(stream)) = result {
+                                    // Verify connected address matches target
+                                    if stream.peer_addr().ok() != Some(ra) {
+                                        infl.lock().await.remove(&(la.port(), ra));
+                                        return;
+                                    }
+                                    let mut res = sr.lock().await;
+                                    if res.is_none() {
+                                        *res = Some(stream);
+                                    }
+                                }
                             }
                         }
                     }
@@ -512,6 +535,9 @@ impl Transport {
             // Stagger the next spawn.
             tokio::time::sleep(std::time::Duration::from_millis(stagger_ms)).await;
         }
+
+        // Drop cancel_tx to signal all remaining spawned tasks to stop.
+        drop(cancel_tx);
 
         if let Some(stream) = stream_result.lock().await.take() {
             tracing::info!("TSO connected, starting handshake");
@@ -604,8 +630,14 @@ async fn tso_handshake(
         .map_err(|_| TransportError::Connect("tso_handshake timeout reading peer info".into()))?
         .map_err(|e| TransportError::Io(e.to_string()))?;
 
-    let their_id = PeerId(their_info[..32].try_into().unwrap_or([0u8; 32]));
-    let their_pk: &[u8; 32] = their_info[32..].try_into().unwrap_or(&[0u8; 32]);
+    let their_id = PeerId(match <[u8; 32]>::try_from(&their_info[..32]) {
+        Ok(id) => id,
+        Err(_) => return Err(TransportError::Connect("invalid peer info".into())),
+    });
+    let their_pk: &[u8; 32] = match <&[u8; 32]>::try_from(&their_info[32..]) {
+        Ok(pk) => pk,
+        Err(_) => return Err(TransportError::Connect("invalid peer info".into())),
+    };
     let we_init = my_id.0 < their_id.0;
 
     let mut noise: Box<dyn NoiseHandshake> = if we_init {

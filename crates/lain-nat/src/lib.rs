@@ -15,7 +15,8 @@ pub struct NatProbe {
 
 impl NatProbe {
     pub fn new(servers: Vec<SocketAddr>, timeout_secs: u64) -> Self {
-        Self { servers, timeout: Duration::from_secs(timeout_secs) }
+        let secs = timeout_secs.max(1);
+        Self { servers, timeout: Duration::from_secs(secs) }
     }
 }
 
@@ -28,7 +29,8 @@ impl NatProbe {
     pub async fn ipv6_status() -> (bool, Option<std::net::Ipv6Addr>) {
         let v6_avail = tokio::net::UdpSocket::bind("[::1]:0").await.is_ok();
         let global = if v6_avail {
-            if_addrs::get_if_addrs().ok().and_then(|ifs| {
+            tokio::task::spawn_blocking(|| {
+                if_addrs::get_if_addrs().ok().and_then(|ifs| {
                     ifs.into_iter().find_map(|i| match i.addr {
                         if_addrs::IfAddr::V6(v6)
                             if !v6.ip.is_loopback()
@@ -37,6 +39,7 @@ impl NatProbe {
                         _ => None,
                     })
                 })
+            }).await.unwrap_or(None)
         } else { None };
         (v6_avail, global)
     }
@@ -77,22 +80,27 @@ impl NatProber for NatProbe {
         let mut rtt_total: u64 = 0;
 
         if !self.servers.is_empty() {
-            let (tx, mut rx) = tokio::sync::mpsc::channel::<(SocketAddr, Duration)>(self.servers.len());
-            for &server in &self.servers {
-                let tx = tx.clone();
-                let t = self.timeout;
-                tokio::spawn(async move {
-                    if let Some(r) = probe_server(t, server).await {
-                        tx.send(r).await.ok();
-                    }
-                });
-            }
-            drop(tx);
-            while let Some((addr, rtt)) = rx.recv().await {
-                rtt_total += rtt.as_millis() as u64;
-                results.push(ProbeAttempt { mapped: addr });
-                if results.len() >= 2 { break; }
-            }
+            let global_timeout = self.timeout * 2;
+            let collect_fut = async {
+                let (tx, mut rx) = tokio::sync::mpsc::channel::<(SocketAddr, Duration)>(self.servers.len());
+                for &server in &self.servers {
+                    let tx = tx.clone();
+                    let t = self.timeout;
+                    tokio::spawn(async move {
+                        if let Some(r) = probe_server(t, server).await {
+                            tx.send(r).await.ok();
+                        }
+                    });
+                }
+                drop(tx);
+                while let Some((addr, rtt)) = rx.recv().await {
+                    rtt_total += rtt.as_millis() as u64;
+                    results.push(ProbeAttempt { mapped: addr });
+                    if results.len() >= 2 { break; }
+                }
+            };
+            let _ = tokio::time::timeout(global_timeout, collect_fut).await;
+            // results and rtt_total may be partial if timeout fired — that's ok
         }
 
         if results.is_empty() {
@@ -128,7 +136,8 @@ impl NatProber for NatProbe {
             }).collect()
         } else { vec![] };
 
-        let port_delta = if deltas.iter().all(|&d| d == 1) { Some(1) }
+        let port_delta = if deltas.is_empty() { None }
+            else if deltas.iter().all(|&d| d == 1) { Some(1) }
             else if deltas.windows(2).all(|w| w[0] == w[1]) { deltas.first().copied() }
             else { None };
 

@@ -37,7 +37,7 @@ pub const MAX_PAYLOAD_SIZE: u64 = 4 * 1024 * 1024; // 4 MiB
 
 /// 编码 Lain 帧
 pub fn encode_frame(stream_id: u64, frame_type: FrameType, payload: &[u8]) -> Vec<u8> {
-    let mut f = Vec::with_capacity(8 + payload.len());
+    let mut f = Vec::with_capacity(27 + payload.len());
     f.extend_from_slice(&MAGIC);
     encode_varint(stream_id, &mut f);
     encode_varint(frame_type as u64, &mut f);
@@ -146,17 +146,21 @@ pub fn encode_handshake_frame(step: u8, payload: &[u8]) -> Vec<u8> {
 /// 解析 Noise 握手帧头
 pub fn parse_handshake_frame_header(data: &[u8]) -> Result<HandshakeFrameHeader, crate::error::CoreError> {
     if data.len() < 8 {
-        return Err(crate::error::CoreError::InvalidEndpoint("frame too short".into()));
+        return Err(crate::error::CoreError::HandshakeFrame("frame too short".into()));
     }
     if data[0..3] != MAGIC {
-        return Err(crate::error::CoreError::InvalidEndpoint("bad magic".into()));
+        return Err(crate::error::CoreError::HandshakeFrame("bad magic".into()));
     }
     if data[3] != HANDSHAKE_VERSION {
-        return Err(crate::error::CoreError::InvalidEndpoint("bad version".into()));
+        return Err(crate::error::CoreError::HandshakeFrame("bad version".into()));
+    }
+    let payload_len = ((data[5] as usize) << 16) | ((data[6] as usize) << 8) | (data[7] as usize);
+    if payload_len > MAX_PAYLOAD_SIZE as usize {
+        return Err(crate::error::CoreError::HandshakeFrame("payload too large".into()));
     }
     Ok(HandshakeFrameHeader {
         step: data[4],
-        payload_len: ((data[5] as usize) << 16) | ((data[6] as usize) << 8) | (data[7] as usize),
+        payload_len,
     })
 }
 

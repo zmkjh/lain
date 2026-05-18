@@ -87,7 +87,7 @@ pub struct DhtHandle {
     socket: Arc<UdpSocket>,
     signing_key: Option<[u8; 32]>,
     pending_queries: Arc<RwLock<HashMap<[u8; 16], tokio::sync::oneshot::Sender<Option<PeerRecord>>>>>,
-    peer_ratelimit: Arc<RwLock<HashMap<PeerId, (u128, u32)>>>,
+    peer_ratelimit: Arc<RwLock<HashMap<PeerId, (std::time::Instant, u128, u32)>>>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -157,9 +157,11 @@ impl DhtHandle {
                 last_err = e.to_string();
                 continue;
             }
-            // Recursively fill routing table: FIND_NODE(self.id) from each newly discovered node
-            // Let in-flight responses populate the table; just need one successful contact
-            return Ok(());
+            // Wait briefly for at least one PING response to populate the routing table
+            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+            if self.routing_table.read().await.size() > 0 {
+                return Ok(());
+            }
         }
         Err(DhtError::BootstrapFailed { attempts: attempted, last_error: last_err })
     }
@@ -238,17 +240,17 @@ impl DhtHandle {
             let rt = self.routing_table.read().await;
             rt.closest_nodes(&self.peer_id, self.config.k)
         };
-        let msg_id: [u8; 16] = rand::random::<u128>().to_be_bytes();
-        let msg = self.encode_store(
-            &self.peer_id.0,
-            msg_id,
-            self.config.ttl_seconds,
-            pubkey,
-            noise_pubkey,
-            capabilities,
-            endpoints,
-        );
         for node in &closest {
+            let msg_id: [u8; 16] = rand::random::<u128>().to_be_bytes();
+            let msg = self.encode_store(
+                &self.peer_id.0,
+                msg_id,
+                self.config.ttl_seconds,
+                pubkey,
+                noise_pubkey,
+                capabilities,
+                endpoints,
+            );
             self.send_msg(&msg, node.address).await;
         }
         // Save locally
@@ -297,14 +299,22 @@ impl DhtHandle {
             let rt = self.routing_table.read().await;
             rt.closest_nodes(peer_id, self.config.alpha)
         };
+        let req = self.encode_find_value(msg_id, &peer_id.0);
         for node in &closest {
-            let req = self.encode_find_value(msg_id, &peer_id.0);
             self.send_msg(&req, node.address).await;
         }
 
         // Wait for response with timeout
         match tokio::time::timeout(std::time::Duration::from_secs(5), rx).await {
-            Ok(Ok(record)) => Ok(record),
+            Ok(Ok(record)) => {
+                self.pending_queries.write().await.remove(&msg_id);
+                // Cache the result for future lookups
+                if let Some(ref rec) = record {
+                    let rec_pid = PeerId(sha2::Sha256::digest(&rec.pubkey).into());
+                    self.peer_records.write().await.insert(rec_pid, rec.clone());
+                }
+                Ok(record)
+            }
             _ => {
                 self.pending_queries.write().await.remove(&msg_id);
                 Ok(None)
@@ -336,22 +346,25 @@ impl DhtHandle {
             .map_err(|e| DhtError::Network(e.to_string()))?;
         let entries: Vec<RoutesEntry> = serde_json::from_slice(&data)
             .map_err(|e| DhtError::Serialization(e.to_string()))?;
-        let mut count = 0usize;
-        let mut rt = self.routing_table.write().await;
-        for entry in entries {
-            if let (Ok(peer_id), Ok(addr)) = (
-                PeerId::from_hex(&entry.node_id_hex),
-                entry.addr.parse::<SocketAddr>(),
-            ) {
+        let parsed: Vec<(PeerId, SocketAddr)> = entries.iter()
+            .filter_map(|e| {
+                let pid = PeerId::from_hex(&e.node_id_hex).ok()?;
+                let addr = e.addr.parse::<SocketAddr>().ok()?;
+                Some((pid, addr))
+            })
+            .collect();
+        {
+            let mut rt = self.routing_table.write().await;
+            for (pid, addr) in &parsed {
                 rt.insert_or_update(BucketEntry {
-                    node_id: peer_id,
-                    address: addr,
+                    node_id: *pid,
+                    address: *addr,
                     last_seen: std::time::Instant::now(),
                 });
-                count += 1;
             }
         }
-        tracing::info!("loaded {count} routes from {}", path.display());
+        let count = parsed.len();
+        tracing::debug!("loaded {count} routes from {}", path.display());
         Ok(count)
     }
 
@@ -385,19 +398,18 @@ impl DhtHandle {
     /// Per-peer 限速：每秒最多 20 条消息
     async fn check_rate_limit(&self, peer_id: &PeerId) -> bool {
         let mut limits = self.peer_ratelimit.write().await;
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis())
-            .unwrap_or(0);
-        let entry = limits.entry(*peer_id).or_insert((now, 0));
-        if now.saturating_sub(entry.0) > 1000 {
+        let now = std::time::Instant::now();
+        let now_ms = now.elapsed().as_millis();
+        let entry = limits.entry(*peer_id).or_insert_with(|| (now, now_ms, 0));
+        if now_ms.saturating_sub(entry.1) > 1000 {
             entry.0 = now;
-            entry.1 = 1;
+            entry.1 = now_ms;
+            entry.2 = 1;
             true
-        } else if entry.1 >= 20 {
+        } else if entry.2 >= 20 {
             false
         } else {
-            entry.1 += 1;
+            entry.2 += 1;
             true
         }
     }
@@ -443,7 +455,7 @@ impl DhtHandle {
         Err(DhtError::InvalidSignature { peer_id: msg.sender_id })
     }
 
-    /// 后台清理：每 10 分钟移除过期 peer_records
+    /// 后台清理：每 10 分钟移除过期 peer_records 和闲置的 peer_ratelimit 条目
     pub fn spawn_cleanup(self: &Arc<Self>) {
         let this = self.clone();
         tokio::spawn(async move {
@@ -456,6 +468,16 @@ impl DhtHandle {
                 records.retain(|_k, v| v.expires_at > now);
                 if before != records.len() {
                     tracing::debug!("DHT cleanup: removed {} expired", before - records.len());
+                }
+                drop(records);
+
+                // Remove ratelimit entries not seen in the last 5 minutes
+                let mut limits = this.peer_ratelimit.write().await;
+                let before_rl = limits.len();
+                limits.retain(|_k, v| now.duration_since(v.0).as_secs() < 300);
+                if before_rl != limits.len() {
+                    tracing::debug!("DHT cleanup: removed {} stale ratelimit entries",
+                        before_rl - limits.len());
                 }
             }
         });
@@ -480,26 +502,25 @@ impl DhtHandle {
             }
         }
 
-        // Verify Ed25519 signatures for requests and FIND_VALUE responses
-        if !msg.is_response || msg.msg_type == DhtMsgType::FindValue {
-            let has_sig = msg.signature.as_ref().map_or(false, |s| s.iter().any(|&b| b != 0));
-            if has_sig && data.len() >= 64 {
-                let body = &data[..data.len().saturating_sub(64)];
-                let verified = self.verify_signature(&msg, body).await;
-                match verified {
-                    Ok(()) => {} // signature valid
-                    Err(e) => {
-                        if !msg.is_response && msg.msg_type == DhtMsgType::Store {
-                            // STORE from unknown peer with unverifiable signature: REJECT
-                            return Err(e);
-                        }
-                        if msg.is_response {
-                            // FIND_VALUE response from unknown sender: cannot verify, silently drop
-                            tracing::debug!("FIND_VALUE response from {}: signature not verifiable, dropping", msg.sender_id);
-                            return Ok(());
-                        }
-                        // Non-STORE request (PING/FIND_NODE) from unknown peer: accept (deferred)
+        // Verify Ed25519 signatures for all messages carrying a signature
+        let has_sig = msg.signature.as_ref().is_some_and(|s| s.iter().any(|&b| b != 0));
+        if has_sig && data.len() >= 64 {
+            let body = &data[..data.len().saturating_sub(64)];
+            let verified = self.verify_signature(&msg, body).await;
+            match verified {
+                Ok(()) => {} // signature valid
+                Err(e) => {
+                    if !msg.is_response && msg.msg_type == DhtMsgType::Store {
+                        // STORE from unknown peer with unverifiable signature: REJECT
+                        return Err(e);
                     }
+                    if msg.is_response {
+                        // Response from unknown sender: cannot verify, silently drop
+                        tracing::debug!("{} response from {}: signature not verifiable, dropping",
+                            format!("{:?}", msg.msg_type), msg.sender_id);
+                        return Ok(());
+                    }
+                    // Non-STORE request (PING/FIND_NODE) from unknown peer: accept (deferred)
                 }
             }
         }
@@ -515,20 +536,32 @@ impl DhtHandle {
             }
         }
 
-        // 更新路由表
+        if msg.is_response {
+            // Add response sender to routing table (responses are inherently safe:
+            // they only reach us if we initiated the query)
+            {
+                let mut rt = self.routing_table.write().await;
+                rt.insert_or_update(BucketEntry {
+                    node_id: msg.sender_id,
+                    address: src,
+                    last_seen: std::time::Instant::now(),
+                });
+            }
+            return self.handle_response(msg, src).await;
+        }
+        // Only update routing table AFTER request processing succeeds (signature verified)
+        let sender_id = msg.sender_id;
+        self.handle_request(msg, src).await?;
+        // Update routing table with verified sender
         {
             let mut rt = self.routing_table.write().await;
             rt.insert_or_update(BucketEntry {
-                node_id: msg.sender_id,
+                node_id: sender_id,
                 address: src,
                 last_seen: std::time::Instant::now(),
             });
         }
-
-        if msg.is_response {
-            return self.handle_response(msg, src).await;
-        }
-        self.handle_request(msg, src).await
+        Ok(())
     }
 
     async fn handle_request(&self, msg: lain_core::dht::DhtMessage, src: SocketAddr) -> Result<(), DhtError> {

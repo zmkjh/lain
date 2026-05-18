@@ -33,10 +33,10 @@ impl PeerId {
         self.0.iter().map(|b| format!("{:02x}", b)).collect()
     }
 
-    pub fn from_hex(hex: &str) -> Result<Self, String> {
-        let bytes = hex::decode(hex).map_err(|e| e.to_string())?;
+    pub fn from_hex(hex: &str) -> Result<Self, crate::error::CoreError> {
+        let bytes = hex::decode(hex).map_err(|e| crate::error::CoreError::InvalidPeerId(e.to_string()))?;
         if bytes.len() != 32 {
-            return Err("PeerId must be 32 bytes".to_string());
+            return Err(crate::error::CoreError::InvalidPeerId("PeerId must be 32 bytes".into()));
         }
         let mut id = [0u8; 32];
         id.copy_from_slice(&bytes);

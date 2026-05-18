@@ -2,7 +2,7 @@
 #![deny(clippy::expect_used)]
 #![deny(clippy::panic)]
 
-use ed25519_dalek::{Signer, SigningKey, VerifyingKey};
+use ed25519_dalek::{Signer, SigningKey};
 use lain_core::identity::{Ed25519PublicKey, Ed25519Signature, IdentityProvider};
 use lain_core::peer::PeerId;
 use rand::rngs::OsRng;
@@ -36,8 +36,6 @@ struct StoredIdentity {
 
 pub struct Identity {
     signing_key: SigningKey,
-    #[allow(dead_code)]
-    verifying_key: VerifyingKey,
     public_key: Ed25519PublicKey,
     peer_id: PeerId,
 }
@@ -50,7 +48,7 @@ impl Identity {
         let public_key = verifying_key.to_bytes();
         let peer_id = Self::compute_peer_id(&public_key);
         tracing::info!("generated new identity: {peer_id}");
-        Ok(Self { signing_key, verifying_key, public_key, peer_id })
+        Ok(Self { signing_key, public_key, peer_id })
     }
 
     /// 导出用于 Noise IK 的 X25519 密钥对
@@ -76,7 +74,19 @@ impl Identity {
         match Self::identity_path() {
             Some(path) if path.exists() => {
                 tracing::info!("loading identity from {}", path.display());
-                Self::load_from_file(&path)
+                match Self::load_from_file(&path) {
+                    Ok(id) => Ok(id),
+                    Err(e) => {
+                        tracing::warn!("identity file corrupted ({}), generating new identity", e);
+                        let id = Self::generate()?;
+                        if let Some(parent) = path.parent() {
+                            std::fs::create_dir_all(parent)
+                                .map_err(|e| IdentityError::WriteFile(e.to_string()))?;
+                        }
+                        id.save_to_file(&path)?;
+                        Ok(id)
+                    }
+                }
             }
             Some(path) => {
                 let id = Self::generate()?;
@@ -94,7 +104,7 @@ impl Identity {
         }
     }
 
-    fn load_from_file(path: &PathBuf) -> Result<Self, IdentityError> {
+    fn load_from_file(path: &std::path::Path) -> Result<Self, IdentityError> {
         let data = std::fs::read_to_string(path)
             .map_err(|e| IdentityError::ReadFile(e.to_string()))?;
         let stored: StoredIdentity = serde_json::from_str(&data)
@@ -112,13 +122,12 @@ impl Identity {
 
         Ok(Self {
             signing_key,
-            verifying_key,
-            public_key: stored.public_key,
+            public_key: verifying_key.to_bytes(),
             peer_id: computed_peer_id,
         })
     }
 
-    fn save_to_file(&self, path: &PathBuf) -> Result<(), IdentityError> {
+    fn save_to_file(&self, path: &std::path::Path) -> Result<(), IdentityError> {
         let stored = StoredIdentity {
             secret_key_bytes: self.signing_key.to_bytes(),
             public_key: self.public_key,
@@ -150,8 +159,8 @@ impl IdentityProvider for Identity {
         &self.public_key
     }
 
-    fn sign(&self, data: &[u8]) -> Ed25519Signature {
-        self.signing_key.sign(data).to_bytes()
+    fn sign(&self, data: &[u8]) -> Result<Ed25519Signature, lain_core::error::CoreError> {
+        Ok(self.signing_key.sign(data).to_bytes())
     }
 }
 
@@ -201,7 +210,7 @@ mod tests {
     fn test_sign_and_verify() {
         let id = Identity::generate().unwrap();
         let data = b"hello lain";
-        let signature = id.sign(data);
+        let signature = id.sign(data).expect("sign should succeed");
 
         let vk = VerifyingKey::from_bytes(&id.public_key).unwrap();
         if let Ok(sig) = ed25519_dalek::Signature::from_slice(&signature) {
@@ -234,7 +243,7 @@ mod tests {
         let pk = *id.public_key();
 
         // Sign to have a known signature
-        let sig_before = id.sign(b"test data");
+        let sig_before = id.sign(b"test data").expect("sign should succeed");
 
         // Save to temp file
         let tmp = std::env::temp_dir().join("lain_test_identity.json");
@@ -247,7 +256,7 @@ mod tests {
         assert_eq!(loaded.public_key(), &pk, "public key should match");
 
         // Loaded identity should produce same signatures
-        let sig_after = loaded.sign(b"test data");
+        let sig_after = loaded.sign(b"test data").expect("sign should succeed");
         assert_eq!(sig_before, sig_after, "signatures from saved/loaded identity should match");
 
         // Noise keypair should also be deterministic
