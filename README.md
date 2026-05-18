@@ -298,9 +298,9 @@ IPC 协议完整规范见 [PROTOCOL.md §8](PROTOCOL.md#8-ipc-api)。
 
 ```bash
 cargo build --release    # 生产构建
-cargo test               # 148 自动化测试 (0 warning)
+cargo test               # 138 自动化测试 (0 warning)
 
-148 个测试覆盖全部协议层：identity、noise、nat、dht、discovery、transport（PeekConnection + Mock Transport）、daemon（编排函数 + 签名验证 + ConnectionGuard）+ 12 个端到端集成测试（连接握手、多消息、双向通信、并发连接、大消息、生存时间、连接关闭、PeerID 校验）。
+138 个测试覆盖全部协议层：identity、noise、nat、dht、discovery、transport（PeekConnection + Mock Transport）、daemon（编排函数 + 签名验证 + ConnectionGuard）+ 12 个端到端集成测试（连接握手、多消息、双向通信、并发连接、大消息、生存时间、连接关闭、PeerID 校验）。
 
 ## 许可证
 
@@ -316,3 +316,13 @@ MIT © 2026 zmkjh
 - **NAT 探测重写**：多服务器 Binding Request 比较，不再依赖 CHANGE-REQUEST
 - **Relay 回退**：`find_relays()` 返回 `RelayInfo`（含 noise_pubkey），daemon 层 `recv→send` pipe
 - **1423 行新增 / 3480 行删除**，crate 间死依赖全部清理
+
+### Windows 守护进程与正确性硬化 (2026-05-18)
+
+- **Windows IPC 修复**：PIPE_NOWAIT 模式下 `ReadFile` 返回 `ERROR_NO_DATA` 被 Rust std 映射为 `Ok(0)`，CLI `read_line_timeout` 误判为 EOF。改为对空行重试（100ms sleep），同时增加读缓冲区 1B→4KB
+- **DHT 签名验证精准化**：签名 body range 从 `data.len()-64` 改为 `53+payload.len()`，不再依赖尾部数据长度推算
+- **入站连接超时保护**：accept 后等待首帧的循环加 30s timeout，防止恶意连接永久挂起 task
+- **DHT 发现持久化**：`find_cmd` 现在将 DHT 查到的 peer 写入 `known_peers`，重启后无需重新 DHT 查找
+- **CLI JSON 注入修复**：peer_id 从 `format!` 拼接改为 `serde_json::json!` 宏
+- **死代码清理**：移除 `conn_mgr.rs`、`iface_watcher.rs` 等从未实例化的模块
+- **全模块审计**：4 关键 / 13 高 / 22 中 / 60 低，路由表签名验证 + TSO 取消 + 帧校验 + NAT 边界条件覆盖
