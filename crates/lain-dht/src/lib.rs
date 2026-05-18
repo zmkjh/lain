@@ -505,7 +505,8 @@ impl DhtHandle {
         // Verify Ed25519 signatures for all messages carrying a signature
         let has_sig = msg.signature.as_ref().is_some_and(|s| s.iter().any(|&b| b != 0));
         if has_sig && data.len() >= 64 {
-            let body = &data[..data.len().saturating_sub(64)];
+            // Body = header + payload (excluding trailing signature bytes)
+            let body = &data[..53 + msg.payload.len()];
             let verified = self.verify_signature(&msg, body).await;
             match verified {
                 Ok(()) => {} // signature valid

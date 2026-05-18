@@ -320,7 +320,8 @@ impl Daemon {
                     IpcCommand::FindPeer { peer_id } => {
                         let d = dht.clone(); let t = transport.clone();
                         let e = ipc_ev.clone(); let c = connected.clone();
-                        tokio::spawn(async move { find_cmd(peer_id, d, t, e, c).await; });
+                        let k = known_peers.clone();
+                        tokio::spawn(async move { find_cmd(peer_id, d, t, e, c, k).await; });
                     }
                     IpcCommand::DisconnectPeer { peer_id } => {
                         if let Some((conn, guard)) = connected.write().await.remove(&peer_id) {
@@ -404,19 +405,30 @@ impl Daemon {
                                 }
                             }
                             // Skip control frames (HEADERS sent by try_quic) until we
-                            // get a Data or RelayConnect message.
-                            let (_, first) = loop {
-                                match conn.recv().await {
-                                    Ok((ft, data)) => match ft {
-                                        FrameType::RelayConnect => {
-                                            handle_relay(conn, &data, d, t).await;
-                                            return;
+                            // get a Data or RelayConnect message, with a timeout
+                            // to prevent idle connections from holding tasks forever.
+                            let recv = &*conn;
+                            let (_, first) = match tokio::time::timeout(
+                                std::time::Duration::from_secs(30),
+                                async {
+                                    loop {
+                                        match recv.recv().await {
+                                            Ok((ft, data)) => match ft {
+                                                FrameType::RelayConnect => break Some((data, true)),
+                                                FrameType::Data => break Some((data, false)),
+                                                _ => continue,
+                                            },
+                                            Err(_) => break None,
                                         }
-                                        FrameType::Data => break (ft, data),
-                                        _ => continue,
                                     }
-                                    Err(_) => return,
+                                },
+                            ).await {
+                                Ok(Some((data, true))) => {
+                                    handle_relay(conn, &data, d, t).await;
+                                    return;
                                 }
+                                Ok(Some((data, false))) => (FrameType::Data, data),
+                                _ => return,
                             };
                             let conn = PeekConnection::new(conn, first);
                             let conn = Arc::new(conn) as Arc<dyn Connection>;
@@ -685,6 +697,7 @@ async fn find_cmd(
     hex: String, dht: Arc<DhtHandle>, transport: Arc<dyn Transport>,
     ipc: broadcast::Sender<IpcResponse>,
     connected: Connections,
+    known: KnownPeers,
 ) {
     let pid = match PeerId::from_hex(&hex) {
         Ok(p) => p,
@@ -712,6 +725,7 @@ async fn find_cmd(
             return;
         }
     };
+    known.write().await.insert(pid, record.endpoints.clone());
     connect_and_track(pid, &record.noise_pubkey, &record.endpoints, transport, ipc, connected, "dht", true).await;
 }
 

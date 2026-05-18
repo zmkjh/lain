@@ -187,7 +187,8 @@ fn main() {
         Command::Tso { invite } => tso_connect(&socket_path, &invite),
         Command::Find { peer_id } => find_and_connect(&socket_path, &peer_id),
         Command::Disconnect { peer_id } => {
-            match ipc_req(&socket_path, &format!(r#"{{"cmd":"Disconnect","peer_id":"{peer_id}"}}"#)) {
+            let req = serde_json::json!({"cmd":"Disconnect","peer_id":peer_id}).to_string();
+            match ipc_req(&socket_path, &req) {
                 Some(_) => println!("disconnected from {peer_id}"),
                 None => eprintln!("daemon not running — run 'lain daemon' to start"),
             }
@@ -284,14 +285,13 @@ fn run_daemon(foreground: bool) {
 fn read_line_timeout(reader: &mut BufReader<IpcStream>, timeout_secs: u64) -> std::io::Result<String> {
     // Move the reader into a spawned thread so we can time out
     // We can't move BufReader, so use raw reads with a small buffer
-    let mut buf = vec![0u8; 1];
+    let mut buf = vec![0u8; 4096];
     let mut line = String::new();
     let start = std::time::Instant::now();
     loop {
         if start.elapsed().as_secs() > timeout_secs {
             return Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "timeout"));
         }
-        // Read one byte at a time with a short wait between retries
         match reader.get_mut().read(&mut buf) {
             Ok(0) => {
                 // On Windows PIPE_NOWAIT, ReadFile returns ERROR_NO_DATA (232)
@@ -304,9 +304,11 @@ fn read_line_timeout(reader: &mut BufReader<IpcStream>, timeout_secs: u64) -> st
                 if line.is_empty() { return Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "eof")); }
                 return Ok(line);
             }
-            Ok(_) => {
-                line.push(buf[0] as char);
-                if buf[0] == b'\n' { return Ok(line); }
+            Ok(n) => {
+                for &b in &buf[..n] {
+                    line.push(b as char);
+                    if b == b'\n' { return Ok(line); }
+                }
             }
             // On Windows PIPE_NOWAIT, read() returns ERROR_NO_DATA (232) when
             // no data is available yet. Rust maps this to BrokenPipe, but it's
