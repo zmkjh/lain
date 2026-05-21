@@ -58,6 +58,9 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::sync::{Mutex, watch};
 
+mod port_predict;
+pub use port_predict::LinearPredictor;
+
 #[derive(Error, Debug)]
 pub enum TransportError {
     #[error("connect: {0}")]
@@ -390,6 +393,7 @@ impl Transport {
         stun_rtt_ms: Option<u64>,
         mappable_port_start: u16,
         mappable_port_end: u16,
+        predictor: Arc<dyn lain_core::PortPredictor>,
     ) -> Result<Box<dyn Connection>, TransportError> {
         const TSO_DEADLINE_SECS: u64 = 102;
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(TSO_DEADLINE_SECS);
@@ -409,29 +413,58 @@ impl Transport {
         // SYN-flood thresholds (50-100/sec on China Mobile NAT4 devices).
         let stagger_ms: u64 = 40;
 
-        let mappable_range = if mappable_port_end > mappable_port_start && !is_pp {
-            Some(mappable_port_start..mappable_port_end)
-        } else {
-            None
-        };
+        // ── Build remote address list ──
+        //
+        // Strategy (Yamada 2008 / N4 2024):
+        //   1. Retain TSO endpoints as-is (for Cone NAT fallback; those ports may
+        //      accept packets from any remote source).
+        //   2. Use PortPredictor to generate predicted external ports for the NEXT
+        //      destination on a symmetric NAT (i.e., ports the NAT will allocate
+        //      for a connection TO this peer — NOT the STUN server).
+        //   3. If port_delta is None (unpredictable allocation), fall back to a
+        //      wider random scan of the mappable_port_range, but acknowledge that
+        //      APDF × APDF success probability is low; relay is the real fallback.
 
-        // Build remote address list once (same logic as before).
-        let remote_addrs: Vec<SocketAddr> = if let Some(ref range) = mappable_range {
-            let mut addrs = tso_endpoints.to_vec();
-            for _ in 0..local_ports as usize {
-                let range_len = (range.end - range.start) as u32;
-                let offset = if range_len > 0 { rand::random::<u32>() % range_len } else { 0 };
-                let random_port = range.start + offset as u16;
-                if let Some(base) = tso_endpoints.first() {
-                    addrs.push(SocketAddr::new(base.ip(), random_port));
+        let mut remote_addrs: Vec<SocketAddr> = tso_endpoints.to_vec();
+
+        // Predicted ports for symmetric NAT (next-destination prediction)
+        let remote_ip = tso_endpoints.first().map(|a| a.ip());
+        if let Some(ip) = remote_ip {
+            let base_ports: Vec<u16> = tso_endpoints.iter().map(|a| a.port()).collect();
+            let predicted = predictor.predict(&base_ports, port_delta, stun_rtt_ms);
+            for &p in &predicted {
+                remote_addrs.push(SocketAddr::new(ip, p));
+            }
+
+            // ── Random fallback for unpredictable NAT ──
+            //
+            // When port_delta is None (APDF with random port allocation), the
+            // linear predictor returns empty.  We widen the random scan to 32
+            // ports from mappable_range as a last-ditch effort.  Success rate
+            // is low (~1-2% per pair), but the low cost makes it worth trying
+            // before relay.
+            if port_delta.is_none() {
+                let range = mappable_port_start.saturating_sub(128)..mappable_port_end.saturating_add(128);
+                let range_len = (range.end - range.start).max(1) as u32;
+                for _ in 0..32 {
+                    let offset = rand::random::<u32>() % range_len;
+                    remote_addrs.push(SocketAddr::new(ip, range.start + offset as u16));
                 }
             }
-            addrs
-        } else {
-            tso_endpoints.to_vec()
-        };
+        }
+        // Deduplicate by SocketAddr
+        remote_addrs.sort_by_key(|a| a.port());
+        remote_addrs.dedup();
 
-        // Pre-compute all (local_addr, remote_addr) pairs.
+        let random_count = if port_delta.is_none() { 32u64 } else { 0 };
+        let predicted_count = remote_addrs.len()
+            .saturating_sub(tso_endpoints.len() + random_count as usize);
+        tracing::info!(
+            "TSO: {} targets ({} invite + {} predicted + {} random), {} local ports",
+            remote_addrs.len(), tso_endpoints.len(), predicted_count, random_count, local_ports,
+        );
+
+        // ── Build (local_addr, remote_addr) pairs ──
         let pairs: Vec<(SocketAddr, SocketAddr)> = (0..local_ports)
             .flat_map(|i| {
                 let la = SocketAddr::new(bind_ip, self.tso_port_start + i);
@@ -781,8 +814,8 @@ impl TransportTrait for Transport {
             .map_err(|e| CoreError::InvalidEndpoint(e.to_string()))
     }
 
-    async fn connect_tso(&self, peer_id: PeerId, tso_endpoints: &[SocketAddr], port_delta: Option<u16>, stun_rtt_ms: Option<u64>, mappable_port_start: u16, mappable_port_end: u16) -> Result<Box<dyn Connection>, CoreError> {
-        Transport::connect_tso(self, peer_id, tso_endpoints, port_delta, stun_rtt_ms, mappable_port_start, mappable_port_end).await
+    async fn connect_tso(&self, peer_id: PeerId, tso_endpoints: &[SocketAddr], port_delta: Option<u16>, stun_rtt_ms: Option<u64>, mappable_port_start: u16, mappable_port_end: u16, predictor: std::sync::Arc<dyn lain_core::PortPredictor>) -> Result<Box<dyn Connection>, CoreError> {
+        Transport::connect_tso(self, peer_id, tso_endpoints, port_delta, stun_rtt_ms, mappable_port_start, mappable_port_end, predictor).await
             .map_err(|e| CoreError::InvalidEndpoint(e.to_string()))
     }
 

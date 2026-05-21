@@ -153,7 +153,8 @@ pub trait Transport: Send + Sync {
         endpoints: &[Endpoint]) -> Result<Box<dyn Connection>, CoreError>;
     async fn connect_tso(&self, peer_id: PeerId, tso_endpoints: &[SocketAddr],
         port_delta: Option<u16>, stun_rtt_ms: Option<u64>,
-        mappable_port_start: u16, mappable_port_end: u16)
+        mappable_port_start: u16, mappable_port_end: u16,
+        predictor: Arc<dyn PortPredictor>)
         -> Result<Box<dyn Connection>, CoreError>;
     async fn accept(&self) -> Result<Box<dyn Connection>, CoreError>;
     fn local_addr(&self) -> Result<SocketAddr, CoreError>;
@@ -2018,7 +2019,7 @@ A的app ──fd read/write──→ A的daemon ──QUIC──→ B的daemon �
 | Lain 帧协议 | 10 种帧类型（Headers/Data/DataDgram/Close/Ping/Pong/PathChange/StreamResume/RelayConnect/RelayData），VarInt 编解码 |
 | 连接数上限 | `mm_connections` Semaphore 限制并发 QUIC 连接 |
 | DHT 桥接 | QUIC 连接成功后通过专用 stream 交换双方真实 DHT 地址，路由表从 0 自生长 |
-| TSO + Birthday Attack | 8 端口 TCP 同时打开，K×K 并发穿透 APDF NAT，102s 时间窗口，PeerID 比较确定 Noise IK 角色 |
+| TSO + Birthday Attack | 8 端口 TCP 同时打开，PortPredictor 端口预测 + K×K 并发穿透 APDF NAT，102s 时间窗口，PeerID 比较确定 Noise IK 角色 |
 | 四层 fallback | 直连→relay→TSO→relay 自动链路，覆盖所有 NAT 类型组合 |
 | routes.json 持久化 | 每次心跳保存路由表，启动时加载，支持崩溃恢复 |
 

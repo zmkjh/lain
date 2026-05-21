@@ -13,7 +13,7 @@
 - **Invite 替代 Bootstrap**：每份邀请码是一条网络入口。A 邀请 B，B 的连接动作自动播种 DHT。B 再邀请 C，网络随人际关系自然生长，无需任何公共服务器。
 - **DHT 自组织**：QUIC 连接成功后双方交换真实 DHT 地址并立即执行 `store_self`，路由表从零开始病毒式扩张。
 - **IPv6 优先**：自动检测全局单播地址（2000::/3），有则直连——零 NAT、零 relay。无全局 IPv6 时自动降级至 IPv4 + STUN + relay。
-- **TSO 穿透 CGNAT**：TCP Simultaneous Open + Birthday Attack 作为最后一层穿透。双方从同端口范围 bind+connect，出站 SYN 创建 NAT hole，对端 SYN 交叉握手。N×M 端口对并发（Birthday Attack），NAT 探测（端口保持性 delta + RTT）驱动自适应参数：端口保持型 4 端口、随机型 8 端口，超时和间隔也根据 RTT 动态调整。专为中国移动 CGNAT 设计。
+- **TSO 穿透 CGNAT**：TCP Simultaneous Open + Birthday Attack 作为最后一层穿透。双方从同端口范围 bind+connect，出站 SYN 创建 NAT hole，对端 SYN 交叉握手。N×M 端口对并发（Birthday Attack），NAT 探测（端口保持性 delta + RTT）驱动自适应参数：端口保持型 4 端口、随机型 8 端口，超时和间隔也根据 RTT 动态调整。基于 `PortPredictor` trait 实现端口预测（当前为 `LinearPredictor`，基于增量线性预测；预留 ML 预测器接口）。专为中国移动 CGNAT 设计。
 
 详细设计及协议规范见 [DESIGN.md](DESIGN.md) 和 [PROTOCOL.md](PROTOCOL.md)。
 

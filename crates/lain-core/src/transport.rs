@@ -57,7 +57,20 @@ pub trait Transport: Send + Sync {
     async fn connect(&self, peer_id: PeerId, noise_pubkey: &[u8; 32], endpoints: &[Endpoint]) -> Result<Box<dyn Connection>, CoreError>;
     /// TSO 连接（TCP 端口映射穿透）。**不**接受 noise_pubkey 参数；
     /// TSO 握手在 TCP 上独立完成 Noise IK，身份由 Noise payload 中的 PeerId 认证。
-    async fn connect_tso(&self, peer_id: PeerId, tso_endpoints: &[SocketAddr], port_delta: Option<u16>, stun_rtt_ms: Option<u64>, mappable_port_start: u16, mappable_port_end: u16) -> Result<Box<dyn Connection>, CoreError>;
+    ///
+    /// `predictor` 用于根据邀请码中的 TSO 端口和 `port_delta` 预测对端 NAT
+    /// 为"下一个新目标"分配的外部端口。预测端口列表替代原本直接使用 STUN 端点
+    /// 作为目标的错误做法（STUN 端点的端口仅对 STUN 服务器目标有效）。
+    async fn connect_tso(
+        &self,
+        peer_id: PeerId,
+        tso_endpoints: &[SocketAddr],
+        port_delta: Option<u16>,
+        stun_rtt_ms: Option<u64>,
+        mappable_port_start: u16,
+        mappable_port_end: u16,
+        predictor: std::sync::Arc<dyn crate::nat::PortPredictor>,
+    ) -> Result<Box<dyn Connection>, CoreError>;
     async fn accept(&self) -> Result<Box<dyn Connection>, CoreError>;
     fn local_addr(&self) -> Result<SocketAddr, CoreError>;
 }

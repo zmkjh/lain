@@ -76,7 +76,7 @@ use lain_discovery::MdnsDiscovery;
 use lain_identity::Identity;
 use lain_nat::NatProbe;
 use lain_noise::NoiseProvider;
-use lain_transport::{TransportConfig, PeekConnection};
+use lain_transport::{TransportConfig, PeekConnection, LinearPredictor};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -671,7 +671,8 @@ async fn tso_cmd(
         return;
     }
     let port_delta = if code.port_delta_hint > 0 { Some(code.port_delta_hint as u16) } else { None };
-    match transport.connect_tso(code.peer_id, &tso, port_delta, stun_rtt_ms, code.mappable_port_start, code.mappable_port_end).await {
+    let predictor = Arc::new(LinearPredictor::default());
+    match transport.connect_tso(code.peer_id, &tso, port_delta, stun_rtt_ms, code.mappable_port_start, code.mappable_port_end, predictor).await {
         Ok(conn) => {
             let conn = <Arc<dyn Connection>>::from(conn);
             let (cancel_tx, cancel_rx) = watch::channel(false);
@@ -993,7 +994,7 @@ mod tests {
         async fn connect(&self, _pid: PeerId, _npk: &[u8; 32], _eps: &[Endpoint]) -> Result<Box<dyn Connection>, CoreError> {
             self.connect_result.lock().unwrap().clone().map(|c| Box::new(c) as Box<dyn Connection>)
         }
-        async fn connect_tso(&self, _pid: PeerId, _eps: &[SocketAddr], _pd: Option<u16>, _rtt: Option<u64>, _mps: u16, _mpe: u16) -> Result<Box<dyn Connection>, CoreError> {
+        async fn connect_tso(&self, _pid: PeerId, _eps: &[SocketAddr], _pd: Option<u16>, _rtt: Option<u64>, _mps: u16, _mpe: u16, _pred: Arc<dyn lain_core::PortPredictor>) -> Result<Box<dyn Connection>, CoreError> {
             Err(CoreError::InvalidEndpoint("tso not mocked".into()))
         }
         async fn accept(&self) -> Result<Box<dyn Connection>, CoreError> {

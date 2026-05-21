@@ -21,6 +21,7 @@ pub mod frame;
 // 协议常量
 pub const PROTOCOL_VERSION: u8 = 1;
 pub use frame::MAGIC;  // re-export from frame.rs (single source of truth)
+pub use nat::PortPredictor;
 
 /// DHT 参数默认值
 pub const DHT_K: usize = 20;

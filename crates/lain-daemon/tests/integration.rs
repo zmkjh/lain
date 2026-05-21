@@ -17,7 +17,7 @@ use lain_core::peer::PeerId;
 use lain_core::transport::{Connection, Transport};
 use lain_identity::Identity;
 use lain_noise::NoiseProvider;
-use lain_transport::{TransportConfig, PeekConnection};
+use lain_transport::{TransportConfig, PeekConnection, LinearPredictor};
 
 fn init() {
     let _ = rustls::crypto::ring::default_provider().install_default();
@@ -318,14 +318,16 @@ async fn tso_handshake() {
     let b_pid = b.peer_id;
     let tso_clone = tso_eps.clone();
 
+    let pred = Arc::new(LinearPredictor::default());
     let h = tokio::spawn(async move {
         let _ = tokio::time::timeout(Duration::from_secs(20),
-            b_t.connect_tso(a.peer_id, &tso_clone, Some(1), Some(10), 50000, 50008)
+            b_t.connect_tso(a.peer_id, &tso_clone, Some(1), Some(10), 50000, 50008, pred)
         ).await;
     });
 
+    let pred2 = Arc::new(LinearPredictor::default());
     let conn = match tokio::time::timeout(Duration::from_secs(20),
-        a_t.connect_tso(b_pid, &tso_eps, Some(1), Some(10), 50000, 50008)
+        a_t.connect_tso(b_pid, &tso_eps, Some(1), Some(10), 50000, 50008, pred2)
     ).await {
         Ok(Ok(c)) => c,
         Ok(Err(e)) => { h.await.unwrap_or(()); panic!("TSO failed: {e}"); }
